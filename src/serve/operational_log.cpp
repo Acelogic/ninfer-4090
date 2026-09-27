@@ -68,24 +68,6 @@ OperationalSeverity failure_severity(RequestFailureClass classification) noexcep
     return OperationalSeverity::Error;
 }
 
-const char* finish_reason_name(ninfer::FinishReason reason) noexcept {
-    switch (reason) {
-    case ninfer::FinishReason::None:
-        return "none";
-    case ninfer::FinishReason::OutputLimit:
-        return "output limit";
-    case ninfer::FinishReason::ContextCapacity:
-        return "context capacity";
-    case ninfer::FinishReason::StopToken:
-        return "stop token";
-    case ninfer::FinishReason::StopString:
-        return "stop string";
-    case ninfer::FinishReason::Cancelled:
-        return "cancelled";
-    }
-    return "unknown";
-}
-
 const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
@@ -104,18 +86,10 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
     return "unknown";
 }
 
-const char* resolved_reasoning_effort_name(const RequestLogContext& context) noexcept {
-    if (!context.enable_thinking) { return "none"; }
-    if (!context.resolved_reasoning_effort) { return "on"; }
-    switch (*context.resolved_reasoning_effort) {
-    case ninfer::ReasoningEffort::Low:
-        return "low";
-    case ninfer::ReasoningEffort::Medium:
-        return "medium";
-    case ninfer::ReasoningEffort::XHigh:
-        return "xhigh";
-    }
-    return "unknown";
+std::string_view requested_effort_name(const RequestLogContext& context) noexcept {
+    if (context.requested_reasoning_effort)
+        return requested_reasoning_effort_name(*context.requested_reasoning_effort);
+    return "template default";
 }
 
 const char* protocol_name(std::string_view protocol) noexcept {
@@ -186,6 +160,24 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
 
 } // namespace
 
+const char* finish_reason_name(ninfer::FinishReason reason) noexcept {
+    switch (reason) {
+    case ninfer::FinishReason::None:
+        return "none";
+    case ninfer::FinishReason::OutputLimit:
+        return "output limit";
+    case ninfer::FinishReason::ContextCapacity:
+        return "context capacity";
+    case ninfer::FinishReason::StopToken:
+        return "stop token";
+    case ninfer::FinishReason::StopString:
+        return "stop string";
+    case ninfer::FinishReason::Cancelled:
+        return "cancelled";
+    }
+    return "unknown";
+}
+
 OperationalRecord render_request_start(const RequestLogContext& context) {
     std::ostringstream out;
     out << "req#" << context.id << " started | " << protocol_name(context.protocol) << ' '
@@ -196,7 +188,7 @@ OperationalRecord render_request_start(const RequestLogContext& context) {
                static_cast<std::uint64_t>(std::max(context.requested_output_tokens, 0)));
     out << " | thinking ";
     if (context.enable_thinking) {
-        out << resolved_reasoning_effort_name(context);
+        out << requested_effort_name(context);
         if (context.thinking_budget) {
             out << ", budget " << product::format_pretty_count(*context.thinking_budget);
         }
@@ -210,7 +202,7 @@ OperationalRecord render_request_start(const RequestLogContext& context) {
         }
     }
     if (context.tool_count != 0) { append_counted_clause(out, "tools", context.tool_count); }
-    if (context.preserve_thinking) { append_clause(out, "preserve thinking"); }
+    if (context.preserve_thinking == true) { append_clause(out, "preserve thinking"); }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 
@@ -287,6 +279,12 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << " accepted " << product::format_pretty_count(metrics.speculative_accepted_tokens)
             << '/' << product::format_pretty_count(metrics.speculative_draft_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
+    }
+    if (metrics.speculative_ngram_draft_tokens != 0) {
+        out << " | ngram accepted "
+            << product::format_pretty_count(metrics.speculative_ngram_accepted_tokens) << '/'
+            << product::format_pretty_count(metrics.speculative_ngram_draft_tokens) << ", wide "
+            << product::format_pretty_count(metrics.speculative_wide_rounds);
     }
     if (outcome.thinking.configured_budget) {
         out << " | thinking "
@@ -486,12 +484,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
                    product::format_pretty_bytes(memory.planned_slack_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
-    logger_->debug("context cost | transfer {} | prefill {} | profile {}/{}/{}",
+    logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),
                    product::format_pretty_text(context_cost.hardware_class),
-                   product::format_pretty_text(context_cost.model_id),
-                   product::format_pretty_text(context_cost.weights_id));
+                   product::format_pretty_text(context_cost.prefill_signature));
 }
 
 void OperationalLog::warmup_started() const { logger_->debug("warming up"); }

@@ -87,9 +87,11 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--ngram chain [--ngram-max V] [--ngram-n N] [--ngram-min N] [--ngram-pool-mib M]] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -120,7 +122,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --auto-save-evicted spills an involuntarily evicted session back to the "
            "slot file it was last saved to or restored from, before the eviction destroys it "
            "(requires --slot-save-path; explicit erase never auto-saves)\n"
-           "       --model-id overrides the artifact identity.model_id reported by the server\n"
+           "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -337,6 +339,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (product::is_ngram_cli_flag(arg)) {
+            const char* flag_value = require_value(arg.c_str());
+            product::apply_ngram_cli_option(arg, flag_value, options.speculative.ngram);
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = require_value("--chat-template");
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
@@ -421,12 +428,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
 }
 
 std::string resolve_public_model_id(const ServeOptions& options,
-                                    std::string_view artifact_model_id) {
+                                    std::string_view artifact_model_name) {
     if (options.model_id_override.has_value()) { return *options.model_id_override; }
-    if (artifact_model_id.empty()) {
-        throw std::logic_error("loaded artifact model_id must not be empty");
+    if (artifact_model_name.empty()) {
+        throw std::logic_error("loaded artifact model name must not be empty");
     }
-    return std::string(artifact_model_id);
+    return std::string(artifact_model_name);
 }
 
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,

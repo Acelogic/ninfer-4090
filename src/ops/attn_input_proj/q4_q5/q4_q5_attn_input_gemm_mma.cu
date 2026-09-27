@@ -1,8 +1,11 @@
+#include "core/weight.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
+#include "ops/common/rowsplit_tall_a8_mma.cuh"
+#include "ops/common/rowsplit_tall_mma.cuh"
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
@@ -20,7 +23,7 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std
     const std::int64_t groups = weight.padded_shape[1] / 64;
     const auto* codes         = static_cast<const std::uint8_t*>(weight.qdata) +
                         static_cast<std::int64_t>(row_begin) * groups * 32;
-    const auto* high   = weight.qtype == QType::Q5G64_F16S
+    const auto* high   = weight.qtype == QType::Q5_G64_FP16
                              ? static_cast<const std::uint8_t*>(weight.qhigh) +
                                  static_cast<std::int64_t>(row_begin) * groups * 8
                              : nullptr;
@@ -28,7 +31,7 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std
                          static_cast<std::int64_t>(row_begin) * groups * 2;
     return RowSplitGroupedMmaJob{
         codes,     high,      scales, static_cast<__nv_bfloat16*>(out.data),
-        row_count, out.ne[0], 0,      weight.qtype == QType::Q5G64_F16S,
+        row_count, out.ne[0], 0,      weight.qtype == QType::Q5_G64_FP16,
     };
 }
 
@@ -118,6 +121,13 @@ void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weigh
     launch<MmaR32C64S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
 }
 
+void q4_q5_attn_input_mixed_r32_c32_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
+                                              Tensor& q, Tensor& g, Tensor& k, Tensor& v,
+                                              cudaStream_t stream) {
+    launch_mixed<GemmCfg<32, 32, 64, 16, 16, 2, 1, false, true, true>>(x, w0, w1, q, g, k, v,
+                                                                       stream);
+}
+
 void q4_q5_attn_input_mixed_r32_c64_s3_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
                                               cudaStream_t stream) {
@@ -131,10 +141,34 @@ void q4_q5_attn_input_pair_r32_c64_s3_launch(const Tensor& x, const Weight& w0, 
     launch<GemmCfg<32, 64, 64, 32, 16, 3, 2, false, true, true>>(x, w0, w1, q, g, k, v, stream);
 }
 
-void q4_q5_attn_input_mixed_r64_c128_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
-                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
-                                               cudaStream_t stream) {
-    launch_mixed<GemmCfg<64, 128, 64, 64, 16, 2, 2, false, true, true>>(x, w0, w1, q, g, k, v,
-                                                                        stream);
+namespace {
+
+rowsplit_tall::GroupedProblem tall_problem(const Weight& w0, const Weight& w1, Tensor& q,
+                                           Tensor& g, Tensor& k, Tensor& v) {
+    return rowsplit_tall::GroupedProblem{{
+        rowsplit_tall::grouped_job(w0, 0, 6144, static_cast<__nv_bfloat16*>(q.data), q.ne[0], 0),
+        rowsplit_tall::grouped_job(w0, 6144, 1024, static_cast<__nv_bfloat16*>(k.data), k.ne[0], 0),
+        rowsplit_tall::grouped_job(w1, 0, 6144, static_cast<__nv_bfloat16*>(g.data), g.ne[0], 0),
+        rowsplit_tall::grouped_job(w1, 6144, 1024, static_cast<__nv_bfloat16*>(v.data), v.ne[0], 0),
+    }};
+}
+
+} // namespace
+
+void q4_q5_attn_input_mixed_pipelined_r128_c128_launch(const Tensor& x, const Weight& w0,
+                                                       const Weight& w1, Tensor& q, Tensor& g,
+                                                       Tensor& k, Tensor& v, cudaStream_t stream) {
+    rowsplit_tall::launch<128>(tall_problem(w0, w1, q, g, k, v), 14336 / 128,
+                               static_cast<const __nv_bfloat16*>(x.data), x.ne[0], x.ne[1], stream);
+}
+
+void q4_q5_attn_input_a8_mixed_pipelined_r128_c128_launch(const A8G64Activation& x,
+                                                          const Weight& w0, const Weight& w1,
+                                                          Tensor& q, Tensor& g, Tensor& k,
+                                                          Tensor& v, cudaStream_t stream) {
+    rowsplit_tall_a8::launch<128>(tall_problem(w0, w1, q, g, k, v), 14336 / 128,
+                                  static_cast<const std::int8_t*>(x.q.data),
+                                  static_cast<const float*>(x.scale.data), x.q.ne[0], x.q.ne[1],
+                                  stream);
 }
 } // namespace ninfer::ops::detail

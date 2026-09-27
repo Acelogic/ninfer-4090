@@ -1,6 +1,7 @@
 // Public-Op benchmark for every registered Attention input-projection contract.
 // Production dispatch is owned exclusively by attn_input_proj().
 
+#include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 
 #include "core/device.h"
@@ -33,7 +34,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 
-enum class Format : std::uint8_t { Q4Q5, W8Qgkv, W8Qkv, W8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
+enum class Format : std::uint8_t { Q4Q5, Q8Qgkv, Q8Qkv, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
@@ -41,6 +42,7 @@ struct Options {
     Format format                  = Format::All;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
+    ops::LinearPolicy q4q5_policy  = ops::LinearPolicy::A16Only;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
@@ -73,8 +75,8 @@ struct Measurement {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_attn_input_proj_bench "
-                 "[--format q4q5|w8-qgkv|w8-qkv|w8-dflash2-qkv|bf16|nvfp4|fp8|all] "
-                 "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
+                 "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
+                 "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] [--q4q5-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -121,12 +123,12 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value(next("--format requires a value"));
             if (value == "q4q5")
                 options.format = Format::Q4Q5;
-            else if (value == "w8-qgkv")
-                options.format = Format::W8Qgkv;
-            else if (value == "w8-qkv")
-                options.format = Format::W8Qkv;
-            else if (value == "w8-dflash2-qkv")
-                options.format = Format::W8DFlash2Qkv;
+            else if (value == "q8-qgkv")
+                options.format = Format::Q8Qgkv;
+            else if (value == "q8-qkv")
+                options.format = Format::Q8Qkv;
+            else if (value == "q8-dflash2-qkv")
+                options.format = Format::Q8DFlash2Qkv;
             else if (value == "bf16")
                 options.format = Format::Bf16;
             else if (value == "nvfp4")
@@ -136,7 +138,7 @@ Options parse_options(int argc, char** argv) {
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, w8-qgkv, w8-qkv, w8-dflash2-qkv, bf16, nvfp4, "
+                usage("--format expects q4q5, q8-qgkv, q8-qkv, q8-dflash2-qkv, bf16, nvfp4, "
                       "fp8, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
@@ -154,6 +156,14 @@ Options parse_options(int argc, char** argv) {
                 options.fp8_policy = ops::LinearPolicy::AllowA8;
             else
                 usage("--fp8-policy expects a16 or a8");
+        } else if (argument == "--q4q5-policy") {
+            const std::string_view value(next("--q4q5-policy requires a value"));
+            if (value == "a16")
+                options.q4q5_policy = ops::LinearPolicy::A16Only;
+            else if (value == "a8")
+                options.q4q5_policy = ops::LinearPolicy::AllowA8;
+            else
+                usage("--q4q5-policy expects a16 or a8");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -341,7 +351,7 @@ void vary_groupwise(bench::PackedQuantizedWeight& weight) {
     auto* bytes       = static_cast<std::uint8_t*>(weight.storage.p);
     auto* scales      = reinterpret_cast<std::uint16_t*>(bytes + weight.scale_offset);
     const auto groups = static_cast<unsigned>(weight.scale_bytes / 2);
-    if (weight.weight.qtype == QType::Q4G64_F16S)
+    if (weight.weight.qtype == QType::Q4_G64_FP16)
         fill_groupwise<false><<<(groups + 255) / 256, 256>>>(bytes, nullptr, scales, groups);
     else
         fill_groupwise<true>
@@ -368,12 +378,17 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t parent_rows = q_rows + kv_rows;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     bench::PackedQuantizedWeight qk = bench::make_row_split_weight(
-        QType::Q4G64_F16S, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
+        QType::Q4_G64_FP16, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
     bench::PackedQuantizedWeight gv = bench::make_row_split_weight(
-        QType::Q5G64_F16S, parent_rows, hidden, hidden, {0x31, 0xa5, 0x3c00});
+        QType::Q5_G64_FP16, parent_rows, hidden, hidden, {0x31, 0xa5, 0x3c00});
     vary_groupwise(qk);
     vary_groupwise(gv);
     DeviceBuffer input = varied_input(static_cast<std::size_t>(hidden) * max_tokens);
+    const char* policy = policy_name(options.q4q5_policy);
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::attn_input_proj_workspace_capacity_bytes(QType::Q4_G64_FP16, QType::Q5_G64_FP16,
+                                                      hidden, options.q4q5_policy, 1, max_tokens),
+        256));
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
@@ -385,12 +400,13 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
         Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
         Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, launch_stream);
+            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, options.q4q5_policy,
+                                 workspace, launch_stream);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
         if (options.profile) {
-            profile_public(launch, "q4q5", "a16", profile_cache, flush, stream, options.warmup,
+            profile_public(launch, "q4q5", policy, profile_cache, flush, stream, options.warmup,
                            options.graph);
             continue;
         }
@@ -402,7 +418,11 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
-            append_result(results, "q4q5", "a16", tokens, cache, 0, logical, flops,
+            append_result(results, "q4q5", policy, tokens, cache,
+                          ops::attn_input_proj_workspace_capacity_bytes(
+                              QType::Q4_G64_FP16, QType::Q5_G64_FP16, hidden,
+                              options.q4q5_policy, tokens, tokens),
+                          logical, flops,
                           measure_public(launch, cache, flush, stream, options.warmup,
                                          options.repeat, options.graph));
         }
@@ -420,7 +440,7 @@ void run_four_output(const Options& options, const char* format, QType qtype,
     const std::size_t workspace_bytes = ops::attn_input_proj_workspace_capacity_bytes(
         qtype, parent_rows, hidden, policy, min_tokens, max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
-    DeviceBuffer input = qtype == QType::FP8_E4M3FN_ROW_BF16S
+    DeviceBuffer input = qtype == QType::FP8_E4M3FN_ROW_BF16
                              ? varied_input(static_cast<std::size_t>(hidden) * max_tokens)
                              : bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
@@ -468,14 +488,14 @@ void run_four_output(const Options& options, const char* format, QType qtype,
     }
 }
 
-void run_w8_qkv(const Options& options, const char* label, std::int32_t hidden, DeviceBuffer& flush,
+void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden, DeviceBuffer& flush,
                 cudaStream_t stream, std::vector<Result>& results) {
     constexpr std::int32_t q_rows      = 4096;
     constexpr std::int32_t kv_rows     = 1024;
     constexpr std::int32_t parent_rows = 6144;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     bench::PackedQuantizedWeight weight = bench::make_row_split_weight(
-        QType::W8G32_F16S, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
+        QType::Q8_G32_FP16, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
@@ -518,7 +538,7 @@ void run_fp8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
         14336);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16S, options.fp8_policy, false, 5120,
+    run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16, options.fp8_policy, false, 5120,
                     6144, 1024, 14336, weight, flush, stream, results);
 }
 
@@ -568,22 +588,22 @@ int main(int argc, char** argv) {
         std::vector<Result> results;
 
         if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
-        if (selected(options.format, Format::W8Qgkv)) {
-            auto weight = bench::make_row_split_weight(QType::W8G32_F16S, 9216, 2048, 2048,
+        if (selected(options.format, Format::Q8Qgkv)) {
+            auto weight = bench::make_row_split_weight(QType::Q8_G32_FP16, 9216, 2048, 2048,
                                                        {0x31, 0x00, 0x3c00});
-            run_four_output(options, "w8-qgkv", QType::W8G32_F16S, ops::LinearPolicy::A16Only, true,
-                            2048, 4096, 512, 9216, weight, flush, stream, results);
+            run_four_output(options, "q8-qgkv", QType::Q8_G32_FP16, ops::LinearPolicy::A16Only,
+                            true, 2048, 4096, 512, 9216, weight, flush, stream, results);
         }
-        if (selected(options.format, Format::W8Qkv)) {
-            run_w8_qkv(options, "w8-qkv", 2048, flush, stream, results);
+        if (selected(options.format, Format::Q8Qkv)) {
+            run_q8_qkv(options, "q8-qkv", 2048, flush, stream, results);
         }
-        if (selected(options.format, Format::W8DFlash2Qkv)) {
-            run_w8_qkv(options, "w8-dflash2-qkv", 5120, flush, stream, results);
+        if (selected(options.format, Format::Q8DFlash2Qkv)) {
+            run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, stream, results);
         }
         if (selected(options.format, Format::Bf16)) {
             auto weight = bench::make_direct_bf16_weight(14336, 5120);
-            run_four_output(options, "bf16", QType::BF16_CTRL, ops::LinearPolicy::A16Only, false,
-                            5120, 6144, 1024, 14336, weight, flush, stream, results);
+            run_four_output(options, "bf16", QType::BF16, ops::LinearPolicy::A16Only, false, 5120,
+                            6144, 1024, 14336, weight, flush, stream, results);
         }
         if (selected(options.format, Format::Nvfp4)) {
             auto weight = bench::make_nvfp4_weight(14336, 5120);

@@ -244,6 +244,15 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+        if (speculative.verify_window > speculative.draft_window) {
+            print_metric("ngram verify window", std::to_string(speculative.verify_window));
+            print_metric("ngram wide rounds", std::to_string(speculative.wide_rounds));
+            print_metric("ngram drafted tokens", std::to_string(speculative.ngram_drafted_tokens));
+            print_metric("ngram accepted tokens",
+                         std::to_string(speculative.ngram_accepted_tokens));
+            print_metric("ngram acceptance rate", format_percent(speculative.ngram_accepted_tokens,
+                                                                 speculative.ngram_drafted_tokens));
+        }
     }
 }
 
@@ -288,16 +297,17 @@ int main(int argc, char** argv) {
         request.output.raw                        = cli.raw_output;
 
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path  = cli.artifact_path;
-        engine_options.device         = cli.device;
-        engine_options.max_context    = cli.max_context;
-        engine_options.kv_capacity    = cli.kv_capacity;
-        engine_options.prefill_chunk  = cli.prefill_chunk;
-        engine_options.kv_cache       = cli.kv_cache;
-        engine_options.speculative    = cli.speculative;
-        engine_options.enable_vision     = cli.enable_vision;
-        engine_options.vision_max_tokens = cli.vision_max_tokens;
-        engine_options.use_cuda_graph    = cli.use_cuda_graph;
+        engine_options.artifact_path      = cli.artifact_path;
+        engine_options.chat_template_path = cli.chat_template_path;
+        engine_options.device             = cli.device;
+        engine_options.max_context        = cli.max_context;
+        engine_options.kv_capacity        = cli.kv_capacity;
+        engine_options.prefill_chunk      = cli.prefill_chunk;
+        engine_options.kv_cache           = cli.kv_cache;
+        engine_options.speculative        = cli.speculative;
+        engine_options.enable_vision      = cli.enable_vision;
+        engine_options.vision_max_tokens  = cli.vision_max_tokens;
+        engine_options.use_cuda_graph     = cli.use_cuda_graph;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;

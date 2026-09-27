@@ -79,11 +79,33 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash2,
 };
 
+// Host n-gram drafts (llama.cpp ngram-mod style) chained after the MTP proposal.
+enum class NgramDraftMode : std::uint8_t {
+    Off,
+    // Each row verifies the MTP proposal followed by the pool's continuation of it.
+    Chain,
+};
+
+struct NgramOptions {
+    NgramDraftMode mode = NgramDraftMode::Off;
+    // Verify window V: drafts per round, MTP proposal plus pool extension, in
+    // [draft_tokens + 3, 15]. A round uses V only when some row's draft reaches draft_tokens + 3.
+    std::uint32_t max_drafts = 15;
+    // n: tokens in the pool lookup key, [1,64].
+    std::uint32_t match_tokens = 8;
+    // A pool extension shorter than this is dropped, [1,max_drafts].
+    std::uint32_t min_drafts = 1;
+    // Host pool table, 4 bytes per entry, allocated once at startup.
+    std::uint64_t pool_bytes = 16ULL << 20U;
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Requires the MTP backend.
+    NgramOptions ngram;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -167,6 +189,7 @@ struct ContextCostOptions {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    std::filesystem::path chat_template_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
@@ -397,34 +420,34 @@ struct ChatMessage {
 };
 
 enum class ReasoningEffort : std::uint8_t {
+    None,
+    Minimal,
     Low,
     Medium,
+    High,
     XHigh,
+    Max,
 };
 
-struct ReasoningEffortCapabilities {
-    bool low    = false;
-    bool medium = false;
-    bool xhigh  = false;
-    std::optional<ReasoningEffort> default_effort;
-
-    [[nodiscard]] constexpr bool supports(ReasoningEffort effort) const noexcept {
-        switch (effort) {
-        case ReasoningEffort::Low:
-            return low;
-        case ReasoningEffort::Medium:
-            return medium;
-        case ReasoningEffort::XHigh:
-            return xhigh;
-        }
-        return false;
+[[nodiscard]] constexpr std::string_view reasoning_effort_name(ReasoningEffort effort) noexcept {
+    switch (effort) {
+    case ReasoningEffort::None:
+        return "none";
+    case ReasoningEffort::Minimal:
+        return "minimal";
+    case ReasoningEffort::Low:
+        return "low";
+    case ReasoningEffort::Medium:
+        return "medium";
+    case ReasoningEffort::High:
+        return "high";
+    case ReasoningEffort::XHigh:
+        return "xhigh";
+    case ReasoningEffort::Max:
+        return "max";
     }
-};
-
-struct PromptCapabilities {
-    bool enable_thinking = false;
-    ReasoningEffortCapabilities reasoning_effort;
-};
+    return {};
+}
 
 enum class PromptContinuationMode : std::uint8_t {
     NewAssistantTurn,
@@ -433,10 +456,12 @@ enum class PromptContinuationMode : std::uint8_t {
 
 struct PromptOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
-    bool enable_thinking                = true;
+    std::optional<bool> enable_thinking;
     std::optional<ReasoningEffort> reasoning_effort;
-    bool preserve_thinking = false;
-    bool add_vision_id     = false;
+    std::optional<bool> preserve_thinking;
+    // JSON object of template parameters. Unset typed fields leave template defaults intact.
+    std::string chat_template_kwargs_json;
+    bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
 };
 
@@ -551,6 +576,7 @@ private:
 };
 
 struct PromptSummary {
+    bool starts_in_reasoning    = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
 };
@@ -717,6 +743,13 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    // MTP: the widest verify window V; above draft_window when n-gram drafts are enabled.
+    std::uint32_t verify_window = 0;
+    // N-gram pool share of drafted_tokens/accepted_tokens; the rest came from the MTP head.
+    std::uint64_t ngram_drafted_tokens  = 0;
+    std::uint64_t ngram_accepted_tokens = 0;
+    // Rounds verified at the n-gram window V instead of the MTP width.
+    std::uint64_t wide_rounds = 0;
 };
 
 struct ThinkingBudgetStats {
@@ -1059,8 +1092,7 @@ struct ContextCostSummary {
     ContextCostPresetSource transfer_source = ContextCostPresetSource::GenericDefault;
     ContextCostPresetSource prefill_source  = ContextCostPresetSource::GenericDefault;
     std::string hardware_class;
-    std::string model_id;
-    std::string weights_id;
+    std::string prefill_signature;
     std::filesystem::path preset_path;
 };
 
@@ -1110,16 +1142,17 @@ public:
 };
 
 struct LoadSummary {
-    std::string target;
-    std::string model_id;
-    std::string weights_id;
+    std::string architecture;
+    std::string model_name;
+    std::vector<std::string> weight_formats;
+    std::string prefill_signature;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
     std::uint64_t peak_staging_bytes   = 0;
-    std::size_t tensor_count           = 0;
-    std::size_t resource_count         = 0;
+    std::size_t device_object_count    = 0;
+    std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
 };
 

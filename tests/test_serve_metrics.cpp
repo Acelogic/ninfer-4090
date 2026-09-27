@@ -1,6 +1,12 @@
+#include "serve/monitor_page.h"
 #include "serve/serve_metrics.h"
 
+#include <nlohmann/json.hpp>
+
+#include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <string>
@@ -38,6 +44,9 @@ GenerationOutcome outcome(int prompt, std::uint32_t cached, int completion, doub
     out.metrics.decode_seconds               = decode_s;
     out.metrics.speculative_draft_tokens     = drafted;
     out.metrics.speculative_accepted_tokens  = accepted;
+    // A third of the drafts and of the accepted drafts came from the n-gram pool.
+    out.metrics.speculative_ngram_draft_tokens    = drafted / 3;
+    out.metrics.speculative_ngram_accepted_tokens = accepted / 3;
     return out;
 }
 
@@ -101,12 +110,78 @@ int main() {
     failures += check(values.at("ninfer:prefix_cache_hit_tokens_total") == 900.0, "cache hits");
     failures += check(values.at("ninfer:draft_tokens_total") == 450.0, "draft tokens");
     failures += check(values.at("ninfer:draft_accepted_tokens_total") == 225.0, "accepted tokens");
+    failures += check(values.at("ninfer:ngram_draft_tokens_total") == 150.0, "n-gram draft tokens");
+    failures += check(values.at("ninfer:ngram_draft_accepted_tokens_total") == 75.0,
+                      "n-gram accepted tokens");
 
     // A cache hit reported larger than the prompt must clamp, not underflow.
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));
     const auto residue = metrics.last_completed();
     failures += check(residue.prompt_tokens == 10 && residue.cached_tokens == 10,
                       "last completed cache clamped to prompt");
+
+    // Monitor snapshot: the static context, live KV/scheduler gauges, Engine totals since the
+    // attach baseline (the warmup generation excluded), one row per retained-conversation cell,
+    // and the completed requests newest first.
+    ServeMetrics::MonitorContext context{"bonsai-27b", 262144, 3, 262144, 4096, 2};
+    ninfer::RuntimeStats baseline;
+    baseline.computed_prefill_tokens = 60;
+    baseline.prefill_seconds_total   = 0.1;
+    baseline.committed_decode_tokens = 3;
+    baseline.decode_seconds_total    = 0.02;
+    live.device_main_kv_occupied_pages = 1400;
+    live.running_requests              = 1;
+    live.waiting_requests              = 2;
+    std::vector<ninfer::SlotState> slots(6);
+    slots[0].processing    = true;
+    slots[0].prompt_tokens = 86266;
+    slots[0].cached_tokens = 85133;
+    slots[1].retained      = true;
+    const auto monitor =
+        nlohmann::json::parse(metrics.render_monitor(context, live, baseline, slots));
+    failures += check(monitor.at("model") == "bonsai-27b" && monitor.at("lanes") == 3 &&
+                          monitor.at("draft_window") == 2,
+                      "monitor context");
+    failures += check(monitor.at("kv").at("pages") == 4096 &&
+                          monitor.at("kv").at("occupied_pages") == 1400,
+                      "monitor kv occupancy");
+    failures += check(monitor.at("scheduler").at("running") == 1 &&
+                          monitor.at("scheduler").at("waiting") == 2,
+                      "monitor scheduler gauges");
+    const auto& totals = monitor.at("totals");
+    failures += check(totals.at("requests") == 3 && totals.at("prefill_tokens") == 1240 &&
+                          totals.at("decode_tokens") == 297 &&
+                          std::abs(totals.at("decode_seconds").get<double>() - 5.98) < 1e-9,
+                      "monitor totals exclude the warmup baseline");
+    // Completed prompts 1000 + 1200 + 10; reuse clamped to each prompt: 0 + 900 + 10.
+    failures += check(totals.at("prompt_tokens") == 2210 &&
+                          totals.at("cached_prompt_tokens") == 910,
+                      "monitor prompt reuse totals");
+    const auto& slot_rows = monitor.at("slots");
+    failures += check(slot_rows.size() == 6 && slot_rows[0].at("processing") == true &&
+                          slot_rows[0].at("prompt_tokens") == 86266 &&
+                          slot_rows[1].at("retained") == true,
+                      "monitor slot rows");
+    const auto& recent = monitor.at("recent");
+    failures += check(recent.size() == 3 && recent[0].at("sequence") == 3 &&
+                          recent[0].at("cached_tokens") == 10 && recent[2].at("sequence") == 1 &&
+                          recent[1].at("drafted") == 150 && recent[1].at("accepted") == 75,
+                      "monitor recent requests newest first");
+
+    // The recent list keeps the latest kRecentRequests completions.
+    for (int i = 0; i < 40; ++i) metrics.record(outcome(100 + i, 0, 10, 0.1, 0.2, 0, 0));
+    const auto kept = metrics.recent_requests();
+    failures += check(kept.size() == ServeMetrics::kRecentRequests && kept.front().sequence == 43 &&
+                          kept.front().prompt_tokens == 139 &&
+                          kept.back().sequence == 43 - ServeMetrics::kRecentRequests + 1,
+                      "recent requests bounded");
+
+    // The page compiled into the server is the source page, byte for byte.
+    std::ifstream page_file(std::string(NINFER_SOURCE_DIR) + "/src/serve/monitor_page.html",
+                            std::ios::binary);
+    const std::string page_source{std::istreambuf_iterator<char>(page_file), {}};
+    failures += check(!page_source.empty() && ninfer::serve::monitor_page() == page_source,
+                      "embedded monitor page matches its source");
 
     std::printf("%s serve metrics\n", failures == 0 ? "OK" : "FAIL");
     return failures == 0 ? 0 : 1;

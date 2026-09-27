@@ -40,7 +40,7 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
     if (window > 8198) { include_tier(16390, 256 / Geometry::SmallTSplitScale); }
     if (window > 16390) { include_tier(window, 480 / Geometry::SmallTSplitScale); }
 
-    return (splits < Geometry::SmallTMaximumSplits) ? splits : Geometry::SmallTMaximumSplits;
+    return causal_small_t_wave_splits<Geometry>(splits);
 }
 
 template <typename Geometry>
@@ -233,17 +233,21 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
         const int capacity =
             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
         if (batch_size > 1) {
-            // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
-            // leaves room for the indivisible 4*B group, including B=3/5/6/7.
+            // Keep complete grids within one or two SM-count waves (upstream's 160 and 320 on
+            // 170 SMs). Rounding from slightly under a wave leaves room for the indivisible
+            // 4*B group, including B=3/5/6/7.
+            constexpr int kOneWave = kTargetSmCount - kTargetSmCount / 16;
+            constexpr int kTwoWaves = 2 * kOneWave;
             const bool narrow = tokens <= 5;
-            int target_ctas   = 160;
+            int target_ctas   = kOneWave;
             if (cache_storage == KvCacheStorage::BFloat16)
-                target_ctas =
-                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
+                target_ctas = narrow || batch_size >= 5 || envelope.max_visible_keys > 4096
+                                  ? kTwoWaves
+                                  : kOneWave;
             else if (kv_storage_is_int8_family(cache_storage))
-                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
+                target_ctas = narrow || envelope.max_visible_keys > 4096 ? kTwoWaves : kOneWave;
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
-                target_ctas = narrow ? 320 : 160;
+                target_ctas = narrow ? kTwoWaves : kOneWave;
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
             // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
             // key-tile rounding and page alignment at the 262144-key resource limit.
@@ -362,11 +366,17 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = Geometry::QHeads == 24 ? 256 : 64;
+    const bool rotate_v        = kv_fork_mode_flags(cache.storage).rotate_v;
     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
-        causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                        Offset><<<grid, kReduceBlock, 0, stream>>>(
+        const auto kernel =
+            rotate_v ? causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8,
+                                                                      MultiBatch, Masked, Offset,
+                                                                      Int8>
+                     : causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8,
+                                                                      MultiBatch, Masked, Offset>;
+        kernel<<<grid, kReduceBlock, 0, stream>>>(
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data), static_cast<const std::int32_t*>(pos.data),
             invocation.valid_columns
@@ -399,17 +409,6 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     else
         launch_for_storage.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
-    if (kv_fork_mode_flags(cache.storage).rotate_v) {
-        const int units = invocation.batch_size * invocation.width * Geometry::QHeads *
-                          kKVCacheInt8Groups;
-        kv_cache_inverse_rotate_output_kernel<Geometry::QHeads><<<units, 32, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(out.data), invocation.width, invocation.full_width,
-            invocation.column_begin,
-            invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data));
-        CUDA_CHECK(cudaGetLastError());
-    }
 }
 
 void causal_attention_small_t_launch(

@@ -57,6 +57,8 @@ int main() {
     options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens       = 3;
     options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
+    options.speculative.ngram.mode         = ninfer::NgramDraftMode::Chain;
+    options.speculative.ngram.max_drafts   = 12;
     options.enable_vision                  = false;
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
@@ -89,23 +91,22 @@ int main() {
     };
 
     ninfer::LoadSummary load;
-    load.target               = "qwen3_6_27b";
-    load.model_id             = "qwen3.6-27b";
-    load.weights_id           = "groupwise-int";
+    load.architecture         = "Qwen3_5ForCausalLM";
+    load.model_name           = "qwen3.6-27b";
+    load.weight_formats       = {"q4_g64_fp16", "q8_g32_fp16"};
     load.load_seconds         = 1.234567890123;
     load.upload_seconds       = 0.345678901234;
     load.artifact_bytes_read  = 1000;
     load.host_to_device_bytes = 900;
     load.peak_staging_bytes   = 128;
-    load.tensor_count         = 42;
-    load.resource_count       = 6;
+    load.device_object_count  = 42;
+    load.host_object_count    = 6;
     load.context_cost         = {
-                .transfer_source = ninfer::ContextCostPresetSource::External,
-                .prefill_source  = ninfer::ContextCostPresetSource::CompiledDefault,
-                .hardware_class  = "nvidia-geforce-rtx-5090-sm120",
-                .model_id        = "qwen3.6-27b",
-                .weights_id      = "groupwise-int",
-                .preset_path     = "local-costs.json",
+                .transfer_source   = ninfer::ContextCostPresetSource::External,
+                .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
+                .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
+                .prefill_signature = "example-prefill-signature",
+                .preset_path       = "local-costs.json",
     };
 
     ninfer::MemorySummary memory;
@@ -162,9 +163,11 @@ int main() {
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
-    failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
-    failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
-                      "server weights id missing");
+    failures += check(server.at("artifact").at("architecture") == "Qwen3_5ForCausalLM",
+                      "server target missing");
+    failures +=
+        check(server.at("artifact").at("formats") == Json::array({"q4_g64_fp16", "q8_g32_fp16"}),
+              "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
@@ -200,6 +203,12 @@ int main() {
                       "speculative backend missing");
     failures +=
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
+    failures += check(server.at("engine").at("ngram").at("mode") == "chain" &&
+                          server.at("engine").at("ngram").at("max_drafts") == 12 &&
+                          server.at("engine").at("ngram").at("match_tokens") == 8 &&
+                          server.at("engine").at("ngram").at("min_drafts") == 1 &&
+                          server.at("engine").at("ngram").at("pool_bytes") == 16ULL << 20U,
+                      "n-gram options missing");
     failures += check(
         server.at("engine").at("context_cost").at("transfer_source") == "external" &&
             server.at("engine").at("context_cost").at("prefill_source") == "compiled-default" &&
@@ -261,7 +270,7 @@ int main() {
     PreparedRequest prepared;
     prepared.enable_thinking                           = true;
     prepared.thinking_budget                           = 256;
-    prepared.effective_reasoning_effort                = ninfer::ReasoningEffort::XHigh;
+    prepared.reasoning_effort                          = ninfer::ReasoningEffort::XHigh;
     prepared.preserve_thinking                         = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
@@ -294,12 +303,13 @@ int main() {
             "xhigh, budget 256 | media 1, prepared 120 ms | preserve thinking",
         "pretty request-start record mismatch");
     RequestLogContext default_thinking = context;
-    default_thinking.resolved_reasoning_effort.reset();
+    default_thinking.requested_reasoning_effort.reset();
     default_thinking.thinking_budget.reset();
     const std::string default_thinking_start = render_request_start(default_thinking).message;
-    failures += check(default_thinking_start.find("thinking on") != std::string::npos &&
-                          default_thinking_start.find("unresolved") == std::string::npos,
-                      "default thinking state leaks an internal resolution detail");
+    failures +=
+        check(default_thinking_start.find("thinking template default") != std::string::npos &&
+                  default_thinking_start.find("unresolved") == std::string::npos,
+              "default thinking state leaks an internal resolution detail");
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
@@ -309,8 +319,8 @@ int main() {
                       "resolved thinking mode missing");
     failures += check(started.at("request").at("thinking_budget") == 256,
                       "resolved thinking budget missing");
-    failures += check(started.at("request").at("requested_reasoning_effort").is_null() &&
-                          started.at("request").at("resolved_reasoning_effort") == "xhigh",
+    failures += check(started.at("request").at("requested_reasoning_effort") == "xhigh" &&
+                          !started.at("request").contains("resolved_reasoning_effort"),
                       "requested and resolved reasoning effort are not distinguished");
     failures += check(started.at("request").at("preserve_thinking") == true &&
                           started.at("request").at("preserve_thinking_semantic_change") == true,
@@ -344,7 +354,7 @@ int main() {
                           rejected.at("request").at("message_count") == 2,
                       "preparation rejection request shape missing");
     failures += check(rejected.at("request").at("requested_reasoning_effort") == "high" &&
-                          rejected.at("request").at("resolved_reasoning_effort").is_null(),
+                          !rejected.at("request").contains("resolved_reasoning_effort"),
                       "rejection log fabricated a resolved reasoning effort");
     failures += check(rejected.at("error").at("status") == 400 &&
                           rejected.at("error").at("code") == "context_length_exceeded" &&
@@ -399,6 +409,10 @@ int main() {
     outcome.metrics.speculative_accepted_tokens       = 720;
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.speculative_verify_window         = 15;
+    outcome.metrics.speculative_wide_rounds           = 40;
+    outcome.metrics.speculative_ngram_draft_tokens    = 210;
+    outcome.metrics.speculative_ngram_accepted_tokens = 95;
     outcome.metrics.materialization                   = {
                           .predicted_now_ns           = 200000,
                           .predicted_future_loss_ns   = 50000,
@@ -471,6 +485,11 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(done.at("speculative").at("verify_window") == 15 &&
+                          done.at("speculative").at("wide_rounds") == 40 &&
+                          done.at("speculative").at("ngram_drafted_tokens") == 210 &&
+                          done.at("speculative").at("ngram_accepted_tokens") == 95,
+                      "n-gram draft counters missing");
     failures += check(done.at("materialization").at("predicted_total_ns") == 250000 &&
                           done.at("materialization").at("targets_evaluated") == 7 &&
                           done.at("materialization").at("stop_reason") == "queue_exhausted" &&
@@ -490,7 +509,8 @@ int main() {
         pretty_done.message ==
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
             "(25.2%, response replay) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
-            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | thinking 256/256, control 19",
+            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | ngram accepted 95/210, wide 40 "
+            "| thinking 256/256, control 19",
         "pretty request-done record mismatch");
 
     GenerationOutcome normalized_tool_outcome = outcome;

@@ -1,513 +1,517 @@
-# NInfer-4090
+# NInfer-4090 for Windows
 
-> ### 🪟 Native Windows port available — now reads v3 artifacts too
-> This project adds a **native Windows build (MSVC + CUDA, no WSL, no Docker required)**.
-> It's verified on RTX 4090 (sm_89), CUDA 13.4, Visual Studio Build Tools 2026, and reaches
-> **149 tok/s** decode on code generation — matching the Linux numbers below. A later
-> `--draft-tokens`/`--spec` sweep on this same card found **210.9 tok/s** with
-> `--spec dflash2 --draft-tokens 12` (+53% over the `mtp --draft-tokens 3` config the 149
-> tok/s figure used) — see [WINDOWS_PORT.md](WINDOWS_PORT.md#faster-still---spec-dflash2-beats-mtp-and-its-sweet-spot-isnt-its-max)
-> for the full sweep.
->
-> **→ See [WINDOWS_PORT.md](WINDOWS_PORT.md)** for build instructions and what was changed
-> to make Windows work at all.
->
-> **`main` also reads v3 `.ninfer` artifacts** (the format HuggingFace repos migrated to
-> after this engine originally shipped v2-only support) — no separate build flag needed,
-> the reader auto-detects the container version. **→ See
-> [docs/artifact-v3-port-notes.md](docs/artifact-v3-port-notes.md)** for what v3 changed,
-> how this port reads it, and what was fixed to get a real Qwen3.8-27B v3 artifact serving
-> end to end. The `winport-v2` branch has the plain Windows port without v3 support, if you
-> only need v2.
+A C++20/CUDA inference engine specialized for **one NVIDIA GeForce RTX 4090** (`sm_89`), built
+and run natively on **Windows 11** (MSVC + CUDA; no WSL, no Docker). It serves two 27B models of
+the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP server:
 
-NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an `sm_89` port of
-[NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
-[Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine.
-The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and
-Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP
-speculative decoding, reasoning-effort control, and ReplaySSM state transactions.
+| Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
+|---|---|---:|---:|---:|---:|
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **188 tok/s** | **532 tok/s** (MTP + n-gram) | 4,500 tok/s |
+| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,008 tok/s** |
+| **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 107 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
+| **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
-This fork targets `sm_89`, on Linux natively or Windows via the native MSVC port above.
-Blackwell-only NVFP4/W4A4 execution is unavailable; the engine uses the same groupwise-int path
-as the 3090 base. The Qwen3.6-35B-A3B target is inherited but untested on the RTX 4090.
+The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
+processing run on int8 tensor cores (1.6-1.8x faster, same decode, same quality within noise).
+For reference, the official llama.cpp prefills a Qwen3.8-27B Q4_K_S GGUF at 2,729 tok/s
+(`pp2048`) on the same card.
 
-## Windows native port: v3 artifact support and speed tuning
+Swift 1.5 is a separate fine-tune of Qwen3.8-27B by UkisAI, trained to avoid overthinking. With
+the model card's sampling and thinking on, it used 27 % fewer tokens than base Qwen3.8 on six hard
+problems (three seeds each, 18/18 correct for both), mostly by cutting the longest reasonings;
+decode was slightly faster (129.8 against 121.8 tok/s) thanks to higher MTP acceptance
+([WINDOWS_PORT.md](WINDOWS_PORT.md#sampled-comparison-swift-15-against-base-2026-09-26)). Its
+license limits commercial use above a revenue threshold; see the model card.
 
-Both measured directly on this Windows build, RTX 4090, `--kv-dtype rk4v4-e8`, greedy
-decoding, `enable_thinking:false`. Full detail in
-[docs/artifact-v3-port-notes.md](docs/artifact-v3-port-notes.md) and
+Every figure in this README was measured on the same RTX 4090 under Windows unless it says
+otherwise; the conditions are next to each table. Both models run the full 262K-token context on
+24 GB.
+
+- [Quick start](#quick-start)
+- [Performance](#performance)
+- [Choosing settings](#choosing-settings)
+- [Benchmarking and validation](#benchmarking-and-validation)
+- [How it works](#how-it-works)
+- [Converting models](#converting-models)
+- [Serving](#serving)
+- [Limits](#limits)
+- [Documentation](#documentation)
+- [Lineage and credits](#lineage-and-credits)
+
+## Quick start
+
+### Requirements
+
+| | |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090, 24 GB (`sm_89`). The build targets this card only. |
+| OS | Windows 11 x64 |
+| Toolchain | Visual Studio Build Tools with MSVC (2026 validated), CUDA 12.8 or newer (13.4 validated), CMake 3.28+, Ninja |
+| Libraries | [vcpkg](https://github.com/microsoft/vcpkg) (`curl`, `ffmpeg`, `pkgconf`, installed from the manifest) |
+| Download tool | [`hf`](https://huggingface.co/docs/huggingface_hub/guides/cli) (`pip install -U huggingface_hub`) or a browser |
+
+### 1. Build
+
+From a "x64 Native Tools" prompt (or after running `vcvars64.bat`) with CUDA on `PATH`:
+
+```bat
+git clone -b feat/bonsai-ternary https://github.com/JGamboa/ninfer-4090-windows
+cd ninfer-4090-windows
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake ^
+  -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build -j
+```
+
+This produces `build\apps\ninfer.exe` (CLI), `build\apps\ninfer-serve.exe` (HTTP server) and
+`build\apps\ninfer-perplexity.exe`. Add `-DNINFER_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON` to also
+build the benchmarks and tests. At runtime, put `build\vcpkg_installed\x64-windows\bin` and the
+CUDA `bin` directory on `PATH`. Build details and the Windows-specific changes are in
 [WINDOWS_PORT.md](WINDOWS_PORT.md).
 
-### v3 artifact support — validated end to end
+### 2. Download a model
 
-The reader/binder/bindings.cpp work that lets this build open v3 `.ninfer` artifacts
-(container version auto-detected from the magic bytes; v2 keeps working unchanged) was
-checked against the real Qwen3.8-27B v3 artifact, not just unit-tested in isolation:
+```bat
+:: Ternary Bonsai 2 27B: text + vision + MTP head (6.4 GiB)
+hf download jgamboa/Ternary-Bonsai-2-27B-NInfer-4090 bonsai2_27b_vl_mtp_q4q5.ninfer --local-dir E:\LLM
 
-| Check | Result |
-|---|---|
-| All bindings resolve (text, vision, MTP, dflash2) | Pass |
-| Weight load | 16.7 GiB, complete |
-| CUDA graphs build | Pass |
-| Server reaches `engine ready` and starts listening | Pass |
-| Real generation request (`enable_thinking:false`) | Correct Python output, `reasoning_tokens:0` |
-| Decode throughput on that request | 131.85 tok/s at 90% MTP draft acceptance |
+:: Qwen3.8-27B with int8 prefill: text + vision + MTP + DFlash2 (19.0 GiB)
+hf download jgamboa/Qwen3.8-27B-NInfer-4090 qwen3_8_27b_a8.ninfer --local-dir E:\LLM
 
-Along the way, two apparent artifact bugs (a `chat_template.jinja` mismatch and an
-unrecognized template hash) turned out to be neither: this fork's frontend validation was
-outdated relative to upstream `Neroued/ninfer`, which had already dropped the same
-mismatch check and moved to a different templating scheme. Fixed here instead of worked
-around — see the doc above for how that was confirmed byte-for-byte against upstream.
+:: or the official Qwen3.8-27B artifact (same weights, BF16 prefill)
+hf download neroued/Qwen3.8-27B-NInfer qwen3_8_27b.ninfer --local-dir E:\LLM
+```
 
-### Speed: `--spec`/`--draft-tokens` sweep
+Any folder works; the examples below use `E:\LLM`. The Bonsai repository also has
+`bonsai2_27b_vl.ninfer`, the same model with a Q8 MTP layer (3.5-4.8 % slower decode). Verify
+each download against the checksums on its model card.
 
-Swept both speculative-decoding backends with a fixed code-generation prompt (same seed,
-greedy) instead of assuming the existing default was optimal:
+### 3. Run from the command line
 
-| Backend | `--draft-tokens` | Decode | Draft acceptance |
-|---|---:|---:|---:|
-| `mtp` | 3 | 137.8 tok/s | 96.2% |
-| `mtp` | 5 (max for this backend) | 160.6 tok/s | 89.8% |
-| `dflash2` | 8 | 194.4 tok/s | 97.2% |
-| **`dflash2`** | **12** | **210.9 tok/s** | 85.7% |
-| `dflash2` | 15 (max for this backend) | 201.5 tok/s | 76.8% |
+```bat
+build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
+  --prompt "Write a Python function that merges two sorted lists." ^
+  --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 2 --lm-head-draft
 
-`--spec dflash2 --draft-tokens 12` is the fastest configuration found: **210.9 tok/s**, a
-**+53%** improvement over `mtp --draft-tokens 3`. `dflash2` uses a real separate small
-autoregressive draft model (vs. MTP's single-shot prediction head), which is why it stays
-accurate at much greater speculation depth — but note the optimum is *not* either
-backend's maximum allowed `--draft-tokens`: acceptance keeps falling as it rises, and past
-a point the extra verification cost outweighs the extra accepted tokens. Requires an
-artifact that ships DFlash2 weights (~1.6 GiB extra); the server auto-detects and requires
-them once `--spec dflash2` is passed.
+build\apps\ninfer.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
+  --prompt "Write a Python function that merges two sorted lists." ^
+  --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain
+```
 
-## Measured results on the RTX 4090
+The CLI prints the answer, then a summary with prefill and decode speed, MTP acceptance and memory
+use. Both models think by default; add `--no-thinking` or `--reasoning-effort low|medium|xhigh`.
+Chat histories, images and video go through `--messages FILE.json` (examples in
+[examples/cli/messages](examples/cli/messages)). `ninfer.exe --help` and [docs/cli.md](docs/cli.md)
+list every option.
 
-Conditions: single request, greedy decoding, CUDA Graphs on, INT8 KV, `--prefill-chunk 1024`,
-official 16.96 GiB Qwen3.8-27B artifact. The code-generation decode row and the prefill rows
-are measured from the `ninfer-serve` `/metrics` counters (computed prefill only); the other
-decode rows use the `ninfer` CLI.
+### 4. Run the server
 
-| Test | Result |
-|---|---|
-| Decode, code generation, MTP3 | **148.6 tok/s** at 81.0% draft acceptance |
-| Decode, bench corpus, MTP3 | 106.5 tok/s at 48.7% acceptance |
-| Decode, no speculation | 50.5 tok/s |
-| Decode at 128K depth, no speculation | 39.6 tok/s |
-| 64K needle-in-a-haystack | exact answer, 1,849 tok/s prefill |
-| 128K needle-in-a-haystack | exact answer, 1,561 tok/s prefill |
-| Vision, chart reading | 3 of 3 oracle facts, 22 ms vision tower |
-| Ops test suite | 78 of 78 runnable tests pass on `sm_89` |
+Ternary Bonsai 2 27B, full 262K context per request, three concurrent requests, vision on:
 
-MTP acceptance, and with it the decoded rate, tracks how predictable the output is: structured
-code accepts about 81% of draft tokens, the mixed bench corpus about 49%.
+```bat
+build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
+  --host 127.0.0.1 --port 8080 --model-id bonsai-27b ^
+  --max-context 262144 --kv-capacity auto --kv-dtype rk4v4-e8 --max-concurrency 3 ^
+  --spec mtp --draft-tokens 2 --lm-head-draft --ngram chain --vision
+```
 
-The shipping default has since moved from INT8 KV to the E8 4-bit KV mode, which serves the
-model's full native 262,144-token context on this card. Retrieval stays exact through 260K
-(single-needle, 5-needle, and exact-code-detail probes), MTP acceptance at depth is unchanged,
-and the costs against the INT8 numbers above are a 5.7% decode tax and 1-2% of prefill; see
-[Quick start](#text-only-full-262k-native-context-e8-4-bit-kv-default) for the measured deltas.
+Qwen3.8-27B, 100K context, three concurrent requests:
 
-For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF at about
-46 tok/s in a 144K-context configuration where the MTP buffers do not fit. The upstream engine
-on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400 W power cap
-(the upstream README quotes about 200), so this card lands within 14% of it under MTP.
+```bat
+build\apps\ninfer-serve.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
+  --host 127.0.0.1 --port 8080 --model-id qwen3.8-27b ^
+  --max-context 100000 --kv-capacity 100000 --kv-dtype rk4v4-e8 --max-concurrency 3 ^
+  --max-pending-requests 10 --pending-timeout-ms 600000 --prefill-chunk 1408 ^
+  --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain --preserve-thinking ^
+  --device-state-slots 3 --host-state-slots 4 --host-kv-mib 4096
+```
 
-### Depth sweep against llama.cpp
+These are the configurations the author runs daily. The server checks the memory plan before it
+listens, so a configuration that does not fit fails at startup, not at request time.
 
-Both engines were measured on the same card. llama.cpp build 10358 ran `llama bench` on the
-`UD-Q4_K_XL` GGUF (16.68 GiB) with q8_0 KV cache, flash attention, and `-ub 1024 -b 4096`,
-which matches its deployed configuration, on 2026-08-15. The NInfer side was re-measured on
-2026-08-17 on the deployed E8 262K configuration through the `/metrics` counters; the
-llama.cpp configuration did not change between the dates. Two caveats: the artifacts differ
-by about 2% in size, and `llama bench` is a bare kernel loop while the NInfer numbers
-include the full server path.
+- API base URL: `http://127.0.0.1:8080/v1` (OpenAI Chat Completions and Responses) and
+  `http://127.0.0.1:8080/v1/messages` (Anthropic Messages). Use `--host 0.0.0.0` to serve the
+  local network and `--api-key KEY` to require a key.
+- Live monitor: open `http://127.0.0.1:8080/monitor` in a browser for decode and prefill speed,
+  draft acceptance, prefix-cache reuse, KV occupancy, slots and recent requests.
+- Prometheus metrics at `/metrics`, a llama.cpp-style slot table at `/slots`.
 
-Marginal rates at depth:
+A first request from PowerShell:
 
-| Depth | llama.cpp pp2048 | llama.cpp tg32 | NInfer decode, no speculation |
-|---:|---:|---:|---:|
-| 0 | 3,024 tok/s | 45.9 tok/s | 50.4 tok/s |
-| 32K | 2,327 | 42.0 | - |
-| 64K | 1,866 | 38.6 | - |
-| 128K | 1,336 | 33.1 | 42.1 |
-| 256K | no entry | no entry | 36.6 |
+```powershell
+$body = @{ model = "bonsai-27b"; max_tokens = 512
+           messages = @(@{ role = "user"; content = "Explain CUDA graphs in three sentences." }) } | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
+  -ContentType "application/json" -Body $body | Select-Object -ExpandProperty choices
+```
 
-Wall time to prefill one full prompt (llama.cpp integrated from the marginal rates, NInfer
-measured):
+Any OpenAI- or Anthropic-compatible client (OpenCode, Claude Code through a proxy, LiteLLM, Open
+WebUI, the `openai` Python package) works with the same URL.
 
-| Prompt | llama.cpp | NInfer |
-|---:|---:|---:|
-| 32K | 12.5 s (2,630 tok/s) | 14.5 s (2,027 tok/s) |
-| 64K | 28.3 s (2,317 tok/s) | 31.7 s (1,857 tok/s) |
-| 128K | 70.4 s (1,862 tok/s) | 74.5 s (1,581 tok/s) |
-| 192K | no entry | 127.9 s (1,381 tok/s) |
-| 256K | no entry | 191.7 s (1,228 tok/s) |
+## Performance
 
-The llama.cpp prefill lead narrows with depth. Server-measured, it prefills a 64K prompt in
-28.7 s against 31.7 s (a 10% lead) and a 128K prompt in 71.6 s against 74.5 s (4%); the
-server path costs llama.cpp 2-4% over the bare-loop estimates above. Everything past its
-144K ceiling is NInfer-only. Decode inverts the shallow picture. NInfer leads by 10%
-shallow and by 27% at 128K without speculation, and the MTP3 gap grows with depth:
+Conditions for every table: RTX 4090 at stock clocks, Core i9-13900K, Windows 11, driver 595.97,
+CUDA 13.4, greedy decoding unless noted. The same 4090 drives a 4K desktop at 60 Hz, which costs
+about 15 % of decode ([below](#when-the-4090-also-drives-the-display)).
 
-| Workload | llama.cpp `draft-mtp` | NInfer MTP3 (E8) |
+### Ternary Bonsai 2 27B
+
+Against Prism's own llama.cpp fork (build b10709, `Ternary-Bonsai-2-27B-PTQ1_0.gguf`) on the same
+machine:
+
+| Measurement | NInfer | Prism llama.cpp fork |
 |---|---:|---:|
-| Code, shallow | 118.8 tok/s at 85.9% acceptance | 142.9 tok/s at 78.0% |
-| Prose, 64K depth | 55.5 tok/s at 45.3% | 86.1 tok/s at 42.3% |
-| Prose, 128K depth | 42.3 tok/s at 45.4% | 77.5 tok/s at 41.6% |
-| Prose, 256K depth | no entry | 65.4 tok/s at 41.1% |
-| Code, 256K depth | no entry | 91.2 tok/s at 72.1% |
+| Decode, no speculation (`tg128`) | **101 tok/s** | 77 tok/s |
+| Decode, MTP 2, mean of six mixed prompts | **188 tok/s** | — |
+| Decode, MTP 2, prose / edit-style prompts | 167 / 250 tok/s | — |
+| Decode, MTP 2 + n-gram, edit-style prompts | **532 tok/s** | — |
+| Decode, three concurrent requests, aggregate | **360 tok/s** | — |
+| Prefill, `pp512` / `pp2048` | **4,180-4,250 / 4,460-4,500 tok/s** | 1,363 tok/s / — |
+| Prefill, 64K / 128K-token prompt (needle test, answer exact) | 18.6 s / 46.2 s | — |
+| Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
+| Task quality, 45 deterministic tasks (`tools/eval`) | 43/45 | — |
+| Weights in VRAM (text / + vision) | 6.11 / 6.39 GiB | 5.53 GiB (text) |
 
-The NInfer rows in this table use the 2026-08-17 generated corpora; acceptance on them runs
-a few points below the 2026-08-15 payloads (code 78% against 81%), which accounts for the
-difference from the headline 148.6 tok/s. The llama.cpp MTP rows required a reduced
-131,584-token context; the draft buffers push VRAM
-to 23.8 of 24 GiB, and the deployed 144K llama.cpp configuration cannot fit them at all.
-NInfer serves 172,032 tokens with MTP in the same VRAM at INT8 KV, and the full native
-262,144 with the E8 4-bit KV default. Acceptance matches per content type, so the decode gap
-is engine time, not draft quality.
+- Decode depends on the text: drafts are accepted more often in predictable output. Edit-style
+  prompts (return a file, a JSON list or a document with a small change) restate their input.
+- Prism's model card says its PQ2_0 packing processes prompts faster than PTQ1_0, so part of the
+  prefill gap is the file format.
+- Sources: [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md), section 9.1
+  (items 14-25).
 
-Full configurations, method, and raw numbers:
-[NInfer against llama.cpp](docs/llamacpp-comparison.md).
+### Qwen3.8-27B
 
-## Quick start (Linux)
+| Measurement | Result |
+|---|---:|
+| Decode, no speculation (`tg128`) | 47.0 tok/s (~95 % of the card's measured read bandwidth) |
+| Decode, MTP 3, mean of six mixed prompts, thinking on | 107 tok/s |
+| Decode, MTP 3, code prompt, thinking off (server) | 149 tok/s |
+| Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
+| Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
+| Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
+| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **4,436 / 5,008 tok/s** |
+| Prefill, 8K / 64K / 128K-token prompt, official artifact (needle test, answer exact) | 2.9 s / 27.4-27.6 s / 64.0 s |
+| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.6 s / 17.2 s / 43.0 s** |
+| Perplexity, quick four-corpus run, official / int8 artifact | 4.8007 / 4.7944 |
+| Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 (2026-09-25); 45/45 on both artifacts (2026-09-26) |
 
-Requirements: an RTX 4090, a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
+The **int8 artifact** (`qwen3_8_27b_a8.ninfer`) holds the same weights as the official one, byte
+for byte, and allows the prefill GEMMs to quantize their activations to int8 (per token and per 64
+channels) and run on int8 tensor cores; decode is unchanged. It is built from the official file in
+a few minutes, without a BF16 checkpoint ([conversion](#converting-models)).
 
-Build the image and download the model once:
+Against the official llama.cpp on the same machine and the same Qwen3.8-27B fine-tune (ColdFusion;
+llama.cpp `a894dae` on the Q4_K_S GGUF with q8_0 KV and flash attention, NInfer on the Q4/Q5
+artifact with int8 KV; same needle prompts, thinking off, no speculation, two runs each):
 
-```bash
-docker build --tag ninfer-4090:sm89 .
-NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
+| Prompt prefill | llama.cpp | NInfer |
+|---|---:|---:|
+| 8K tokens | 3.0 s (2,558-2,585 tok/s) | 3.0-3.1 s (2,470-2,530 tok/s) |
+| 64K tokens | 29.8-29.9 s | **28.9-29.4 s** |
+| 128K tokens | 73.6-73.8 s | **66.8-66.9 s** (-9 %) |
+| `pp512` / `pp2048` (bench tools) | **2,756 / 2,729 tok/s** | 2,334 / 2,594 tok/s |
+
+With the official artifact, llama.cpp leads on short prompts and NInfer ties at 8K-64K and leads
+at 128K. The int8 artifact prefills `pp512` / `pp2048` at 4,436 / 5,008 tok/s, 1.6-1.8x the
+llama.cpp rates above (the int8 runs used the base Qwen3.8 artifact; the ColdFusion files were
+removed). Measurements and methods: [WINDOWS_PORT.md](WINDOWS_PORT.md).
+
+### Speculative decoding by workload
+
+Decode tok/s, KV `rk4v4-e8`:
+
+| Workload | Bonsai MTP 2 | Bonsai MTP 2 + n-gram | Qwen3.8 MTP 3 | Qwen3.8 MTP 3 + n-gram | Qwen3.8 DFlash2 d6 |
+|---|---:|---:|---:|---:|---:|
+| CLI, edit-style prompts, thinking off | 250 | **532** | 152 | **289** | 215 |
+| CLI, prose, thinking off | 167 | 167 | 97 | 97 | 96 |
+| Server, edit-style prompts, thinking on | 212 | **319** | — | 165 | 169 |
+| Server, edit of a 7K-11K-token file, thinking on | 215 | **378** | — | **258** | 139 |
+
+CLI rows: one request, greedy, up to 1024 tokens. Server rows: `ninfer-serve` with the launcher
+flags above (three lanes, sampling and thinking defaults), one request at a time.
+
+## Choosing settings
+
+**Speculation.** Every drafted token is verified by the model, so the output distribution does
+not change; only the speed does.
+
+| Model | Recommended | When to change |
+|---|---|---|
+| Bonsai | `--spec mtp --draft-tokens 2 --lm-head-draft --ngram chain` | `--draft-tokens 3` is up to 18 % faster on code and math and about 10 % slower on prose |
+| Qwen3.8 | `--spec mtp --draft-tokens 3 --lm-head-draft --ngram chain` | `--spec dflash2 --draft-tokens 6` is faster on free-form prose (99 against 85 tok/s through the server); `--draft-tokens 12` peaks at 211 tok/s on code. DFlash2 loads 1.6 GiB more weights; with three lanes, `--no-cuda-graph` frees about 1.1 GiB of graph memory for about 4 % of decode speed |
+
+`--ngram chain` extends each MTP proposal with text copied from the context, so rounds that
+reproduce code, JSON, tool calls or documents accept 10 or more tokens. It costs a second set of
+CUDA graphs (about 2.5 % of the KV pool) and changes nothing on text with nothing to copy.
+[docs/cli.md](docs/cli.md#speculative-decoding) lists the `--ngram-*` options.
+
+**KV cache.**
+
+| `--kv-dtype` | Use it for |
+|---|---|
+| `rk4v4-e8` (4-bit E8-lattice keys, 4-bit values) | Default. Full 262K context with vision; retrieval exact through 260K |
+| `int8` | Maximum precision; Qwen3.8 fits about 168K tokens text-only |
+| `rk2v4-e8` | More headroom at 262K (2-bit keys); about 10 % slower decode |
+
+**Context and lanes.** `--max-context` bounds one request; `--kv-capacity` sizes the KV pool
+shared by all lanes (`auto` takes what fits). `--max-concurrency` (one to eight) sets the lanes;
+three are measured on both models. Prefill runs one request at a time, so a long prompt delays the
+first token of other requests.
+
+**Sampling.** The server applies the model card defaults: `temperature 1.0, top_p 0.95, top_k 20`
+with thinking, and `temperature 0.7, top_p 0.80, top_k 20, presence_penalty 1.5` without.
+Requests and startup flags (`--temperature`, `--top-p`, ...) override them.
+
+### When the 4090 also drives the display
+
+If the RTX 4090 also drives your monitor, the Windows desktop compositor takes the GPU from CUDA on
+every frame. With a 3840x2160 desktop this cost 18 % of each MTP decode round at 120 Hz and 15 % at
+60 Hz. For the best decode speed, connect the monitor to the motherboard (integrated graphics) or
+another GPU; otherwise use 60 Hz and keep animated windows still while generating. Compare tok/s
+only between runs with the same display setup.
+
+## Benchmarking and validation
+
+Build with `-DNINFER_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON`. Close `ninfer-serve` first, and run
+each A/B comparison alternating the two binaries (old, new, new, old) so thermal and display
+effects cancel. All commands run from the repository root.
+
+**Throughput** (`ninfer_bench`, the public Engine route: `pp` = prefill, `tg` = decode):
+
+```bat
+build\bench\ninfer_bench.exe --weights E:\LLM\qwen3_8_27b.ninfer -p 512,2048 -n 128 -r 3 --kv-dtype int8
+build\bench\ninfer_bench.exe --weights E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer -n 128 -r 3 ^
+  --spec mtp --draft-tokens 2 --lm-head-draft
 ```
 
-Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
+`-o json --output-file FILE` writes a machine-readable report; see [bench/README.md](bench/README.md).
 
-The profiles as written run one generation slot. `--max-concurrency 2` is measured
-and worthwhile on the 4090: the second lane costs about 390 MiB (state pools plus a
-doubled CUDA-graph allowance) while the KV page pool stays shared, so a lone session
-still uses the full context; single-stream decode is unregressed and two sessions
-decode batched at roughly 1.5x aggregate throughput, each lane keeping its own
-resident prefix. Prefill still serializes across lanes, so a deep cold prefill
-delays the other lane's first token.
+**Decode on real prompts** (the six-prompt protocol behind the decode means above; read `decode
+speed` and `mtp acceptance rate` from the summary):
 
-When clients edit recent conversation history (a re-serialized reply, tool results
-folded into the previous turn, an updated agent memory block), the server proposes a
-private long anchor at each of the last N message boundaries of every prompt
-(`--auto-long-anchors N`, on by default at the `--max-long-anchors-per-continuation`
-cap of 2) and re-prefills from the anchor below the edit instead of from zero.
-Coverage reaches back exactly as many message boundaries as the retention cap:
-when the anchor set is full the shallowest is evicted, so an edit deeper than the
-cap still re-prefills from zero. Raise `--max-long-anchors-per-continuation` and
-`--auto-long-anchors` together for deeper reach; each retained anchor holds one GDN
-state image (about 147 MiB of host memory on Qwen3.8-27B), so size `--host-state-slots`
-for `continuations x (2 + anchors)`. The old `--turn-checkpoints` ring is retired
-and ignored; see [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
-
-Extra requests beyond the slots wait in the admission queue, and the queue deadline
-defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
-parallel agent clients would fail with `request_queue_timeout`. The
-`--pending-timeout-ms 600000` line raises the deadline to 10 minutes. On a
-streaming request the timeout arrives as an in-band SSE error event after HTTP 200;
-a client that does not parse error events sees a stream that ends without a
-`finish_reason`. See [docs/serving.md](docs/serving.md) for the full queue
-contract.
-
-### Text-only, full 262K native context (E8 4-bit KV, default)
-
-The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
-[UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090); see
-[the fork comparison](docs/udp-fork-comparison.md)) fits the model's entire native
-262,144-token context on 24 GB with 1.4 GiB to spare:
-
-```bash
-docker run --rm --gpus all --publish 8080:8080 \
-  --volume "$PWD/models:/workspace/models:ro" \
-  ninfer-4090:sm89 \
-  ninfer-serve models/qwen3_8_27b.ninfer \
-  --host 0.0.0.0 --port 8080 \
-  --max-context 262144 --kv-capacity 262144 \
-  --max-concurrency 1 --max-pending-requests 16 \
-  --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --preserve-thinking
+```bat
+build\apps\ninfer.exe E:\LLM\qwen3_8_27b.ninfer --prompt "Explain how a transformer language model generates text, step by step." ^
+  --max-context 4096 --max-new 512 --greedy --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
-Measured against INT8 KV on this build: identical MTP acceptance at 111K depth
-(78.8% vs 78.4%), a 5.7% decode tax (126.6 vs 134.2 tok/s on a shallow greedy code
-probe), prefill within 1-2% at matched depth, and exact single-needle, 5-needle, and
-code-detail retrieval through 260K tokens.
+**Long-context prefill and retrieval** (needle in a haystack; the answer must contain
+`ORCHID=493817`; prompts at 8K, 64K, 128K and 256K):
 
-### Text-only, 168K context (INT8 KV, maximum precision)
-
-```bash
-docker run --rm --gpus all --publish 8080:8080 \
-  --volume "$PWD/models:/workspace/models:ro" \
-  ninfer-4090:sm89 \
-  ninfer-serve models/qwen3_8_27b.ninfer \
-  --host 0.0.0.0 --port 8080 \
-  --max-context 172032 --kv-capacity 172032 \
-  --max-concurrency 1 --max-pending-requests 16 \
-  --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --preserve-thinking
+```bat
+build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --messages examples\cli\messages\long_niah_64k.json ^
+  --max-context 262144 --prefill-chunk 1024 --kv-dtype rk4v4-e8 --no-thinking --max-new 16 --greedy ^
+  --spec mtp --draft-tokens 2 --lm-head-draft
 ```
 
-### With vision, full 262K context (E8 4-bit KV)
+**Perplexity** (four corpora; `--quick` takes one stream per corpus, about two minutes):
 
-The vision scratchpad defaults to 8192 tokens (`--vision-max-tokens`, ported from
-the same fork as the E8 KV modes) instead of the former hardcoded 32768. The
-smaller scratchpad frees about 1.5 GiB, so the full native context fits next to
-vision on 4-bit keys:
-
-```bash
-docker run --rm --gpus all --publish 8080:8080 \
-  --volume "$PWD/models:/workspace/models:ro" \
-  ninfer-4090:sm89 \
-  ninfer-serve models/qwen3_8_27b.ninfer \
-  --host 0.0.0.0 --port 8080 \
-  --max-context 262144 --kv-capacity 262144 \
-  --max-concurrency 1 --max-pending-requests 16 \
-  --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --vision --preserve-thinking
+```bat
+build\apps\ninfer-perplexity.exe E:\LLM\qwen3_8_27b.ninfer --corpus eval\corpora\perplexity-1m\manifest.json ^
+  --quick --kv-dtype bf16 --output E:\eval\ppl_qwen38
 ```
 
-The scratchpad bounds the image tokens per request, not the conversation depth:
-a 51K-token conversation with an attached image completes normally. One
-1024x1024 image costs 1026 vision tokens, so the default fits about seven
-maximum-size images per request. The server rejects a request over the limit
-with `media_budget_exceeded` before the request reaches the encoder. For dense
-video workloads, raise the limit with `--vision-max-tokens`. Each additional
-1024 tokens of scratchpad costs about 62 MiB of VRAM.
+See [docs/perplexity.md](docs/perplexity.md) for full runs and long-context scoring.
 
-### The tradeoff
+**Task quality** (45 deterministic tasks against a running server: tool calls, JSON, Python,
+math, instruction following, Spanish, 4K-32K retrieval):
 
-KV precision, vision, and maximum context trade against each other on a 24 GB card:
+```powershell
+python -m tools.eval run --base-url http://127.0.0.1:8080/v1 --label qwen38 --out E:\eval\qwen38.json --thinking off
+python -m tools.eval compare E:\eval\bonsai.json E:\eval\qwen38.json --markdown E:\eval\compare.md
+```
 
-| Profile | KV mode | Context | KV runtime | Startup slack |
-|---|---|---:|---:|---:|
-| Text-only, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.08 GiB | 1.37 GiB |
-| Text-only, MTP3 | `rk2v4-e8` | 262144 (256K) | 4.01 GiB | 2.43 GiB |
-| Text-only, MTP3 | `int8` | 172032 (168K) | 6.31 GiB | 136 MiB |
-| With `--vision`, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.41 GiB | 780 MiB |
-| With `--vision` (32K scratchpad), MTP3 | `rk2v4-e8` | 262144 (256K) | 5.85 GiB | 329 MiB |
-| With `--vision` (32K scratchpad), MTP3 | `rk4v4-e8` | 212992 (208K) | 6.06 GiB | 108 MiB |
-| With `--vision` (32K scratchpad), MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
+See [tools/eval/README.md](tools/eval/README.md).
 
-262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
-buys no additional context over `rk4v4-e8` in the text-only profile - only slack.
-That slack is what pays for vision. With the former hardcoded 32,768-token vision
-scratchpad, vision cost about 2.1 GiB (1.83 GiB of runtime buffers plus a
-0.28 GiB tower): INT8 could only afford it at 96K, 4-bit keys topped out at
-212992, and only 2-bit keys fit the full 262,144. The default 8192-token
-scratchpad cuts the cost to about 0.6 GiB, and the full native 262,144 now fits
-alongside vision on 4-bit keys with 780 MiB of slack. The vision
-modes answer a two-swatch color oracle exactly at temperature 0, including with
-the image buried under 52,700 tokens of text on `rk2v4-e8`. `rk2v4-e8` also passes
-the text retrieval gates (single-needle at 260K, 5-needle at 118K, exact code
-details at 168K) at a 10% decode tax (120.5 tok/s on the shallow code probe). The
-INT8 text-only ceiling is near 176K: 172032 starts, and 196608 is rejected at
-startup with a byte-exact deficit. The server validates memory before it listens,
-so an oversized context fails fast instead of at request time.
+**Tests.** `ctest --test-dir build --output-on-failure` runs the suite. Every CUDA kernel is
+checked against an independent FP32/FP64 oracle; for example `build\tests\ninfer_linear_t5_test.exe`
+(ternary GEMM/GEMV) and `build\tests\ninfer_softmax_attention_test.exe` (attention, all KV
+modes). Tests that load a real model are opt-in; see [tests/README.md](tests/README.md).
 
-For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
-`CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
-GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
+**Profiling.** `nsys profile --trace=cuda,nvtx` on `ninfer_bench` or the CLI attributes time by
+kernel; Nsight Compute (`ncu`) answers per-kernel questions. The Op benchmarks under
+`build\bench\ninfer_*_bench.exe` (for example `ninfer_t5_bench`, `ninfer_q4_linear_swiglu_bench`)
+time one kernel family at real shapes.
 
-## What this fork changes
+## How it works
 
-- **`sm_89` retarget.** The CMake architecture pin, the runtime compute-capability check, and the
-  NVFP4 stub gate now select `sm_89`. Most SM86 kernel schedules run unmodified on Ada; the
-  INT8 attention prefill schedule is retuned (below).
-- **Ada-retuned INT8 attention prefill.** The SM120 schedule spills registers on Ada and pays the
-  consumer half-rate penalty for f32-accumulate HMMA. Arch-gated for `sm_89`: the full
-  128-register budget, eight paired producer warps over `Bc` column halves with one named-barrier
-  exchange per key tile, byte-permute V dequantization (bit-identical), and fp16-accumulated PV
-  tiles folded into the fp32 running accumulator each tile. The kernel gains 30% at 64K depth
-  (109 to 143 TFLOP/s on the `d256-h24-kv4` INT8 append shape); serve prefill gains 5-7% at
-  88K-128K. Needle-in-a-haystack retrieval stays exact at both depths and all 84 suite tests
-  pass, which bounds the fp16-accumulation numerics change.
-- **Causal-tile partitioned key-block traversal.** Interior key blocks (wholly below the causal
-  diagonal for the whole CTA tile) run a separate instantiation of the key-block body: KV stages
-  with unconditional copies and the softmax drops its masking selects; boundary blocks keep the
-  exact masked path. The idea comes from the
-  [UDPSendToFailed fork](https://github.com/UDPSendToFailed/ninfer-4090) (c5f70526),
-  re-implemented inside the retuned schedule above. Kernel: 144 to 165 TFLOP/s at 32K-224K
-  context on the INT8 append shape (-12 to -13% latency), register count unchanged, bit-exact.
-  End-to-end this is bounded by the attention wall share of this hybrid-GDN model: about +1%
-  serve prefill at 51K on INT8 KV, within noise on the E8 modes, whose staging time is dominated
-  by lattice decode rather than the removed guards.
-- **`/v1/models` reports `context_window`.** Clients without access to a llama.cpp `/props` or a
-  vLLM `max_model_len` can size prompts from the models payload.
-- **llama.cpp-compatible `timings` on chat completions.** Responses and final stream chunks carry
-  a top-level `timings` block (`prompt_n`/`predicted_n`, per-second rates, `ttft_ms`, `cache_n`,
-  `draft_n`/`draft_n_accepted`), so proxies such as llama-swap show per-request prefill and decode
-  rates, MTP draft acceptance, and prefix-cache hits. Contributed by the
-  [shantanusingh16 fork](https://github.com/shantanusingh16/ninfer-4090) of this repository.
-- **`GET /metrics`.** Prometheus counters under llama.cpp-compatible names
-  (`llamacpp:prompt_tokens_total`, `llamacpp:prompt_seconds_total`,
-  `llamacpp:tokens_predicted_total`, `llamacpp:tokens_predicted_seconds_total`,
-  `llamacpp:requests_processing`, `llamacpp:requests_deferred`), so existing scrapers read this
-  server without changes. Prompt tokens count only computed prefill; prefix-cache hits are
-  excluded, as in llama.cpp. Additional `ninfer:` series report request totals, prefix-cache
-  hits, and MTP draft/acceptance totals.
-- **`GET /slots`.** A llama.cpp-shaped slot table read from the engine's real lane state: busy
-  slots report their request's prompt and reused-prefix sizes, idle retained slots report the
-  resident session's depth and its identifying `session_digest`. Truthful per-slot attribution
-  holds at any `--max-concurrency`.
-- **Slot session save/restore.** `--slot-save-path DIR` (off by default) enables llama.cpp-style
-  `POST /slots/{id}?action=save|restore|erase`: one idle slot's complete resident session -
-  paged Text and MTP KV, GDN linear-attention state, rewrite checkpoint, long anchors, and
-  prefix identity - moves to or from disk, and a restored slot reuses the cache across server
-  restarts instead of re-prefilling (a 6.9k-token session restores in about 0.1 s against a
-  multi-second reprefill).
-  Sessions are identified by a stable `session_digest`; chat completions carry `id_slot` and the
-  digest next to `timings`, and `save`/`erase` accept an `if_digest` precondition checked
-  atomically, so a client always persists exactly the session it means. A restored session is
-  reusable from its endpoint, its rewrite checkpoint, or any retained long anchor; the GDN
-  state cannot rewind below the deepest retained checkpoint, and the DFlash backend is not
-  supported. Details in [docs/serving.md](docs/serving.md).
-- **Reuse-aware lane choice.** When prefix reuse ties (typically zero for a fresh session),
-  admission picks the lane whose occupation costs least to replace - an empty lane before any
-  retained session, then the shallowest - so a burst request no longer evicts a deep resident
-  session while a free lane exists.
-- **Automatic long anchors.** `--auto-long-anchors N` (default: the
-  `--max-long-anchors-per-continuation` cap) has the server propose a private long anchor at
-  each of the last N message boundaries of every prompt. Upstream's long anchors exist only
-  where a client places an explicit `PrivateLongAnchor` marker, which no OpenAI or Anthropic
-  request can express, so without this flag a rewrite deeper than the last assistant reply
-  has no reuse candidate at all and re-prefills from token zero. With it, the prompt restores
-  at the anchor below the edit. A full anchor set replaces its shallowest entry, so the
-  retained anchors track the most recent boundaries and coverage reaches back exactly the
-  cap: an edit deeper than `--max-long-anchors-per-continuation` boundaries still re-prefills
-  from zero, so raise the cap and this flag together (and `--host-state-slots` with them) for
-  deeper history. Measured on agent traffic, 94% of consecutive prompts are pure appends and
-  96.5% of the remaining history rewrites are two messages deep or less, so the default cap of
-  2 covers 99.8% of turns. The rare deeper edits replace the whole history from message one or
-  two, where no anchor can help. Anchors ride the existing catalog, pressure planner and slot
-  snapshots. This replaces the retired `--turn-checkpoints` ring
-  ([docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md)).
-- **Auto-save on eviction.** `--auto-save-evicted` (off by default, requires
-  `--slot-save-path`) spills an involuntarily evicted session - endpoint, rewrite checkpoint
-  and long anchors included - back to the slot file it was last saved to or restored from,
-  before the eviction destroys it. Rotating more sessions than slots then loses nothing: the
-  next restore recovers the session at its latest frontier. Explicit `erase` never auto-saves.
-  Two rules keep a spill from losing data. First, a slot file is bound to at most one slot at
-  a time: the most recent `save` or `restore` of a path owns it, and every other slot that held
-  the same path is unbound. A stale copy of a session, left behind when a restore retains its
-  source, therefore cannot write the file when it is evicted. Second, a spill never rolls a
-  file back: a spill with fewer tokens than the file already holds is refused and logged as
-  `slot auto-save SKIPPED`, while an explicit `save` always wins. Without these rules a
-  two-day-old copy of a live session once overwrote its 78k-token file, and the client resumed
-  the rolled-back state.
-- **Planner diagnostics in the request JSONL.** `--request-log-jsonl FILE` records, per
-  request, the reuse path the planner chose (`prefix_reuse_path`), the prefix tokens it reused,
-  and the materialization search behind the choice: `stop_reason`, `budget_exhausted`,
-  `selected_maximal_fallback`, `targets_evaluated`, and `best_reuse_prompt_tokens`, the most
-  reuse any candidate offered. That last field separates the two causes of a cold prefill. A
-  value of `0` means that no reuse candidate existed, so the cause sits upstream of the planner:
-  a missing anchor or a changed prefix. A large value beside `prefix_reuse_path=root` means
-  that a candidate existed and the planner rejected it, which points at the search itself.
-  `/metrics` carries only the llama.cpp-compatible subset, so this file is the only place these
-  fields appear. Field reference in [docs/serving.md](docs/serving.md).
-- **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
-  instead of aborting. The full remaining suite passes on the RTX 4090.
-- **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
-  and the 262K-to-1M visible-keys envelope lift from the
-  [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) sibling fork,
-  merged under this fork's retuned `sm_89` attention prefill schedule. The E8 codec verifies
-  bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
-  CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
-  Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
-- **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the same fork
-  and sizes the vision encode workspace (default 8192 tokens, formerly hardcoded 32768). This
-  fork additionally wires the processor media budget to the same limit, so an over-limit
-  request fails as `media_budget_exceeded` instead of reaching an undersized encoder.
+NInfer is a from-scratch engine for one architecture family (Qwen3.5/3.6/3.8: 48 Gated DeltaNet
+linear-attention layers and 16 full-attention layers at 27B). There is no generic graph: each
+layer runs explicit kernels selected for its weight format, and every decode round replays as one
+CUDA graph.
 
-## Known limits on the RTX 4090
+- **Ternary weights (Bonsai).** Prism's ternary codes are stored as scaled base 3, five weights
+  per byte, with one FP16 scale per 128 weights (`t5_g128_fp16`, 1.75 bits per weight). Decode
+  quantizes activations to int8 and multiplies with `dp4a`; prefill and multi-token verification
+  use int8 tensor cores (`m16n8k32`), with a pipelined kernel for the tall projections that
+  overlaps tensor-core work with the ternary decode. Prism's Hadamard rotation is fused into the
+  activation quantization.
+- **Groupwise weights (Qwen3.8).** Q4/Q5 codes with one FP16 scale per 64 weights, dequantized in
+  shared memory for BF16 tensor-core GEMMs, with K-split routes for the 5-16-token verification
+  band of DFlash2. Prefill runs pipelined one-CTA-per-SM GEMMs; with the int8 artifact the codes
+  feed int8 tensor cores directly against per-token, per-64-channel int8 activations.
+- **Speculative decoding.** MTP uses the model's own multi-token-prediction layer (Bonsai borrows
+  Qwen3.8's, which shares its architecture); DFlash2 is a separate drafter; the n-gram pool
+  (16 MiB, 8-token keys) extends MTP drafts with text from the context, up to 15 tokens per round.
+  The linear-attention state rolls back rejected tokens through ReplaySSM records.
+- **Long context.** Paged KV in int8 or E8-lattice 4-bit/2-bit codes, a warp-specialized prompt
+  attention kernel (producer warps score, worker warps accumulate), and decode attention splits
+  sized for whole waves of the 128 SMs.
+- **Serving.** A fixed number of lanes (one to eight) decode as one batch; prefixes of previous
+  requests are reused from device memory, host memory or disk.
 
-- Prefill trails llama.cpp by 16-24% on full 32K-128K prompts under matched conditions (see
-  the depth sweep above). The rate is flat across `--prefill-chunk` 1024 to 2688, so the
-  chunk size is not the lever. With the attention schedule retuned, the remaining gap sits in
-  the custom quantized GEMMs, which run about 10% below cuBLAS on Ada. Decode is where this
-  engine leads.
-- Keep `--prefill-chunk` at 2688 or below. This fork carries measured `sm_89` cooperative
-  residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
-  stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
-  accurate at its onset (about 1e-5 relative).
-- `--max-concurrency 2` is measured on the 4090 (see Quick start); higher lane counts are
-  untested here, and the published cohort results in the
-  [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
-- Prefill is strictly serialized across lanes with no chunk-level interleaving, and decode
-  starves while any prefill runs: a short request submitted behind a 31k-token cold prefill
-  measured a 13.5 s first token. Concurrency pays off for decode and for per-lane resident
-  prefixes, not for prefill fairness.
-- The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
-  no multi-GPU execution, no weight offload.
+The ternary work (converter, format, kernels, measurements and every design decision) is
+documented in the [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md) and the
+[conversion guide](docs/maintainer/bonsai-ternary-conversion.md). Engine internals are in
+[docs/maintainer/engine-architecture.md](docs/maintainer/engine-architecture.md).
 
-## Artifact
+## Converting models
 
-| Model | Artifact | Size |
-|---|---|---:|
-| Qwen3.8-27B | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB |
+The converter is Python (3.11 or 3.12) with NumPy, safetensors and PyTorch; it runs on Windows and
+uses the GPU when `--device cuda` is given:
 
-The artifact is architecture-independent; the model card's RTX 5090 requirement describes the
-upstream engine, not the file. Verify the download against the SHA-256 published on the card.
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install numpy safetensors
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
 
-## Reasoning effort
+**Ternary Bonsai 2 27B from Prism's GGUF.** Download `Ternary-Bonsai-2-27B-PTQ1_0.gguf` and, for
+images, `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` from
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
+and `qwen3_8_27b.ninfer` (it supplies the tokenizer, chat template and MTP head). About three
+minutes:
 
-Qwen3.8-27B has three trained reasoning depths plus an off switch. OpenAI Chat Completions
-accepts a top-level `reasoning_effort` field (`low`, `medium`, `xhigh`) and a top-level
-`enable_thinking` boolean; hidden reasoning returns separately as `message.reasoning_content`.
-Only those three levels are accepted, plus `none` to turn thinking off. `high`, `minimal`, and
-`max` are rejected as `reasoning_effort_not_supported`, so a client that offers a `high` setting
-must map it to `xhigh`. A token budget for reasoning is separate from the effort level. It is
-set only through the Anthropic Messages path (`thinking.budget_tokens`) or server-wide with
-`--default-thinking-budget N`; the OpenAI paths have no field for it. Without a budget,
-reasoning is bounded only by the request's `max_tokens`, which is what the model card
-recommends, and the `model_thinking_tokens` field of the request JSONL reads zero, because that
-counter runs only under a budget. The `chat_template_kwargs` request field of llama.cpp is not
-supported and is rejected. For the CLI, pass `--reasoning-effort` or `--no-thinking`. Sampling
-defaults come from the model card and switch with the thinking mode: `temperature=1.0`,
-`top_p=0.95`, `top_k=20` in thinking mode; `temperature=0.7`, `top_p=0.80`, `top_k=20`,
-`presence_penalty=1.5` in non-thinking mode.
+```bat
+python -m tools.convert.bonsai_base --gguf E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --reference E:\LLM\qwen3_8_27b.ninfer ^
+  --mmproj E:\LLM\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf --out E:\LLM\bonsai2-27b-vl
+python -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe bonsai2_27b_mtp_q4q5 ^
+  --components text,vision,mtp --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --source mmproj=E:\LLM\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf ^
+  --source mtp=E:\LLM\qwen3_8_27b.ninfer --proposal --name bonsai2-27b ^
+  --out E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --device cuda
+```
 
-## Serving APIs
+Leave out `--mmproj`, `vision` and `--source mmproj=...` for a text-only artifact. The recipe keeps
+Prism's ternary codes bit-exact.
 
-OpenAI Chat Completions, OpenAI Responses with streaming and local continuation state, Anthropic
-Messages, prompt-rendered function tools with parsed tool calls, compatible-prefix reuse, and
-JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
+**Qwen3.8-27B fine-tunes from BF16 safetensors.** Any checkpoint with the Qwen3.8-27B
+configuration converts with the official recipe, including its MTP layer; add the DFlash2
+drafter from [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) if you want `--spec
+dflash2`. A 55 GB BF16 checkpoint converts in about 100 s:
 
-## Upstream and credits
+```bat
+python -m tools.convert --model E:\LLM\my-qwen38-finetune --recipe qwen3_8_27b ^
+  --source dflash2=E:\LLM\dflash2-src --components text,vision,mtp,dflash2 ^
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja --proposal ^
+  --name my-qwen38 --out E:\LLM\my_qwen38.ninfer --device cuda
+```
 
-- [Neroued/ninfer](https://github.com/Neroued/ninfer) - the engine, developed for the RTX 5090
+Use NInfer's `qwen3_8.jinja` template: it adds developer and mid-conversation system messages
+and tool-result handling that agent clients need.
+
+**Qwen3.8 int8 prefill artifact.** A ready-made file is on
+[jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090). To
+build it yourself: the `qwen3_8_27b_a8` recipe copies an existing
+`qwen3_8_27b.ninfer` word for word and only grants int8 activations to the prefill GEMMs. It needs
+a configuration directory (the Qwen3.8 `config.json` and tokenizer/template files) and takes about
+four minutes on the CPU:
+
+```bat
+python -m tools.convert --model E:\LLM\qwen38-config --recipe qwen3_8_27b_a8 ^
+  --source reference=E:\LLM\qwen3_8_27b.ninfer --source dflash2=E:\LLM\dflash2-src ^
+  --components text,vision,mtp,dflash2 --name qwen3.8-27b --out E:\LLM\qwen3_8_27b_a8.ninfer
+```
+
+The [conversion guide](docs/weight-conversion.md) lists the files the configuration directory
+needs. Custom recipes and every option are in the
+[weight conversion guide](docs/weight-conversion.md).
+
+## Serving
+
+- **APIs.** OpenAI Chat Completions, OpenAI Responses (streaming, stored continuation state) and
+  Anthropic Messages; function tools are rendered into the prompt and parsed back as tool calls
+  (NInfer does not execute tools).
+- **Reasoning.** `reasoning_effort` (`low`, `medium`, `xhigh`, or `none`) and `enable_thinking`
+  on OpenAI routes; `thinking.budget_tokens` on Anthropic Messages or `--default-thinking-budget`
+  server-wide. Reasoning returns separately as `reasoning_content`.
+- **Prefix reuse.** Requests that extend or edit a previous conversation resume from the longest
+  compatible prefix. Automatic long anchors at the last message boundaries
+  (`--auto-long-anchors`) let an edited history restart below the edit instead of from zero.
+- **Session persistence.** `--slot-save-path DIR` enables llama.cpp-style
+  `POST /slots/{id}?action=save|restore|erase`, so a long session survives a server restart
+  (a 6.9K-token session restores in about 0.1 s); `--auto-save-evicted` spills evicted sessions.
+- **Observability.** `/monitor` (browser dashboard), `/metrics` (Prometheus, llama.cpp-compatible
+  names), `/slots`, llama.cpp-style `timings` on every response, and a per-request JSONL log with
+  the prefix-reuse decisions (`--request-log-jsonl FILE`).
+- **Admission.** Requests beyond the lanes wait in a bounded FIFO queue (`--max-pending-requests`,
+  `--pending-timeout-ms`); the default 30 s deadline is short for deep prefills.
+
+The full protocol reference, including every field and error code, is in
+[docs/serving.md](docs/serving.md).
+
+## Limits
+
+- One RTX 4090, one process, one resident model. No multi-GPU, no weight offload, no request
+  preemption or priorities.
+- Prefill runs one request at a time; decode of other lanes waits while it runs.
+- With the official Qwen3.8 artifact, prefill trails llama.cpp on short prompts (`pp512` 2,334
+  against 2,756 tok/s on the same machine); the int8 artifact leads at every length
+  ([Qwen3.8 performance](#qwen38-27b)). Bonsai prefill is about 3x Prism's llama.cpp fork.
+- Long-context decode slows with depth: a Bonsai MTP round costs 18.5-20.8 ms at 128K against
+  12.8 ms at short context, all of it in attention.
+- DFlash2 is not supported with Bonsai's ternary output head; use MTP.
+- NVFP4/W4A4 execution needs Blackwell tensor cores and is unavailable on `sm_89`.
+- This branch is developed and validated on Windows. The Linux build and `Dockerfile` are
+  inherited from the upstream 4090 port and are not re-validated here; see
+  [docs/rtx-3090-linux.md](docs/rtx-3090-linux.md) with `CMAKE_CUDA_ARCHITECTURES=89`.
+
+## Documentation
+
+| Topic | Document |
+|---|---|
+| All documentation | [docs/README.md](docs/README.md) |
+| CLI options | [docs/cli.md](docs/cli.md) |
+| HTTP server and protocols | [docs/serving.md](docs/serving.md) |
+| Windows build, Qwen3.8 measurements and experiments | [WINDOWS_PORT.md](WINDOWS_PORT.md) |
+| Ternary Bonsai design, kernels and measurements | [docs/maintainer/bonsai-ternary-design.md](docs/maintainer/bonsai-ternary-design.md) |
+| Ternary Bonsai conversion and tensor mapping | [docs/maintainer/bonsai-ternary-conversion.md](docs/maintainer/bonsai-ternary-conversion.md) |
+| Weight conversion and custom recipes | [docs/weight-conversion.md](docs/weight-conversion.md) |
+| Perplexity evaluation | [docs/perplexity.md](docs/perplexity.md) |
+| Benchmarks and tests | [bench/README.md](bench/README.md), [tests/README.md](tests/README.md) |
+| Engine architecture | [docs/maintainer/engine-architecture.md](docs/maintainer/engine-architecture.md) |
+| Context cache and scheduling | [docs/maintainer/resource-scheduling-and-context-cache.md](docs/maintainer/resource-scheduling-and-context-cache.md) |
+| Comparison with llama.cpp (Linux, upstream port) | [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md) |
+
+## Lineage and credits
+
+This repository descends from a chain of ports; each added what the next one builds on:
+
+- [Neroued/ninfer](https://github.com/Neroued/ninfer) — the engine, developed for the RTX 5090
   (`sm_120a`).
-- [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) - the SM86 compatibility layer,
-  ReplaySSM integration, and Qwen3.8 runtime support this fork builds on. Its
-  [v0.6.1 release notes](RELEASE_NOTES_0.6.1.md) describe the inherited state.
-- [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) - a sibling
-  RTX 4090 port from the same 3090 base. The rotated and E8-lattice KV-cache quantization
-  modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), the E8 codecs, and the 1M visible-keys
-  envelope are their work, cherry-picked here with authorship preserved. The full 262K
-  default profile exists because of it; see
-  [the fork comparison](docs/udp-fork-comparison.md).
-- [jram4/ninfer-4090](https://github.com/jram4/ninfer-4090) - an earlier RTX 4090 port of a July
-  2026 snapshot. Its Ada dispatch tuning targets a kernel organization that upstream has since
-  replaced, so this fork starts from the current 3090 base instead.
+- [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) — the `sm_86` compatibility
+  layer, ReplaySSM integration and Qwen3.8 runtime support
+  ([v0.6.1 release notes](RELEASE_NOTES_0.6.1.md)).
+- [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) — the `sm_89` RTX 4090 port:
+  Ada-tuned attention prefill, serving features (`/metrics`, `/slots`, slot save/restore,
+  automatic long anchors, request diagnostics).
+- [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) — the rotated and
+  E8-lattice KV modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`) and the configurable vision
+  scratchpad, cherry-picked with authorship preserved
+  ([comparison](docs/udp-fork-comparison.md)).
+- [shantanusingh16/ninfer-4090](https://github.com/shantanusingh16/ninfer-4090) — llama.cpp-style
+  `timings` on chat completions.
+- This repository — the native Windows build, Ternary Bonsai 2 27B (converter, ternary format and
+  kernels, vision), n-gram speculation, the concurrent-lane and prefill work, and the Qwen3.8
+  DFlash2 verification routes.
 
-## Support
-
-NInfer is a personal project that I develop out of interest. If you find it useful and would like
-to support its continued development, you can [support the project on Ko-fi](https://ko-fi.com/neroued).
-
-Support is entirely voluntary. It is not a purchase or investment and does not come with financial
-returns, promised services or features, or a role in project decisions. The project's direction,
-priorities, technical choices, and release schedule remain independently determined by the
-maintainer.
+Ternary Bonsai 2 27B, its packings and Hadamard rotation are by [Prism ML](https://huggingface.co/prism-ml);
+their [llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) defined the formats this branch
+reads. [fraserprice/bonsai-vllm](https://github.com/fraserprice/bonsai-vllm) was a CUDA reference
+for the Hadamard kernel and a ternary tensor-core GEMM. The Bonsai port was developed with
+[Claude Code](https://claude.com/claude-code), with every kernel checked against FP64 oracles and
+every performance claim measured on the RTX 4090.
 
 ## License
 
