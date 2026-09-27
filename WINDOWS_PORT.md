@@ -1172,3 +1172,60 @@ the `a2e5a449` binaries, with no other GPU work (item 29 has the full table):
   41.3 s; all answers exact. `ninfer_bench` int8 KV: pp512 4,622, pp2048 5,138 tok/s, tg128
   54.5 tok/s.
 - Bonsai gains most: pp2048 6,027 tok/s, 64K 16.9-17.2 -> 14.6 s, 128K 42.8 -> 37.4 s.
+
+## Decode round audit (2026-09-27)
+
+Where a decode token or MTP round goes on the RTX 4090, measured with `nsys profile --trace=cuda,nvtx
+--cuda-graph-trace=node` of `ninfer.exe <artifact> --messages
+examples\cli\messages\scenario_story_en_mystery.json --max-context 8192 --max-new 512 --greedy
+--no-thinking [--spec mtp --draft-tokens 3|2 --lm-head-draft]` at `12f87c61` (167 prompt tokens,
+bf16 KV), per NVTX `decode` range. Bytes are the stored weights read per round (Q4_G64 34 and Q5_G64
+42 bytes per 64 weights, Q8 34 per 32, t5 13 per 64 plus an FP16 scale per 128); GB/s against the
+advertised 1008 GB/s.
+
+| Per round, ms (measured) | Qwen3.8 A8, T = 1 | Qwen3.8 A8, MTP 3 (T = 4) | Bonsai, T = 1 | Bonsai, MTP 2 (T = 3) |
+|---|---:|---:|---:|---:|
+| Wall / kernels | 20.17 / 19.86 | 24.54 / 24.18 | 9.03 / 8.71 | 11.21 / 10.84 |
+| Target weight kernels (15.69 GB Qwen, 5.60 GB Bonsai) | 18.93 (829 GB/s) | 19.70 (796 GB/s) | 7.06 (793 GB/s) | 7.15 (784 GB/s) |
+| MTP draft: proposal head (Q4, 131072 rows) + MTP layer | - | 1.19 + 1.58 (~2.4 GB, ~875 GB/s) | - | 0.81 + 0.66 (~1.26 GB, ~855 GB/s) |
+| t5 A8 activation quantization | - | - | 0.74 | 0.76 |
+| GDN (record/update, fold, gating, conv) | 0.39 | 0.96 | 0.47 | 0.90 |
+| Attention (incl. rope, output gate) | 0.33 | 0.43 | 0.34 | 0.38 |
+| Norms, sampling, glue | 0.22 | 0.32 | 0.10 | 0.18 |
+| GPU idle (launch gaps; host and copy-engine gaps) | 0.31 | 0.36 (0.16; 0.21) | 0.32 | 0.37 (0.17; 0.20) |
+| Whole round, weight bytes / wall | 778 GB/s (77 %) | 738 GB/s (73 %) | 620 GB/s (62 %) | 612 GB/s (61 %) |
+
+The weight kernels already stream at 790-910 GB/s: the heads reach 880-910 GB/s, above the 845 GB/s
+of the copy probe above, so that probe understates the read ceiling. Qwen3.8 at T = 4, per call:
+gate+up (`q4_ksplit_mma`) 118.7 us (798 GB/s), the Q5 `simt_split2` down and o_proj/out_proj 50.2 us
+average (788 GB/s, 46.8 us at T = 1), the Q4 sides of GDN in_proj and qkvg (`q4_rowsplit_gemm_simt`)
+17.4 and 30.5 us (640 GB/s), their Q5 sides 820-848 GB/s. Nsight Compute on the T = 4 `split2`
+(one CTA of two warps per row, 64 registers): 66.7 % theoretical and 47-53 % achieved occupancy,
+DRAM throughput 84 % of peak for down (K = 17408) and 76 % for o_proj/out_proj (K = 6144). The
+remaining MTP-round headroom on Qwen3.8 is small: ~0.4 ms in the T = 4 Q5 `split2`, ~0.3 ms in the
+Q4 small sides, and the idle time.
+
+The idle time was mostly the round's copies: in a CUDA Graph on this WDDM driver, each switch between
+a kernel node and a copy-engine node idled the GPU for 15-35 us (ingress copy -> first kernel 25-35
+us, D2D hidden copy -> egress copy 13-27 us, sampling -> egress copy 18-21 us), and the host waited
+for the GDN replay fold before preparing the next round (fold -> next round 26-32 us).
+
+`e589f505` runs these copies as kernels (`kernel_copy_async`, pinned host memory read or written over
+PCIe) and lets a continuing round submit its fold without waiting for it (rows that end or are
+cancelled still wait). Bonsai's items (quantization at decode widths, GDN input loads) are in the
+Bonsai design notes, section 9.1, item 30. Measured 2026-09-27, base (`12f87c61`) and new alternated
+(base, new, new, base), six prompts, 512 tokens, greedy, MTP flags as above: text md5 (answer and
+reasoning) and rounds identical for every prompt; quick perplexity (bf16 KV) 4.794439 and 5.854904.
+
+| Qwen3.8 A8 | Base | New |
+|---|---|---|
+| MTP 3, ms per round (six-prompt mean) | 25.71 / 25.79 | 25.63 / 25.65 (-0.4 %) |
+| MTP 3 + `--ngram chain`, ms per round | 25.86 / 25.87 | 25.74 / 25.74 (-0.5 %) |
+| `ninfer_bench -p 512,2048 -r 3 --kv-dtype int8` tg128 | 47.62 / 47.57 tok/s | 47.74 / 47.66 tok/s |
+| pp512 / pp2048 | 4,174-4,195 / 4,630-4,661 | 4,188-4,195 / 4,643-4,653 (unchanged) |
+| NIAH prefill 8K / 64K / 128K (all exact) | 1.7 / 18.2 / 45.7 s | 1.7 / 18.2 / 45.9 s |
+
+In the round trace the host and copy-engine gaps fall from 3.0 to 1.0 per round. What remains is the
+host's turnaround between the round's egress and the fold launch (52-67 us), which needs the host's
+committed count. The machine measured ~10 % below the 2026-09-27 main figures for both binaries on
+this day (tg128 47.6 against 54.5), so compare within the table.

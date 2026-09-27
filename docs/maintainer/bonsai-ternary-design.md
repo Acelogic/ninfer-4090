@@ -2524,6 +2524,56 @@ Next steps, in order:
       54.5 tok/s. The base times above are faster than the figures measured on 2026-09-26 while
       three agents shared the machine; compare within one table only.
 
+30. Decode round audit and three exact fixes (`65158ee0`, `c6995676`, `e589f505`, measured 2026-09-27,
+    RTX 4090, base `12f87c61`; the Qwen3.8 side and the whole-round table are in WINDOWS_PORT.md,
+    "Decode round audit").
+    - Where an MTP 2 round goes (`nsys --cuda-graph-trace=node`, `scenario_story_en_mystery`, bf16
+      KV, 512 tokens): 11.21 ms wall, 10.84 ms of kernels. The t5 GEMV (T = 3, 257 launches) takes
+      7.15 ms for 5.60 GB (784 GB/s): gate+up 48.1 us (811 GB/s), down 23.7 us (823), o_proj/out_proj
+      9.6 us (~717), GDN in_proj 23.7 us (773), qkvg 21.4 us (749), head 306 us (910). The draft
+      (proposal head 2 x 404 us at 883 GB/s, Q4/Q5 MTP layer 0.66 ms) reads ~1.26 GB in 1.47 ms. The
+      rest: A8 quantization 0.76 ms, GDN 0.90 (record 0.33, fold 0.29, gating 0.17, conv 0.10),
+      attention 0.38, norms and glue 0.18, GPU idle 0.37. The round reads ~6.9 GB (612 GB/s, 61 % of
+      1008); T = 1 decode reads 5.60 GB in 9.03 ms (GEMV 7.06 ms at 793 GB/s).
+    - Nsight Compute, t5 GEMV at T = 3: 121 registers, 8 CTAs of 2 warps per SM (33 % theoretical
+      occupancy, 16-28 % achieved), long-scoreboard stalls 6.2-7.9 of 8.9-15.2 cycles per issued
+      instruction, issue slots 25-36 % busy, 0.48 warp instructions per weight byte. DRAM throughput is
+      82-89 % of peak on the >= 14336-row weights and 63-75 % on the 5120-row ones (640 CTAs, 10 warps
+      per SM): the GEMV is latency-bound on its weight loads, not on the trit decode.
+    - `65158ee0`: the RMSNorm-input quantization ran one CTA per token over the K / 1024 blocks, so at
+      decode widths five blocks ran in series (5.3-5.8 us, 80 calls per round). Below one token per SM
+      each CTA prepares the row's RMS itself (same fixed-order reduction) and quantizes one block
+      (2.1 us): -0.26 ms per round and per token.
+    - `c6995676`: the GDN recurrence loads token t + 1's key, value, gate and query before applying
+      token t (record 6.78 -> 6.43 us per layer).
+    - `e589f505` (both models): the round's ingress, MTP hidden and egress copies run as kernels
+      instead of copy-engine nodes, which idled the GPU 15-35 us each, and a continuing round submits
+      its GDN fold without waiting for it. Host and copy-engine gaps fall from 3.0 to 1.0 per round.
+    - Checks: `ninfer_linear_t5_test`, `ninfer_gated_delta_net_test`,
+      `ninfer_gated_delta_net_replay_record_test` and `ninfer_gdn_replay_fold_test` pass; quick
+      perplexity 5.854904 (bf16 KV); greedy text md5 (answer and reasoning) and MTP rounds identical to
+      the base on the six prompts (with and without `--ngram chain`) and on two 158- and 167-token
+      prompts.
+    - Base and new alternated (base, new, new, base); the machine ran ~10 % below the item-29 figures
+      for both binaries that day, so compare within the table:
+
+      | Bonsai | Base | New |
+      |---|---|---|
+      | MTP 2, ms per round (six-prompt mean) | 11.55 / 11.54 | 11.20 / 11.20 (-2.9 %) |
+      | MTP 2, tok/s (six-prompt mean) | 188.3 / 188.6 | 194.2 / 194.3 (+3.1 %) |
+      | MTP 2 + `--ngram chain`, ms per round | 11.61 / 11.57 | 11.25 / 11.19 (-3.0 %) |
+      | `ninfer_bench -p 512,2048 -r 3 --kv-dtype int8` tg128 | 109.9 / 109.9 tok/s | 114.0 / 113.7 tok/s (+3.6 %) |
+      | pp512 / pp2048 | 5,229-5,287 / 5,505-5,518 | 5,223-5,230 / 5,453-5,496 (within noise) |
+      | NIAH prefill 8K / 64K / 128K (rk4v4-e8, all exact) | 1.5 / 16.3 / 41.8 s | 1.5 / 16.4 / 41.7 s |
+
+    - Rejected, measured: a one-unit prefetch of the GEMV code words (139 registers, 7 CTAs per SM):
+      in_proj 21.9 -> 23.6 us, qkvg 19.9 -> 21.7, gate+up 45.3 -> 46.0 (alternated nsys medians).
+    - Remaining headroom per MTP 2 round: the 5120-row o_proj/out_proj GEMV (~0.12 ms to the big shapes'
+      rate; splitting K further changes the per-lane summation order), the GDN fold (0.29 ms, 302 MB of
+      state traffic) and the host turnaround before it (52-67 us), which folding inside the next
+      round's record kernel would remove; the remaining quantization launches (~0.5 ms); three argmax
+      memset nodes (~4 us each).
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
