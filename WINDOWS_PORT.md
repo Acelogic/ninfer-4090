@@ -1087,3 +1087,17 @@ Not done (estimated below 0.1 % each from the same trace): the RMSNorm fusion be
 qkvg (16 layers, ~5 us each) and before the GDN in_proj, whose BF16 input the gating projection
 still reads. The GDN gated RMSNorm (20.7 us) plus out_proj quantization (6.2 us) could become one
 kernel (~0.6 ms per chunk, estimated).
+
+## Prefill work of 2026-09-26/27, integrated (`f3f4a037`)
+
+The three changes of that round (Bonsai design notes, section 9.1, items 26-28: mixed-tile t5 GEMM
+for the 5120-row weights, loop-invariant V staging in the int8 prompt attention, faster A8
+quantization and the fused Qwen3.8 MLP quantization) were verified together on 2026-09-27 against
+the `a2e5a449` binaries, with no other GPU work (item 29 has the full table):
+
+- Outputs are unchanged: quick perplexity bitwise equal (Qwen3.8 A8 4.794439, Bonsai 5.854904) and
+  identical greedy MTP text on four prompts per model.
+- Qwen3.8 A8 NIAH prefill (rk4v4-e8, MTP 3): 8K 1.6 s both, 64K 16.8 -> 16.5 s, 128K 42.3 ->
+  41.3 s; all answers exact. `ninfer_bench` int8 KV: pp512 4,622, pp2048 5,138 tok/s, tg128
+  54.5 tok/s.
+- Bonsai gains most: pp2048 6,027 tok/s, 64K 16.9-17.2 -> 14.6 s, 128K 42.8 -> 37.4 s.

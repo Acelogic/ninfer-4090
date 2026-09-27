@@ -6,13 +6,13 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **188 tok/s** | **532 tok/s** (MTP + n-gram) | 4,500 tok/s |
-| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,008 tok/s** |
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **188 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,138 tok/s** |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 107 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
 The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
-processing run on int8 tensor cores (1.6-1.8x faster, same decode, same quality within noise).
+processing run on int8 tensor cores (1.7-1.9x faster, same decode, same quality within noise).
 For reference, the official llama.cpp prefills a Qwen3.8-27B Q4_K_S GGUF at 2,729 tok/s
 (`pp2048`) on the same card.
 
@@ -166,8 +166,8 @@ machine:
 | Decode, MTP 2, prose / edit-style prompts | 167 / 250 tok/s | — |
 | Decode, MTP 2 + n-gram, edit-style prompts | **532 tok/s** | — |
 | Decode, three concurrent requests, aggregate | **360 tok/s** | — |
-| Prefill, `pp512` / `pp2048` | **4,180-4,250 / 4,460-4,500 tok/s** | 1,363 tok/s / — |
-| Prefill, 64K / 128K-token prompt (needle test, answer exact) | 18.6 s / 46.2 s | — |
+| Prefill, `pp512` / `pp2048` | **5,793 / 6,027 tok/s** | 1,363 tok/s / — |
+| Prefill, 8K / 64K / 128K-token prompt (needle test, answer exact) | 1.3 s / 14.6 s / 37.4 s | — |
 | Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
 | Task quality, 45 deterministic tasks (`tools/eval`) | 43/45 | — |
 | Weights in VRAM (text / + vision) | 6.11 / 6.39 GiB | 5.53 GiB (text) |
@@ -176,8 +176,10 @@ machine:
   prompts (return a file, a JSON list or a document with a small change) restate their input.
 - Prism's model card says its PQ2_0 packing processes prompts faster than PTQ1_0, so part of the
   prefill gap is the file format.
+- The prefill rows were measured on 2026-09-27 (items 26-29); the decode rows and the Prism fork
+  comparison are from 2026-09-24/25, when the card also drove a real 4K monitor.
 - Sources: [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md), section 9.1
-  (items 14-25).
+  (items 14-29).
 
 ### Qwen3.8-27B
 
@@ -189,9 +191,9 @@ machine:
 | Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
 | Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
-| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **4,436 / 5,008 tok/s** |
+| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **4,622 / 5,138 tok/s** |
 | Prefill, 8K / 64K / 128K-token prompt, official artifact (needle test, answer exact) | 2.9 s / 27.4-27.6 s / 64.0 s |
-| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.6 s / 17.2 s / 43.0 s** |
+| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.6 s / 16.5 s / 41.3 s** |
 | Perplexity, quick four-corpus run, official / int8 artifact | 4.8007 / 4.7944 |
 | Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 (2026-09-25); 45/45 on both artifacts (2026-09-26) |
 
@@ -212,7 +214,7 @@ artifact with int8 KV; same needle prompts, thinking off, no speculation, two ru
 | `pp512` / `pp2048` (bench tools) | **2,756 / 2,729 tok/s** | 2,334 / 2,594 tok/s |
 
 With the official artifact, llama.cpp leads on short prompts and NInfer ties at 8K-64K and leads
-at 128K. The int8 artifact prefills `pp512` / `pp2048` at 4,436 / 5,008 tok/s, 1.6-1.8x the
+at 128K. The int8 artifact prefills `pp512` / `pp2048` at 4,622 / 5,138 tok/s, 1.7-1.9x the
 llama.cpp rates above (the int8 runs used the base Qwen3.8 artifact; the ColdFusion files were
 removed). Measurements and methods: [WINDOWS_PORT.md](WINDOWS_PORT.md).
 

@@ -2500,6 +2500,30 @@ Next steps, in order:
       floor; the GDN gated RMSNorm (22 us) followed by its out_proj quantization (17 us) could be
       one kernel (~1 ms per chunk, estimated).
 
+29. Items 26-28 together (`f3f4a037`, measured 2026-09-27, RTX 4090 driving a 4K60 dummy plug, no
+    other GPU work). Base: the binaries of `a2e5a449` (before items 26-28).
+    - Checks: `ninfer_linear_t5_test`, `rmsnorm`, `gated_rmsnorm`, `linear_swiglu_q4_a8`,
+      `linear_add_q5_a8`, `rmsnorm_swiglu_mlp_q4_q5` and the full `ninfer_softmax_attention_test`
+      pass. Quick perplexity (bf16 KV) is bitwise equal between base and new: Bonsai 5.854904,
+      Qwen3.8 A8 4.794439. Greedy MTP text (256 tokens, thinking off; three short prompts and one
+      of ~1.1K tokens) has the same md5 on base and new for both models.
+    - CLI NIAH prefill (rk4v4-e8, `--prefill-chunk 1024`, MTP, `--no-thinking`; base/new alternated
+      twice for 8K and 64K, once for 128K; all 20 answers exact):
+
+      | Model, prompt | Base | New |
+      |---|---|---|
+      | Bonsai `long_niah_8k` | 1.6 / 1.6 s (4.85 / 4.84K tok/s) | **1.3 / 1.3 s (5.75 / 5.77K)** |
+      | Bonsai `long_niah_64k` | 16.9 / 17.2 s | **14.6 / 14.6 s (-14 %)** |
+      | Bonsai `long_niah_128k` | 42.8 s | **37.4 s (-13 %)** |
+      | Qwen3.8 A8 `long_niah_8k` | 1.6 / 1.6 s (4.87 / 4.88K) | 1.6 / 1.6 s (4.92 / 4.91K) |
+      | Qwen3.8 A8 `long_niah_64k` | 16.8 / 16.8 s | 16.5 / 16.5 s (-2 %) |
+      | Qwen3.8 A8 `long_niah_128k` | 42.3 s | 41.3 s (-2 %) |
+
+    - `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8` on the new build: Bonsai pp512 5,793,
+      pp2048 6,027 tok/s, tg128 123.8 tok/s; Qwen3.8 A8 pp512 4,622, pp2048 5,138 tok/s, tg128
+      54.5 tok/s. The base times above are faster than the figures measured on 2026-09-26 while
+      three agents shared the machine; compare within one table only.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
