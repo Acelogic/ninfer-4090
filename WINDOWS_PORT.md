@@ -1088,6 +1088,77 @@ qkvg (16 layers, ~5 us each) and before the GDN in_proj, whose BF16 input the ga
 still reads. The GDN gated RMSNorm (20.7 us) plus out_proj quantization (6.2 us) could become one
 kernel (~0.6 ms per chunk, estimated).
 
+### A8 GEMM steps of 128 columns (2026-09-27)
+
+The A8 kernel (`src/ops/common/rowsplit_tall_a8_mma.cuh`) now walks K two 64-value groups per
+pipeline step instead of one, so a CTA barrier, the activation `cp.async` issue, the code-byte
+loads and the loop bookkeeping serve 128 columns (64 MMAs per warp for a 128-token tile instead
+of 32):
+
+- Each thread decodes a whole group (32 code bytes, 8 high-bit bytes for Q5) of one row per
+  step; code and activation lines are 128 bytes with 16-byte chunks XORed with `line & 7`.
+- A warp keeps one int32 accumulator set: warps 0-3 multiply group 0, decode, apply group 0,
+  then multiply and apply group 1; warps 4-7 apply the previous step's group 1 and decode, then
+  multiply and apply group 0 and multiply group 1. The row and token scales take three buffers
+  so warps 4-7 can still read the previous step's after the barrier.
+- The activation staging keeps unsigned 32-bit source offsets (the launcher now requires
+  `k % 128 == 0` and `tokens * k < 2^32`; every Qwen3.8 input qualifies). With 64-bit offsets
+  ptxas spilled two values that were reloaded right after each barrier (15 % of the stall
+  samples of the grouped kernel). No instantiation spills now (170-255 registers).
+
+The per-output arithmetic is unchanged (same int32 group sums, FP32 FMAs in K order): a scratch
+old/new harness over the grouped Q4+Q5 (16384 x 5120), residual Q5 (5120 x 6144 / 17408, 64- and
+128-token tiles) and folded SwiGLU (BF16 and quantized outputs) problems at T = 129, 200, 300,
+513, 1024 and 2048 gives byte-identical outputs (535 MB). The A8 op tests (`linear_swiglu_q4_a8`,
+`linear_add_q5_a8`, `gdn_input_proj`, `attn_input_proj`, `rmsnorm_swiglu_mlp_q4_q5`) pass.
+Quick perplexity (bf16 KV) is 4.794439 (Qwen3.8 A8) and 5.854904 (Bonsai) on both binaries, and
+greedy MTP text (256 tokens; two short prompts, `scenario_translation_en_zh` 435 tokens,
+`reasoning_jacobian_counterexample_3d` 492 tokens) is identical for both models at the same ms
+per round (Qwen3.8 MTP 3 bf16 KV 25.5-26.1, Bonsai MTP 2 11.4-11.9).
+
+Nsight Compute, T = 1024 (scratch harness, cold cache, ~2.57 GHz), base -> new:
+
+| Problem | Duration | IMMA pipe active | Barrier stall per issue |
+|---|---|---|---|
+| Folded gate+up, quantized output (34816 x 5120) | 1325 -> 1041 us | 40.8 -> 52.2 % | 0.95 -> 0.28 |
+| Residual Q5, 128-token tiles (5120 x 6144) | 273 -> 240 us | 42.2 -> 47.9 % | 0.93 -> 0.40 |
+| Grouped Q4 + Q5 (16384 x 5120) | 519 -> 508 us | 49.4 -> 50.5 % | 0.30 -> 0.47 |
+
+The grouped problem (GDN in_proj, attention qkvg) was not barrier-bound and gains little; the
+others were.
+
+Op benches (cold L2, median us; base, new, new, base):
+
+| Family | T = 512 | T = 1024 | T = 2048 |
+|---|---|---|---|
+| gate+up 34816 x 5120 | 689 / 656 -> 523 / 523 | 1282 / 1229 -> 977 / 978 | 2544 / 2439 -> 1940 / 1939 |
+| down 5120 x 17408 | 495 / 495 -> 402 / 401 | 769 / 769 -> 715 / 687 | 1294 / 1295 -> 1202 / 1164 |
+| o_proj / out_proj 5120 x 6144 | 189 / 187 -> 159 / 157 | 295 / 294 -> 267 / 266 | 490 / 489 -> 446 / 446 |
+| GDN in_proj 16384 x 5120 | 278 / 289 -> 275 / 286 | 531 / 556 -> 520 / 541 | 1040 / 1092 -> 1022 / 1063 |
+| qkvg 14336 x 5120 | 273 / 285 -> 265 / 275 | 465 / 487 -> 453 / 472 | 913 / 959 -> 887 / 925 |
+
+End to end, Qwen3.8 A8 (base, new, new, base; 128K once each; all answers exact; the machine
+was slower than on 2026-09-27 morning, so compare within the table):
+
+| Measurement | Base | New |
+|---|---|---|
+| NIAH 8K prefill (rk4v4-e8, chunk 1024, MTP 3) | 1.7 / 1.7 s (4.45K tok/s) | 1.5 / 1.5 s (4.96K tok/s) |
+| NIAH 64K prefill | 18.1 / 18.0 s | 16.7 / 16.7 s (-7.5 %) |
+| NIAH 128K prefill | 45.3 s | 42.6 s (-6 %) |
+| `ninfer_bench -p 512,2048 -r 3 --kv-dtype int8` pp512 | 4,204 / 4,205 tok/s | 4,786 / 4,769 tok/s (+13.6 %) |
+| pp2048 | 4,680 / 4,686 tok/s | 5,203 / 5,191 tok/s (+11 %) |
+
+Bonsai does not use this kernel for its projections: `ninfer_bench` pp512 / pp2048 5,223 / 5,214
+-> 5,169 / 5,185 and 5,504 / 5,504 -> 5,515 / 5,517 tok/s (noise).
+
+Measured, not adopted: compiling the pipeline separately for Q4 and Q5 row blocks (the grouped
+kernel spilled 16 bytes again and was 2-19 % slower from T = 300 on); applying group 0 before the decode on warps
+0-3 (more registers, 28-44 bytes of spills). The ternary t5 kernel already steps 128 columns
+(one scale group); a 256-column step would need 128 KB of double-buffered stages (sm_89 allows
+99 KB), and its barrier stalls are 6.8 % of the samples (ncu, gate+up T = 1024), so it was left
+unchanged. All the A8 kernels now run the IMMA pipe at ~48-52 % of peak; the remaining stalls are
+math-pipe throttle and fixed-latency waits with two warps per scheduler.
+
 ## Prefill work of 2026-09-26/27, integrated (`f3f4a037`)
 
 The three changes of that round (Bonsai design notes, section 9.1, items 26-28: mixed-tile t5 GEMM
