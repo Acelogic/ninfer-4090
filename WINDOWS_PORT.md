@@ -784,6 +784,17 @@ MTP 3 decode on the six-prompt regression gives identical text at the same 25.9 
 Qwen3.8 prefill remains GEMM-bound on the Q4/Q5 weights (about 1.9K tok/s at 8K against 4.4K for
 Bonsai).
 
+### Prompt attention V staging (`7843ddbe`, 2026-09-26)
+
+The worker warps of the same kernel now stage and widen V with loop-invariant addresses (Bonsai
+design notes, section 9.1, item 27); outputs are bit-identical. Kernel: rk4v4-e8 -4 % at 8K to
+128K keys, int8 within noise. CLI NIAH prefill on the A8 artifact (`qwen3_8_27b_a8.ninfer`,
+rk4v4-e8, `--prefill-chunk 1024`, `--max-context 132096`, MTP 3, `--no-thinking`, base and new
+alternated, all answers exact): `long_niah_8k` 1.7 s both, `long_niah_64k` 18.5 / 18.5 -> 18.2 /
+18.2 s (-1.6 %), `long_niah_128k` 46.6 -> 45.6 s (-2 %). Decode per step is unchanged (small-T
+kernels are untouched). A FlashAttention-2 style rewrite with rows owned per warp and V widened in
+registers was bit-identical but 12-20 % slower on this card (item 27).
+
 ## Swift 1.5 (Qwen3.8-27B fine-tune) against the base artifact (2026-09-26)
 
 `ukisai/Swift-1.5-Qwen3.8-27b` is a merged LoRA fine-tune of Qwen3.8-27B trained to think less; the

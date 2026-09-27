@@ -2421,6 +2421,51 @@ Next steps, in order:
     - Remaining: the residual read-modify-write in `store_tile` costs ~30 us per 5120-row call at
       T = 1024; a staged, coalesced epilogue would recover it.
 
+27. Prompt attention at long context (`7843ddbe`, measured 2026-09-26, RTX 4090, CUDA 13.4; the
+    kernel serves Qwen3.8 too).
+    - Nsight Compute on the item-22 kernel (append, int8, 64K keys, clocks locked at 2.12 GHz):
+      tensor pipe 53 % of peak, 3.91G warp instructions, 4 warps per scheduler with 0.86
+      eligible. The producers spend 5.8 % of the samples waiting at `PFree`, so the workers are
+      the critical path, and their V dequant loop executed 22 % of all instructions (~268 per
+      worker warp and tile, mostly signed-division and swizzle address arithmetic).
+    - Each worker thread now copies and widens fixed 16-byte V code chunks (four keys of one
+      16-dimension column), so the addresses, the scale group and the swizzle phase are computed
+      once per kernel; packed V is staged with 16-byte copies. Outputs are bit-identical (bench
+      outputs byte-equal at 8K/64K/128K for int8 and rk4v4-e8).
+    - Append bench (1024 tokens, d256-h24-kv4, `--context` 8192/65536/131072, base, new, new,
+      base), median us per chunk:
+
+      | KV | 8K | 64K | 128K |
+      |---|---|---|---|
+      | int8 | 940-982 -> 951-952 | 7261-7527 -> 7252-7326 | 15348-15589 -> 15379-15391 |
+      | rk4v4-e8 | 1084-1085 -> 1036-1038 (-4 %) | 8222-8382 -> 7882-7987 (-4 %) | 17211-17220 -> 16441-16495 (-4 %) |
+
+    - CLI NIAH prefill (rk4v4-e8, `--prefill-chunk 1024`, MTP, `--no-thinking`; base, new, new,
+      base for 8K and 64K, 128K once; all 20 answers exact): Bonsai 64K 18.4/18.6 -> 18.3/18.4 s,
+      128K 46.8 -> 45.8 s (-2 %); Qwen3.8 64K 18.5/18.5 -> 18.2/18.2 s (-1.6 %), 128K 46.6 ->
+      45.6 s (-2 %); 8K unchanged on both (1.7 s).
+    - Full `ninfer_softmax_attention_test` and `--rk4v4-e8-only` pass with the same quality line
+      as item 10; quick perplexity with `--kv-dtype int8` is 5.85494 before and after.
+    - Rejected, measured (all bit-identical to the item-22 outputs, all slower):
+      - Row-owning warps (the FlashAttention-2 layout of iamwavecut's `prompt_i8_fast.cuh`,
+        adapted to 64-row CTAs): eight warps, each row pair splitting the keys for QK and the
+        dimensions for PV, P of the own key half kept in registers, V widened in registers from
+        byte-pair `ldmatrix.trans`, one CTA barrier per double-buffered tile. int8 128K
+        17.1-18.4 ms, rk4v4-e8 128K 17.7-18.2 ms (+12 to +20 %). Nsight Compute: tensor 46.6 %,
+        4.79G instructions (V is widened four times, once per row tile), 2 warps per scheduler
+        with 0.65 eligible; the lockstep QK, softmax and PV phases leave the tensor pipe idle.
+      - The same with 32-row x 64-dimension PV warps (V widened twice) and a 128-thread P
+        exchange: 255 registers, int8 128K 18.3-18.5 ms, rk4v4-e8 19.6 ms.
+      - Shared-register initial accumulators (zero for the FP16 partials, 1.5 * 2^23 for the
+        IMMA so an FADD replaces I2F) on top of this item: int8 128K 15.8-15.9 ms against
+        15.4 ms, rk4v4-e8 128K 17.0-17.2 against 16.4-16.5 ms.
+    - Remaining headroom: the tensor pipe stays near half of peak. Producers' K staging still
+      uses per-chunk signed-division addressing (not on the critical path at 64K), the worker
+      PV keeps a few spills under the 128-register cap, and the fold of the FP16 partials into
+      FP32 (one FFMA and one conversion per accumulator and tile) is fixed by the bit-identical
+      contract.
+
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
