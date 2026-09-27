@@ -875,8 +875,19 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
         }
 
+        // A continuing round only needs the fold ordered before the next round on the same stream
+        // (context captures wait on it through an event), so it is submitted, not awaited: the
+        // host commits and prepares the next round while the fold runs. A row that ends or is
+        // cancelled waits for it.
+        const bool continuing =
+            std::none_of(terminal.begin(), terminal.end(), [](std::uint8_t t) { return t != 0; }) &&
+            std::none_of(cancelled.begin(), cancelled.end(), [](std::uint8_t c) { return c != 0; });
         timing.begin_wait();
-        device.synchronize();
+        if (continuing) {
+            device.flush();
+        } else {
+            device.synchronize();
+        }
         timing.end_wait();
         work.reset();
     } catch (...) {

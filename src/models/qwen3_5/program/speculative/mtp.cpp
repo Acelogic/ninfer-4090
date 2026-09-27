@@ -93,9 +93,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         const std::int32_t hidden =
             dimension(state.execution.parameters.model.config().text.hidden_size);
         const std::int32_t output_rows = frame.target_logits.ne[0];
-        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                   sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+        kernel_copy_async(frame.ingress.data, &state.host_ingress,
+                          sizeof(qwen3_5::MtpDecodeIngress), state.execution.device.stream);
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
@@ -203,15 +202,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                               mtp_rows, envelopes.ar[step], next_hidden_batch);
                 card.mtp_propose_batch(next_hidden, proposal_logits, next);
-                CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice,
-                                           state.execution.device.stream));
+                kernel_copy_async(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
+                                  state.execution.device.stream);
             }
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(qwen3_5::MtpDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+        kernel_copy_async(&state.host_egress, frame.egress.data, sizeof(qwen3_5::MtpDecodeEgress),
+                          state.execution.device.stream);
     };
 }
 

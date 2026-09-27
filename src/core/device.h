@@ -27,6 +27,14 @@ int device_sm_count();
 // this is just one literal, not an architecture switch.
 inline constexpr int kTargetSmCount = 128; // NVIDIA GeForce RTX 4090 (sm_89)
 
+// Stream-ordered copy of `bytes` from `source` to `destination` by a kernel rather than a
+// copy-engine operation. Either side may be pinned host memory (cudaMallocHost, mapped under
+// unified addressing), which the kernel reads or writes over PCIe. Decode rounds use it for their
+// small ingress, egress and hidden-state copies: in a CUDA Graph on this WDDM RTX 4090 every
+// switch between a kernel node and a copy-engine node left the GPU idle for 15-35 us.
+void kernel_copy_async(void* destination, const void* source, std::size_t bytes,
+                       cudaStream_t stream);
+
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
 // capacity. DeviceContext remains the owner and authoritative source of both values.
 struct DeviceExecutionView {
@@ -55,6 +63,9 @@ struct DeviceContext {
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+    // Submits the stream's queued work without waiting for it (WDDM batches launches until the
+    // stream is queried or synchronized) and reports an error it has already raised.
+    void flush() const;
 };
 
 class CudaEventTimer {

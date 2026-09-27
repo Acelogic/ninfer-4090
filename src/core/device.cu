@@ -34,7 +34,42 @@ void destroy_event(cudaEvent_t& event) noexcept {
     }
 }
 
+constexpr int kCopyThreads = 256;
+
+__global__ void __launch_bounds__(kCopyThreads)
+    copy_words_kernel(uint4* __restrict__ destination, const uint4* __restrict__ source,
+                      std::size_t words) {
+    const std::size_t i = std::size_t(blockIdx.x) * kCopyThreads + threadIdx.x;
+    if (i < words) { destination[i] = source[i]; }
+}
+
+__global__ void __launch_bounds__(kCopyThreads)
+    copy_bytes_kernel(unsigned char* __restrict__ destination,
+                      const unsigned char* __restrict__ source, std::size_t bytes) {
+    const std::size_t i = std::size_t(blockIdx.x) * kCopyThreads + threadIdx.x;
+    if (i < bytes) { destination[i] = source[i]; }
+}
+
 } // namespace
+
+void kernel_copy_async(void* destination, const void* source, std::size_t bytes,
+                       cudaStream_t stream) {
+    if (bytes == 0) { return; }
+    const bool words = ((reinterpret_cast<std::uintptr_t>(destination) |
+                         reinterpret_cast<std::uintptr_t>(source) | bytes) &
+                        15) == 0;
+    const std::size_t items = words ? bytes / 16 : bytes;
+    const auto blocks       = static_cast<unsigned>((items + kCopyThreads - 1) / kCopyThreads);
+    if (words) {
+        copy_words_kernel<<<blocks, kCopyThreads, 0, stream>>>(
+            static_cast<uint4*>(destination), static_cast<const uint4*>(source), items);
+    } else {
+        copy_bytes_kernel<<<blocks, kCopyThreads, 0, stream>>>(
+            static_cast<unsigned char*>(destination), static_cast<const unsigned char*>(source),
+            items);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
@@ -141,6 +176,11 @@ DeviceExecutionView DeviceContext::execution_view() const noexcept {
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+
+void DeviceContext::flush() const {
+    const cudaError_t err = cudaStreamQuery(stream);
+    if (err != cudaErrorNotReady) { CUDA_CHECK(err); }
+}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
 

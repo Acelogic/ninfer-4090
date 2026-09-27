@@ -31,9 +31,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         }
 
         qwen3_5::OrdinaryDecodeState& ordinary = state.frame;
-        CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
-                                   sizeof(qwen3_5::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+        kernel_copy_async(ordinary.ingress.data, &state.host_ingress,
+                          sizeof(qwen3_5::OrdinaryDecodeIngress), state.execution.device.stream);
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
@@ -58,9 +57,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
-                                   sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+        kernel_copy_async(&state.host_egress, ordinary.egress.data,
+                          sizeof(qwen3_5::OrdinaryDecodeEgress), state.execution.device.stream);
     };
 }
 

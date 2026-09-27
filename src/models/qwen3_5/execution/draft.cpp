@@ -572,9 +572,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         }
         qwen3_5::DFlashDecodeState& frame = state.frame;
         const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
-        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                   sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+        kernel_copy_async(frame.ingress.data, &state.host_ingress,
+                          sizeof(qwen3_5::DFlashDecodeIngress), state.execution.device.stream);
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
@@ -655,9 +654,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 },
                 target_envelope);
         }
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+        kernel_copy_async(&state.host_egress, frame.egress.data,
+                          sizeof(qwen3_5::DFlashDecodeEgress), state.execution.device.stream);
     };
 }
 
