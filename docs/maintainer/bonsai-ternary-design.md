@@ -2387,6 +2387,40 @@ Next steps, in order:
       4182 / 4251 tok/s, pp2048 4502 / 4460 tok/s, against 3061 and 3349 in item 9 (measured
       2026-09-24, not re-run alternated).
 
+26. Mixed 128/64-token tiles for the 5120-row weights (`d7ae58d4`, measured 2026-09-26, RTX 4090 at
+    60 Hz).
+    - The 5120-row weights (o_proj, GDN out_proj, MLP down) now run `gemm_tall_kernel` instead of the
+      two-barrier 64 x 128 `gemm_kernel`, as 128-row tiles of 128 tokens (eight warps of 64 x 32) or
+      64 tokens (eight warps of 32 x 32), with the pipeline of item 23 unchanged.
+    - One launch covers every row block with `wide` 128-token tiles, then `narrow` 64-token tiles;
+      all wide CTAs come first in the grid, so the cheaper CTAs fill the last one-per-SM wave. The
+      host picks the split with the shortest estimated makespan, taking a 128-token CTA as 1.6x a
+      64-token one (measured 1.58-1.77). With 40 row blocks on 128 SMs: T = 1024 gets 4 + 8 tiles,
+      T = 512 gets 2 + 4, T = 65..192 only 64-token tiles, T = 2048 only 128-token tiles.
+    - Every weight of 128-row blocks takes this kernel beyond T = 64. `gemm_kernel` is reduced to the
+      64 x 64 tile (T = 33..64, or rows not a multiple of 128); its 64 x 128 instantiation and split
+      decode are gone.
+    - Arithmetic per output is unchanged: a bitwise old/new comparison (5120x6144, 5120x17408 and
+      16384x5120; 27 values of T from 33 to 2048; plain and residual) finds no differing output;
+      quick perplexity is 5.854904; greedy MTP text is identical on four prompts of 65-492 tokens;
+      `ninfer_linear_t5_test` passes, now with o_proj `linear_add` at T = 64/65/129 and
+      40-row-block mixed splits at T = 500/1000 (partial last tile, graph replay).
+    - Nsight Compute, T = 1024 (plain / residual): o_proj 278 / 344 -> 201 / 231 us, down
+      760 / 839 -> 568 / 600 us; IMMA pipe active 35 -> 49 %, instructions -19 %, L2 ~80 %.
+    - `ninfer_t5_bench` rot, us, alternated: o_proj T = 129 117 -> 46, T = 512 190-204 -> 126,
+      T = 1024 326-341 -> 251-254, T = 2048 643-671 -> 463-467; down T = 129 326 -> 121, T = 512
+      527-542 -> 376-384, T = 1024 910-926 -> 729-734, T = 2048 1754-1814 -> 1277-1285 (the Qwen3.8
+      A8 route for the same shapes: 296 / 768 us at T = 1024). The split also helps tall weights at
+      widths with a partial wave (gate+up T = 129 298-306 -> 259, qkvg T = 512 285-292 -> 261-268).
+    - End to end, alternated, all answers exact: NIAH prefill (rk4v4-e8, chunk 1024, MTP 2) 8K
+      1.8 -> 1.6 s, 64K 18.5/18.8 -> 17.4/17.4 s, 128K 47.4 -> 44.6 s; `ninfer_bench -p 512,2048 -r 3
+      --kv-dtype int8` pp512 4,305/4,272 -> 4,847/4,947 tok/s, pp2048 4,536/4,485 -> 5,083/5,107
+      tok/s. Decode unchanged.
+    - Rejected: uniform tiles at T = 1024 (all 128-token 277-281 / 717-728 us, all 64-token
+      262-267 / 756 us); the split-K tail of item 24 (not bit-identical).
+    - Remaining: the residual read-modify-write in `store_tile` costs ~30 us per 5120-row call at
+      T = 1024; a staged, coalesced epilogue would recover it.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
