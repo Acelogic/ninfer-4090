@@ -1229,3 +1229,24 @@ In the round trace the host and copy-engine gaps fall from 3.0 to 1.0 per round.
 host's turnaround between the round's egress and the fold launch (52-67 us), which needs the host's
 committed count. The machine measured ~10 % below the 2026-09-27 main figures for both binaries on
 this day (tg128 47.6 against 54.5), so compare within the table.
+
+## Same-weights comparison with llama.cpp and the second integrated round (2026-09-27)
+
+The 128-column A8 GEMM steps and the decode-round fixes were verified together against the
+2026.09.27 release binaries (Bonsai design notes, section 9.1, item 31): bitwise-equal perplexity,
+identical greedy text on 16 runs, Qwen3.8 A8 NIAH prefill 64K 18.1 -> 16.7 s and 128K 45.3 ->
+42.5 s, Bonsai MTP 2 decode 187.3 -> 193.1 tok/s.
+
+Both engines were then measured on the official Qwen3.8-27B weights quantized from the same BF16
+checkpoint: llama.cpp `a894dae` with a Q4_K_M GGUF made here with `convert_hf_to_gguf.py` and
+`llama-quantize` (15.65 GiB, MTP layer included), NInfer with `qwen3_8_27b_a8.ninfer`:
+
+| Measurement | llama.cpp | NInfer |
+|---|---:|---:|
+| Prefill `pp512` / `pp2048` | 2,723 / 2,676 tok/s | 4,777 / 5,124 tok/s |
+| Prefill 8K / 64K / 128K-token prompt (8-bit KV, answers exact) | 3.0 / 30.7 / 75.9 s | 1.5 / 16.5 / 41.8 s |
+| Decode `tg128` | 43.1 tok/s | 47.8 tok/s |
+| Decode, MTP 3, six prompts (greedy, thinking off) | 87.1 tok/s | 106.4 tok/s |
+| Decode, MTP 3, 30K-token document | 66.8 tok/s | 87.2 tok/s |
+
+Method and per-prompt figures: [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md).

@@ -6,15 +6,16 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **188 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
-| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,138 tok/s** |
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **193 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,124 tok/s** |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 107 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
 The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
 processing run on int8 tensor cores (1.7-1.9x faster, same decode, same quality within noise).
-For reference, the official llama.cpp prefills a Qwen3.8-27B Q4_K_S GGUF at 2,729 tok/s
-(`pp2048`) on the same card.
+Against the official llama.cpp on the same card with the same Qwen3.8-27B BF16 checkpoint
+(Q4_K_M GGUF), NInfer prefills 1.8-2.0x faster and decodes 1.1x faster without speculation and
+1.2-1.3x faster with MTP 3 ([comparison](#qwen38-27b)).
 
 Swift 1.5 is a separate fine-tune of Qwen3.8-27B by UkisAI, trained to avoid overthinking. With
 the model card's sampling and thinking on, it used 27 % fewer tokens than base Qwen3.8 on six hard
@@ -170,7 +171,7 @@ machine:
 | Measurement | NInfer | Prism llama.cpp fork |
 |---|---:|---:|
 | Decode, no speculation (`tg128`) | **101 tok/s** | 77 tok/s |
-| Decode, MTP 2, mean of six mixed prompts | **188 tok/s** | — |
+| Decode, MTP 2, mean of six mixed prompts | **193 tok/s** | — |
 | Decode, MTP 2, prose / edit-style prompts | 167 / 250 tok/s | — |
 | Decode, MTP 2 + n-gram, edit-style prompts | **532 tok/s** | — |
 | Decode, three concurrent requests, aggregate | **360 tok/s** | — |
@@ -199,9 +200,9 @@ machine:
 | Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
 | Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
-| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **4,622 / 5,138 tok/s** |
+| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **4,777 / 5,124 tok/s** |
 | Prefill, 8K / 64K / 128K-token prompt, official artifact (needle test, answer exact) | 2.9 s / 27.4-27.6 s / 64.0 s |
-| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.6 s / 16.5 s / 41.3 s** |
+| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.5 s / 16.5 s / 41.8 s** |
 | Perplexity, quick four-corpus run, official / int8 artifact | 4.8007 / 4.7944 |
 | Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 (2026-09-25); 45/45 on both artifacts (2026-09-26) |
 
@@ -210,21 +211,20 @@ for byte, and allows the prefill GEMMs to quantize their activations to int8 (pe
 channels) and run on int8 tensor cores; decode is unchanged. It is built from the official file in
 a few minutes, without a BF16 checkpoint ([conversion](#converting-models)).
 
-Against the official llama.cpp on the same machine and the same Qwen3.8-27B fine-tune (ColdFusion;
-llama.cpp `a894dae` on the Q4_K_S GGUF with q8_0 KV and flash attention, NInfer on the Q4/Q5
-artifact with int8 KV; same needle prompts, thinking off, no speculation, two runs each):
+Against the official llama.cpp on the same machine, both engines starting from the official
+Qwen3.8-27B BF16 checkpoint (llama.cpp `a894dae`, Q4_K_M GGUF of 15.65 GiB with its MTP layer, q8_0
+KV and flash attention; NInfer int8-prefill artifact, int8 KV; measured 2026-09-27):
 
-| Prompt prefill | llama.cpp | NInfer |
-|---|---:|---:|
-| 8K tokens | 3.0 s (2,558-2,585 tok/s) | 3.0-3.1 s (2,470-2,530 tok/s) |
-| 64K tokens | 29.8-29.9 s | **28.9-29.4 s** |
-| 128K tokens | 73.6-73.8 s | **66.8-66.9 s** (-9 %) |
-| `pp512` / `pp2048` (bench tools) | **2,756 / 2,729 tok/s** | 2,334 / 2,594 tok/s |
+| Measurement | llama.cpp | NInfer | Ratio |
+|---|---:|---:|---:|
+| Prefill `pp512` / `pp2048` | 2,723 / 2,676 tok/s | **4,777 / 5,124 tok/s** | 1.75x / 1.91x |
+| Prefill, 8K / 64K / 128K-token prompt | 3.0 / 30.7 / 75.9 s | **1.5 / 16.5 / 41.8 s** | 2.0x / 1.9x / 1.8x |
+| Decode, no speculation (six prompts) | 43.0 tok/s | **48.1 tok/s** | 1.12x |
+| Decode, MTP 3 (six prompts) | 87.1 tok/s | **106.4 tok/s** | 1.22x |
+| Decode, MTP 3, 30K-token document | 66.8 tok/s | **87.2 tok/s** | 1.31x |
 
-With the official artifact, llama.cpp leads on short prompts and NInfer ties at 8K-64K and leads
-at 128K. The int8 artifact prefills `pp512` / `pp2048` at 4,622 / 5,138 tok/s, 1.7-1.9x the
-llama.cpp rates above (the int8 runs used the base Qwen3.8 artifact; the ColdFusion files were
-removed). Measurements and methods: [WINDOWS_PORT.md](WINDOWS_PORT.md).
+Greedy, thinking off, 8-bit KV in both; every needle answer exact. Full method, per-prompt figures
+and the earlier comparisons: [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md).
 
 ### Speculative decoding by workload
 
@@ -466,9 +466,9 @@ The full protocol reference, including every field and error code, is in
 - One RTX 4090, one process, one resident model. No multi-GPU, no weight offload, no request
   preemption or priorities.
 - Prefill runs one request at a time; decode of other lanes waits while it runs.
-- With the official Qwen3.8 artifact, prefill trails llama.cpp on short prompts (`pp512` 2,334
-  against 2,756 tok/s on the same machine); the int8 artifact leads at every length
-  ([Qwen3.8 performance](#qwen38-27b)). Bonsai prefill is about 3x Prism's llama.cpp fork.
+- With the official (BF16-prefill) Qwen3.8 artifact, prefill trails llama.cpp on short prompts;
+  the int8 artifact leads at every length ([Qwen3.8 performance](#qwen38-27b)). Bonsai prefill is
+  about 4x Prism's llama.cpp fork.
 - Long-context decode slows with depth: a Bonsai MTP round costs 18.5-20.8 ms at 128K against
   12.8 ms at short context, all of it in attention.
 - DFlash2 is not supported with Bonsai's ternary output head; use MTP.

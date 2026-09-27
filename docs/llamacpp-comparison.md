@@ -1,11 +1,64 @@
 # NInfer against llama.cpp on one RTX 4090
 
-Two comparisons are recorded here. The current one (2026-09-26, native Windows) ran both engines
-on the maintainer's RTX 4090 with the same Qwen3.8-27B fine-tune. The earlier one (2026-08-15/17)
-was measured by the upstream Linux port on another RTX 4090 and is kept for its decode and depth
-data, which the current comparison does not yet cover.
+Three comparisons are recorded here, newest first. The main one (2026-09-27) ran both engines on
+the maintainer's RTX 4090 with the official Qwen3.8-27B weights, each quantized from the same BF16
+checkpoint. The 2026-09-26 run compared prefill on the Cold Fusion fine-tune. The oldest
+(2026-08-15/17) was measured by the upstream Linux port on another RTX 4090 and is kept for its
+depth sweep past 128K.
 
-## Same machine, Windows (2026-09-26)
+## Same weights, Windows (2026-09-27)
+
+### Environment
+
+| Component | Version |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090, 24 GiB, stock clocks; the card also drives a 4K60 dummy display |
+| Host | Core i9-13900K, 64 GB DDR5-6000, Windows 11, driver 595.97 |
+| llama.cpp | official, commit `a894dae`, MSVC + CUDA build |
+| NInfer | this repository at `b18c5953`, CUDA 13.4, MSVC |
+| Source weights | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), BF16 safetensors |
+| llama.cpp model | `convert_hf_to_gguf.py --outtype bf16`, then `llama-quantize ... Q4_K_M`: 15.65 GiB (4.92 bits/weight), MTP (nextn) layer included |
+| NInfer model | `qwen3_8_27b_a8.ninfer`: the official NInfer Q4/Q5 groupwise artifact made from the same BF16 checkpoint, with int8 prefill; 16.7 GiB of weights loaded (MTP head and indexed proposal head included) |
+
+### Method
+
+- Bench tools: `llama-bench -p 512,2048 -n 128 -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -ub 1024 -b 4096
+  -r 3` against `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8`.
+- Long-prompt prefill: `examples/cli/messages/long_niah_{8k,64k,128k}.json`, thinking off, no
+  speculation, 8-bit KV (llama.cpp q8_0 through `llama-server -c 132096 --flash-attn on -ub 1024
+  -b 4096 --jinja`, `cache_prompt: false`; NInfer int8 through `ninfer.exe --prefill-chunk 1024`).
+  Two rounds with the engine order reversed (128K once). Every answer was exact.
+- Decode: six mixed prompts (story, Python, transformer explanation, Chilean history in Spanish,
+  energy tips, train problem) and a summary of a 30,301-token document; greedy, thinking off, up to
+  512 (1,024 for the document) new tokens, 8-bit KV. Speculation: llama.cpp `--spec-type draft-mtp
+  --spec-draft-n-max 3` (the GGUF's MTP layer); NInfer `--spec mtp --draft-tokens 3
+  --lm-head-draft`. Rates are generated tokens over decode time (llama.cpp `timings`, NInfer
+  summary); the six-prompt figure is token-weighted. The two engines' greedy texts differ in places
+  (different quantizations), so output lengths differ slightly.
+
+### Results
+
+| Measurement | llama.cpp | NInfer | NInfer / llama.cpp |
+|---|---:|---:|---:|
+| Prefill `pp512` | 2,723 tok/s | 4,777 tok/s | 1.75x |
+| Prefill `pp2048` | 2,676 tok/s | 5,124 tok/s | 1.91x |
+| Prefill, 8K-token prompt | 3.0-3.1 s | 1.5 s | 2.0x |
+| Prefill, 64K-token prompt | 30.6-30.8 s | 16.5 s | 1.9x |
+| Prefill, 128K-token prompt | 75.9 s | 41.8 s | 1.8x |
+| Decode, no speculation (`tg128`) | 43.1 tok/s | 47.8 tok/s | 1.11x |
+| Decode, no speculation, six prompts | 42.8-43.2 tok/s | 48.0-48.3 tok/s | 1.12x |
+| Decode, no speculation, 30K-token document | 39.3 tok/s | 44.9 tok/s | 1.14x |
+| Decode, MTP 3, six prompts | 87.1 tok/s | 106.4 tok/s | 1.22x |
+| Decode, MTP 3, 30K-token document | 66.8 tok/s | 87.2 tok/s | 1.31x |
+
+Per prompt with MTP 3 (llama.cpp -> NInfer, tok/s): 67.7 -> 85.0, 105.8 -> 135.9, 90.5 -> 107.6,
+81.1 -> 92.7, 78.4 -> 101.6, 108.8 -> 132.4. llama.cpp accepted 280/690, 364/435, 339/513,
+319/575, 142/270 and 368/427 drafts.
+
+Not covered: NInfer's n-gram drafts (`--ngram chain`, up to 289 tok/s on edit-style prompts) and
+llama.cpp's `ngram-mod`, contexts past 128K, and concurrent requests.
+
+## Same machine, Cold Fusion fine-tune (2026-09-26)
 
 ### Environment
 
@@ -59,8 +112,7 @@ activations in the prefill GEMMs) and the prefill work of 2026-09-26/27, NInfer 
 at 512-2K tokens and about 1.8x on the long prompts, but it is a cross-weight, cross-day comparison
 (see [WINDOWS_PORT.md](../WINDOWS_PORT.md) for every run).
 
-Not yet measured on this machine: llama.cpp decode (plain and `draft-mtp`) and context depths past
-128K. The earlier comparison below covers them on another card.
+The same-weights run above supersedes this one for decode.
 
 ## Earlier comparison: Linux, upstream 4090 port (2026-08-15/17)
 

@@ -2574,6 +2574,28 @@ Next steps, in order:
       round's record kernel would remove; the remaining quantization launches (~0.5 ms); three argmax
       memset nodes (~4 us each).
 
+31. The 128-column A8 GEMM steps and the decode-round fixes together (`b18c5953`, measured
+    2026-09-27, RTX 4090 with a 4K60 dummy display, no other GPU work). Base: the 2026.09.27 release
+    binaries (`40a95858`). The machine ran about 10 % slower in absolute terms than the item-29
+    runs for both binaries, so only the within-table comparison holds.
+    - Checks: `ninfer_linear_t5_test`, `linear_swiglu_q4_a8`, `linear_add_q5_a8`,
+      `rmsnorm_swiglu_mlp_q4_q5`, `gated_delta_net`, `gated_delta_net_replay_record`,
+      `gdn_replay_fold`, `gdn_input_proj` and `attn_input_proj` pass. Quick perplexity is bitwise
+      equal (Bonsai 5.854904, Qwen3.8 A8 4.794439). Greedy text (stdout md5) is identical on base
+      and new for 16 runs: both models, four prompts each (one of ~1.1K tokens), MTP with and
+      without `--ngram chain`.
+    - Decode, six prompts, MTP, greedy, thinking off, 512 tokens, alternated twice: Bonsai MTP 2
+      187.3 / 187.3 -> 193.1 / 193.0 tok/s (11.53 -> 11.18 ms per round, -3.0 %); Qwen3.8 MTP 3
+      104.8 / 104.7 -> 105.1 / 105.2 tok/s (25.83 -> 25.73 ms).
+    - NIAH prefill (rk4v4-e8, MTP, alternated; all answers exact): Bonsai unchanged (8K 1.5 s, 64K
+      16.0-16.2 s, 128K 41.4-41.5 s); Qwen3.8 A8 8K 1.7 -> 1.6 s, 64K 18.1 / 18.1 -> 16.7 / 16.8 s
+      (-8 %), 128K 45.3 -> 42.5 s (-6 %).
+    - `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8`, new: Bonsai pp512 5,285, pp2048
+      5,454, tg128 114.2 tok/s; Qwen3.8 A8 pp512 4,777-4,788, pp2048 5,049-5,124, tg128 47.6-47.8.
+    - Against llama.cpp on the same machine with the same Qwen3.8 BF16 source (Q4_K_M GGUF):
+      prefill 1.75-2.0x, decode without speculation 1.11-1.14x, with MTP 3 1.22-1.31x
+      ([llama.cpp comparison](../llamacpp-comparison.md)).
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
