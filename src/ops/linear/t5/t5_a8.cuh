@@ -796,6 +796,70 @@ constexpr std::size_t gemm_tall_shared_bytes() {
     return 2 * sizeof(GemmStage<128>) + 2 * sizeof(GemmCodeStage<kTallRows>);
 }
 
+// The FP32 tile staged as [token][row], rows padded so that the fragment stores are conflict-free
+// and every 8-row chunk is 16-byte aligned.
+constexpr int kTallStageLd = kTallRows + 4;
+static_assert(std::size_t(128) * kTallStageLd * sizeof(float) <= gemm_tall_shared_bytes());
+
+// Stores a 128-row tile through shared memory: the warps stage their FP32 accumulators, then each
+// thread writes 8-row chunks of one token as 16-byte stores (a token's 128 rows by 16 adjacent
+// threads), adding the residual for accumulate. Per output this is store_row's arithmetic:
+// bf16_rn(acc) or bf16_rn(acc + residual). The host routes here only outputs whose row bounds
+// are multiples of 8 and whose data is 16-byte aligned.
+template <int Tokens, int MTiles>
+__device__ __forceinline__ void store_tall_tile(const Outputs& outputs,
+                                                const float (&acc)[MTiles][4][4], float* staged,
+                                                int row0, int token0, int live, int warp_row,
+                                                int warp_token, int tid, bool accumulate) {
+    const int lane = tid & 31;
+    const int gid  = lane >> 2;
+    const int lid  = lane & 3;
+#pragma unroll
+    for (int mt = 0; mt < MTiles; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int row   = warp_row + mt * 16 + gid + (e >> 1) * 8;
+                const int token = warp_token + nt * 8 + 2 * lid + (e & 1);
+                staged[token * kTallStageLd + row] = acc[mt][nt][e];
+            }
+        }
+    }
+    __syncthreads();
+    constexpr int kChunks = kTallRows / 8;
+#pragma unroll
+    for (int i = 0; i < Tokens * kChunks / kTallThreads; ++i) {
+        const int item  = tid + i * kTallThreads;
+        const int token = item / kChunks;
+        const int chunk = item % kChunks;
+        if (token >= live) continue;
+        const float* source = &staged[token * kTallStageLd + chunk * 8];
+        const float4 low    = *reinterpret_cast<const float4*>(source);
+        const float4 high   = *reinterpret_cast<const float4*>(source + 4);
+        float value[8]      = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+        const OutputRow out = output_row(outputs, row0 + chunk * 8);
+        auto* target = reinterpret_cast<uint4*>(out.data + std::int64_t(token0 + token) * out.rows);
+        if (accumulate) {
+            const uint4 old         = *target;
+            const unsigned words[4] = {old.x, old.y, old.z, old.w};
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const float2 pair = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words[w]));
+                value[2 * w]     = value[2 * w] + pair.x;
+                value[2 * w + 1] = value[2 * w + 1] + pair.y;
+            }
+        }
+        unsigned packed[4];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const __nv_bfloat162 pair = __floats2bfloat162_rn(value[2 * w], value[2 * w + 1]);
+            packed[w]                 = *reinterpret_cast<const unsigned*>(&pair);
+        }
+        *target = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    }
+}
+
 // Each SM sub-partition holds one warp of each half of the CTA. Warps 0-3 ("ping") multiply, then
 // decode the next step's code words and apply the step's FP32 update; warps 4-7 ("pong") first
 // apply the previous step's update and decode, then multiply, carrying their int32 sums and the
@@ -948,7 +1012,10 @@ __device__ __forceinline__ void gemm_tall_tile(const std::uint8_t* __restrict__ 
         }
     }
     if (pong) update(g);
-    store_tile(outputs, acc, row0 + wm * Tile::kWarpRows, wn * 32, token0, live, lane, accumulate);
+    // Every warp is done with the stages, which now hold the FP32 tile.
+    __syncthreads();
+    store_tall_tile<Tokens, MTiles>(outputs, acc, reinterpret_cast<float*>(gemm_smem), row0,
+                                    token0, live, wm * Tile::kWarpRows, wn * 32, tid, accumulate);
 }
 
 // A row block's tokens are covered by `wide` 128-token tiles, then `narrow` 64-token tiles. The

@@ -181,8 +181,8 @@ void require_input(const Tensor& x, const Weight& w, const char* what) {
 
 // Validates the weight, policy and outputs, then quantizes the input and multiplies: dp4a GEMV
 // through T = 4, the small-T MMA route through T = 32 (and at any T when N % 64 != 0, in 32-token
-// tiles), the 64 x 64 GEMM through T = 64 (and beyond when N % 128 != 0), the pipelined
-// 128-row GEMM beyond (every Bonsai weight).
+// tiles), the 64 x 64 GEMM through T = 64 (and beyond when N % 128 != 0 or an output is not made
+// of aligned 8-row chunks), the pipelined 128-row GEMM beyond (every Bonsai weight).
 template <class Input>
 void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* const> outputs,
              bool accumulate, LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
@@ -194,6 +194,8 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
     }
     t5_a8::Outputs packed{};
     int end = 0;
+    // The pipelined GEMM stores 8-row chunks as 16-byte words.
+    bool chunked_outputs = true;
     for (std::size_t i = 0; i < outputs.size(); ++i) {
         const Tensor& out = *outputs[i];
         if (out.dtype != DType::BF16 || out.ne[1] != tokens || out.ne[2] != 1 || out.ne[3] != 1 ||
@@ -201,6 +203,7 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
             throw std::invalid_argument("t5_project: outputs must be contiguous BF16 [rows,T]");
         }
         end += out.ne[0];
+        chunked_outputs = chunked_outputs && out.ne[0] % 8 == 0 && aligned16(out.data);
         packed.data[i] = static_cast<__nv_bfloat16*>(out.data);
         packed.end[i]  = end;
     }
@@ -228,7 +231,7 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
         case 3: launch_small_t<3>(q, w, tokens, packed, accumulate, stream); break;
         default: launch_small_t<4>(q, w, tokens, packed, accumulate, stream); break;
         }
-    } else if (tokens > t5_a8::kGemmTokens && w.n % t5_a8::kTallRows == 0) {
+    } else if (tokens > t5_a8::kGemmTokens && w.n % t5_a8::kTallRows == 0 && chunked_outputs) {
         launch_tall_gemm(q, w, tokens, packed, accumulate, stream);
     } else {
         launch_gemm(q, w, tokens, packed, accumulate, stream);
