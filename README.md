@@ -50,9 +50,17 @@ otherwise; the conditions are next to each table. Both models run the full 262K-
 | Libraries | [vcpkg](https://github.com/microsoft/vcpkg) (`curl`, `ffmpeg`, `pkgconf`, installed from the manifest) |
 | Download tool | [`hf`](https://huggingface.co/docs/huggingface_hub/guides/cli) (`pip install -U huggingface_hub`) or a browser |
 
-### 1. Build
+### 1. Get the binaries
 
-From a "x64 Native Tools" prompt (or after running `vcvars64.bat`) with CUDA on `PATH`:
+**Prebuilt (easiest):** download `ninfer-4090-windows-x64-<date>.zip` from the
+[latest release](https://github.com/JGamboa/ninfer-4090-windows/releases/latest) and unzip it.
+It needs only an NVIDIA driver 595 or newer and the
+[VC++ 2015-2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe): the CUDA
+runtime is built into the executables, and the zip includes the DLLs, two server launchers and
+the licenses. Skip to step 2.
+
+**Or build from source** from a "x64 Native Tools" prompt (or after running `vcvars64.bat`) with
+CUDA on `PATH`:
 
 ```bat
 git clone https://github.com/JGamboa/ninfer-4090-windows
