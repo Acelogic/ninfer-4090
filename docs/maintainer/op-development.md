@@ -462,6 +462,12 @@ decoded weights in FP64, so the profile keeps its family's A16 criterion: only F
 the output rounding remain. Its suites cover both sides of the 129-column boundary, one and several
 token tiles, a partial last tile and captured replays.
 
+The composite `rmsnorm_swiglu_mlp` registers the Q4/Q5 dense MLP under this profile as exactly the
+composition `rmsnorm`, `linear_swiglu`, `linear_add`: the quantized activations are those of the
+BF16 values the composed Ops would store, so it may quantize them where they are produced (the
+RMSNorm row kernel, the gate/up epilogue) instead of storing them. Its suite checks the FP64 oracle
+of that composition and bitwise equality with the composed Ops on both sides of the boundary.
+
 ## 7. Performance evidence
 
 An Op microbenchmark measures the public semantic operation at an exact shape, format, layout,

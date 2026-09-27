@@ -1060,3 +1060,30 @@ unchanged) and 4.794439 (A8); NIAH prefill 8K 2.9 / 2.9 s against 1.6 / 1.6 s, 6
 against 17.2 / 17.2 s, 128K 64.0 s against 43.0 s, every answer exact; `ninfer_bench` int8 KV
 pp512 / pp2048 2,536 / 2,762 against 4,436 / 5,008 tok/s. The six-prompt greedy regression gives
 identical text and ms per round for Bonsai (MTP 2) and Qwen3.8 (MTP 3) against the pre-A8 binary.
+
+### A8 MLP activations quantized where they are produced (`316db048`, 2026-09-26)
+
+`rmsnorm_swiglu_mlp` now also registers the Qwen3.8 dense MLP (Q4 gate/up, Q5 down, both
+`AllowA8`), which the text layers use for every width. From 129 columns on, the RMSNorm row kernel
+(the same 5120-wide CTA code as `rmsnorm`) quantizes its BF16 output to the gate/up A8 activation,
+and the gate/up epilogue quantizes its BF16 SwiGLU output per token and 64-row group (one row block
+is one group) to the down A8 activation; neither is stored in BF16 and the two separate
+`a8_g64_quantize` passes of the MLP are gone. Narrower widths compose `rmsnorm`, `linear_swiglu`
+and `linear_add` as before. The block is bitwise equal to that composition at every width
+(`ninfer_rmsnorm_swiglu_mlp_q4_q5_test`, T = 1 to 300, which also checks the FP64 oracle); quick
+perplexity is 4.794439 and greedy MTP 3 text is identical on five prompts of 65-492 tokens, at
+23.0 ms per round on both binaries.
+
+nsys, `long_niah_8k`, per 1024-token chunk (medians, base `b2f10487` -> new): the down-input
+quantization (15.6 us) disappears, RMSNorm plus gate/up quantization (7.9 + 5.5 us) becomes one
+10.6 us kernel, and the quantizing epilogue costs the gate+up GEMM ~10 us (1242 -> 1252 us), about
+0.5 ms saved per chunk (~0.25 %). The Qwen3.8 quantization was already cheap because its inputs are
+L2-resident right after they are produced. End to end, alternated, all answers exact: NIAH 8K
+4.35/4.39 -> 4.45/4.45K tok/s, 64K 18.5/18.5 -> 18.4/18.3 s, 128K 46.7 -> 46.6 s; `ninfer_bench`
+int8 KV pp512 4,564/4,539 -> 4,553/4,591 tok/s, pp2048 5,064/5,057 -> 5,086/5,102 tok/s (within
+noise to +0.6 %).
+
+Not done (estimated below 0.1 % each from the same trace): the RMSNorm fusion before the attention
+qkvg (16 layers, ~5 us each) and before the GDN in_proj, whose BF16 input the gating projection
+still reads. The GDN gated RMSNorm (20.7 us) plus out_proj quantization (6.2 us) could become one
+kernel (~0.6 ms per chunk, estimated).

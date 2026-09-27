@@ -2419,7 +2419,7 @@ Next steps, in order:
     - Rejected: uniform tiles at T = 1024 (all 128-token 277-281 / 717-728 us, all 64-token
       262-267 / 756 us); the split-K tail of item 24 (not bit-identical).
     - Remaining: the residual read-modify-write in `store_tile` costs ~30 us per 5120-row call at
-      T = 1024; a staged, coalesced epilogue would recover it.
+      T = 1024; a staged, coalesced epilogue would recover it (done in item 28).
 
 27. Prompt attention at long context (`7843ddbe`, measured 2026-09-26, RTX 4090, CUDA 13.4; the
     kernel serves Qwen3.8 too).
@@ -2465,6 +2465,40 @@ Next steps, in order:
       FP32 (one FFMA and one conversion per accumulator and tile) is fixed by the bit-identical
       contract.
 
+
+28. Faster A8 quantization and a staged GEMM epilogue (`9c1ee925`, `1caef1d0`, measured
+    2026-09-26, RTX 4090, server off; base `b2f10487`).
+    - nsys, `long_niah_8k` (1024-token chunks), the separate quantize/rotate kernels took 13.1 ms
+      per chunk (~6.5 % of the prefill): SwiGLU input of down (K = 17408) 104 us, RMSNorm input
+      (K = 5120) 36 us, o_proj/out_proj input (K = 6144) 34 us, GDN in_proj input 29 us. Nsight
+      Compute put the rotated kernel at 81 % SM / 86 % L1 throughput and 50 % DRAM: the ten
+      shared-memory butterfly stages with a barrier each, not memory, bound it.
+    - `rotate_block` now runs strides 1-2 within a thread, 4-64 across the lanes of a warp
+      (`shfl_xor`) and 128-512 in one shared-memory pass (two barriers). Each stage computes the
+      same `a + b` / `a - b` in the same stage order, so q, scales and sums are bitwise unchanged
+      (scratch old/new harness: 0 differing bytes over plain/RMSNorm/SwiGLU prologues, rotated
+      and not, T = 1, 3, 130, 1024). The RMSNorm prologue reduces each row once per token (one CTA
+      per token over all blocks) instead of once per 1024-column block.
+    - `gemm_tall_tile` stages its FP32 tile as [token][row] in the freed stage memory and writes
+      8-row chunks as 16-byte words (16 adjacent threads per token), adding the residual in FP32
+      before the one BF16 rounding, as `store_row`. The pipelined route now requires outputs of
+      aligned 8-row chunks (all Bonsai weights); other splits take the 64 x 64 GEMM.
+    - Per-kernel medians, same trace, base -> new (us): SwiGLU quantization 104 -> 64, RMSNorm
+      36 -> 19, K = 6144 34 -> 17, K = 5120 29 -> 14; gate+up GEMM 1017 -> 987, 5120-row GEMM
+      565 -> 525, GDN in_proj 479 -> 463, qkvg 423 -> 407. About 13.7 ms saved per chunk.
+    - Checks: `ninfer_linear_t5_test` passes; quick perplexity 5.854904 (unchanged); greedy MTP 2
+      text identical on five prompts of 65-492 tokens at 11.6-11.9 ms per round on both binaries.
+    - End to end, alternated (base, new, new, base), all answers exact: NIAH prefill (rk4v4-e8,
+      chunk 1024, MTP 2) 8K 4.86/4.84 -> 5.15/5.20K tok/s, 64K 17.3/17.3 -> 16.4/16.4 s, 128K
+      44.4 -> 42.8 s; `ninfer_bench -p 512,2048 -r 3 --kv-dtype int8` pp512 5,370/5,345 ->
+      5,755/5,676 tok/s, pp2048 5,564/5,562 -> 5,977/5,986 tok/s.
+    - Not possible bit-identically: quantizing the SwiGLU output in the gate+up epilogue. The
+      down input is rotated over 1024-channel blocks, while a GEMM tile holds 128 rows of either
+      gate or up; staging the unrounded SwiGLU (or a partial butterfly) in FP32 moves as many
+      bytes as g and u in BF16, and a BF16 SwiGLU would add a rounding the contract excludes.
+    - Remaining: the down-input quantization (64 us, reading g and u) is now near its traffic
+      floor; the GDN gated RMSNorm (22 us) followed by its out_proj quantization (17 us) could be
+      one kernel (~1 ms per chunk, estimated).
 
 ## Appendix: sources
 
