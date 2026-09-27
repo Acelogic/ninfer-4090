@@ -55,7 +55,7 @@ otherwise; the conditions are next to each table. Both models run the full 262K-
 From a "x64 Native Tools" prompt (or after running `vcvars64.bat`) with CUDA on `PATH`:
 
 ```bat
-git clone -b feat/bonsai-ternary https://github.com/JGamboa/ninfer-4090-windows
+git clone https://github.com/JGamboa/ninfer-4090-windows
 cd ninfer-4090-windows
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake ^

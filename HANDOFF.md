@@ -38,7 +38,7 @@ proyecto:
    numerada "Current state and next steps"). Anota el commit medido, el comando, el hardware y los
    números. Los resultados de Qwen3.8 van en `WINDOWS_PORT.md`.
 6. **Commits:** usa el formato Conventional Commits (`perf(...)`, `fix(...)`, `test(...)`,
-   `docs(...)`). Trabaja en la rama `feat/bonsai-ternary` del repo `JGamboa/ninfer-4090-windows`.
+   `docs(...)`). Trabaja en la rama `main` del repo `JGamboa/ninfer-4090-windows`.
    No subas un cambio de rendimiento sin haber pasado sus tests.
 
 ### Trampas de CUDA que ya nos mordieron en este proyecto
@@ -63,7 +63,7 @@ proyecto:
 
 ## 2. Entorno
 
-- **Repo:** `E:\LLM\ninfer-4090-bonsai`, rama `feat/bonsai-ternary`. Hay otro checkout Qwen-only en
+- **Repo:** `E:\LLM\ninfer-4090-bonsai`, rama `main` (antes `feat/bonsai-ternary`, que queda congelada). Hay otro checkout Qwen-only en
   `E:\LLM\ninfer-4090-winport`.
 - **Build:** abre una shell con MSVC (`vcvars64.bat`) y CUDA en el PATH, y corre
   `cmake --build build -j`. Para configurar desde cero, sigue `WINDOWS_PORT.md`, sección "Building on
@@ -207,7 +207,7 @@ cd E:\LLM\ninfer-known-good
 ```
 
 **Para volver atrás en la rama sin perder lo demás:** usa `git revert` sobre el commit que falle. No
-hagas `git reset --hard` ni `push --force` en `feat/bonsai-ternary`: se pierden las mediciones y los
+hagas `git reset --hard` ni `push --force` en `main`: se pierden las mediciones y los
 otros cambios. Así se revierte cada parte:
 
 | Si falla... | Revertir (en este orden) | Queda como |
