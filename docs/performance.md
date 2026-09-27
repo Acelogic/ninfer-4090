@@ -1,5 +1,11 @@
 # Single-GPU serving performance
 
+> **Upstream measurements.** This page and the pages it links are the upstream engine's RTX 5090
+> results, kept for reference. For this fork's RTX 4090 figures see the
+> [README](../README.md#performance), [WINDOWS_PORT.md](../WINDOWS_PORT.md), the
+> [Bonsai design notes](maintainer/bonsai-ternary-design.md) (section 9.1) and the
+> [llama.cpp comparison](llamacpp-comparison.md).
+
 Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.
 Choose a model below for its detailed results, run conditions, output limitations, and reproduction
 commands. These are recorded historical measurements; a model/backend being supported does not

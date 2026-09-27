@@ -1,10 +1,73 @@
 # NInfer against llama.cpp on one RTX 4090
 
-Measured 2026-08-15. Both engines ran Qwen3.8-27B on the same card on the same day. This
-document records the configurations, the method, and the raw numbers behind the summary
-tables in the [README](../README.md).
+Two comparisons are recorded here. The current one (2026-09-26, native Windows) ran both engines
+on the maintainer's RTX 4090 with the same Qwen3.8-27B fine-tune. The earlier one (2026-08-15/17)
+was measured by the upstream Linux port on another RTX 4090 and is kept for its decode and depth
+data, which the current comparison does not yet cover.
 
-## Environment
+## Same machine, Windows (2026-09-26)
+
+### Environment
+
+| Component | Version |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090, 24 GiB, stock clocks; the card also drives the desktop at 60 Hz |
+| Host | Core i9-13900K, 64 GB DDR5-6000, Windows 11, driver 595.97 |
+| llama.cpp | official, commit `a894dae`, MSVC + CUDA build |
+| NInfer | this repository, CUDA 13.4, MSVC |
+| Model | Qwen3.8-27B Cold Fusion fine-tune in each engine's format: `Qwen3.8-27B-ColdFusion-MTP-Q4_K_S.gguf` (16.32 GiB) for llama.cpp, the `qwen3_8_27b` Q4/Q5 groupwise recipe for NInfer. Same architecture and similar size, not bit-identical weights |
+
+### Method
+
+- llama.cpp: `llama-server -c 132096 -ngl 99 --flash-attn on -ctk <kv> -ctv <kv> -ub 1024 -b 4096
+  --jinja -np 1`; requests with `cache_prompt: false` and `chat_template_kwargs.enable_thinking:
+  false`; prefill time from the response `timings`.
+- NInfer: `ninfer.exe <artifact> --messages <prompt> --max-context 132096 --no-thinking
+  --prefill-chunk 1024 --kv-dtype <kv> --max-new 16 --greedy`, no speculation; prefill time from
+  the `text prefill` line.
+- Prompts: `examples/cli/messages/long_niah_{8k,64k,128k}.json` (7,680 / 64,512 / 130,048 prompt
+  tokens in both engines). Two rounds with the engine order reversed; every answer was exact.
+- Bench tools at depth 0: `llama-bench -p 512,2048 -n 0 -fa 1 -ctk q8_0 -ctv q8_0 -ub 1024 -b 4096
+  -r 3` against `ninfer_bench -p 512,2048 -r 3 --kv-dtype int8`.
+
+### Prefill results
+
+8-bit KV (llama.cpp q8_0, NInfer int8 with group-64 scales), NInfer on the BF16-prefill artifact:
+
+| Prompt | llama.cpp | NInfer |
+|---|---:|---:|
+| 8K | 3.0 / 3.0 s | 3.1 / 3.0 s |
+| 64K | 29.8 / 29.9 s | 29.4 / 28.9 s |
+| 128K | 73.6 / 73.8 s | 66.8 / 66.9 s (-9 %) |
+| `pp512` / `pp2048` (bench tools) | 2,756 / 2,729 tok/s | 2,334 / 2,594 tok/s |
+
+4-bit KV (llama.cpp q4_0, NInfer rk4v4-e8, whose E8-lattice keys keep more precision):
+
+| Prompt | llama.cpp | NInfer |
+|---|---:|---:|
+| 8K | 3.0 / 3.0 s | 3.2 / 3.1 s |
+| 64K | 29.8 / 29.9 s | 29.4 / 29.5 s |
+| 128K | 73.0 / 73.5 s | 69.4 / 68.5 s (-6 %) |
+
+### Since then
+
+The Cold Fusion files were removed after this comparison, so later NInfer figures use the official
+Qwen3.8-27B weights. With the int8-prefill artifact (`qwen3_8_27b_a8.ninfer`, same weights, int8
+activations in the prefill GEMMs) and the prefill work of 2026-09-26/27, NInfer measured on
+2026-09-27, with the GPU otherwise idle: `pp512` / `pp2048` 4,622 / 5,138 tok/s, `long_niah_64k`
+16.5 s and `long_niah_128k` 41.3 s (rk4v4-e8). Against the llama.cpp rates above that is 1.7-1.9x
+at 512-2K tokens and about 1.8x on the long prompts, but it is a cross-weight, cross-day comparison
+(see [WINDOWS_PORT.md](../WINDOWS_PORT.md) for every run).
+
+Not yet measured on this machine: llama.cpp decode (plain and `draft-mtp`) and context depths past
+128K. The earlier comparison below covers them on another card.
+
+## Earlier comparison: Linux, upstream 4090 port (2026-08-15/17)
+
+Measured 2026-08-15. Both engines ran Qwen3.8-27B on the same card on the same day. This
+section records the configurations, the method, and the raw numbers of that run.
+
+### Environment
 
 | Component | Version |
 |---|---|
@@ -18,7 +81,7 @@ tables in the [README](../README.md).
 The artifacts differ by about 2% in size, which favors llama.cpp on every
 bandwidth-bound measurement.
 
-## Configurations
+### Configurations
 
 NInfer ran the deployed serve configuration:
 
@@ -46,7 +109,7 @@ The 131,584-token context is the practical MTP ceiling on this card: VRAM reache
 23.8 of 24 GiB. The 64K variant (`-c 65536`) uses 20.8 GiB. The deployed 144K llama.cpp
 configuration cannot fit the MTP draft buffers.
 
-## Method
+### Method
 
 - `llama bench` reports marginal rates: the pp2048 row at depth d measures 2,048 tokens
   of prefill after a d-token prefix, and tg32 measures 32 decoded tokens after the same
@@ -73,9 +136,9 @@ configuration cannot fit the MTP draft buffers.
   trapezoid; the two server-measured points show that integration underestimates the true
   server time by 2-4%.
 
-## Raw results
+### Raw results
 
-### llama.cpp `llama bench` sweep (marginal rates)
+#### llama.cpp `llama bench` sweep (marginal rates)
 
 | Depth | pp2048 tok/s | tg32 tok/s |
 |---:|---:|---:|
@@ -84,7 +147,7 @@ configuration cannot fit the MTP draft buffers.
 | 65,536 | 1,865.64 ± 1.36 | 38.58 ± 0.18 |
 | 131,072 | 1,335.69 ± 0.41 | 33.14 ± 0.12 |
 
-### NInfer serve prefill (full-prompt averages)
+#### NInfer serve prefill (full-prompt averages)
 
 | Prompt tokens | Time | Rate |
 |---:|---:|---:|
@@ -97,21 +160,21 @@ configuration cannot fit the MTP draft buffers.
 Marginal band rates from finite differences: 2,010 tok/s across 2K-32K, 1,714 across
 32K-64K, 1,465 across 64K-88K, 1,292 across 88K-128K.
 
-### llama.cpp server prefill (from the MTP runs)
+#### llama.cpp server prefill (from the MTP runs)
 
 | Prompt tokens | Time | Rate |
 |---:|---:|---:|
 | 63,633 | 28.72 s | 2,216 tok/s |
 | 127,939 | 71.59 s | 1,787 tok/s |
 
-### Decode, no speculation
+#### Decode, no speculation
 
 | Depth | llama.cpp tg32 | NInfer (CLI, greedy) |
 |---:|---:|---:|
 | 0 | 45.9 tok/s | 50.5 tok/s |
 | 128K | 33.1 tok/s | 39.6 tok/s |
 
-### Decode, MTP against MTP (server, greedy, draft depth 3)
+#### Decode, MTP against MTP (server, greedy, draft depth 3)
 
 | Workload | llama.cpp `draft-mtp` | NInfer MTP3 |
 |---|---:|---:|
@@ -131,7 +194,7 @@ The matching sweep on the RTX 5090 lives in the
 [ninfer-5090 repository](https://github.com/sergiuszm/ninfer-5090)
 (`docs/qwen38-rtx5090-vs-llamacpp.md`).
 
-## Findings
+### Findings
 
 1. llama.cpp leads prefill; the lead narrows with depth. Server against server: 20% on a
    64K prompt, 15% on a 128K prompt.
@@ -147,13 +210,13 @@ The matching sweep on the RTX 5090 lives in the
    representative of long prompts: its own marginal rate falls to 1,336 tok/s at 128K
    depth under production settings.
 
-## History note
+### History note
 
 An earlier measurement recorded llama.cpp prefill at 2,334 tok/s at 64K depth under
 unmatched settings. Under the production configuration above the matched number is
 1,866 tok/s. The table in this document supersedes the old figure.
 
-## 2026-08-17 refresh: E8 KV default
+### 2026-08-17 refresh: E8 KV default
 
 The NInfer default moved from INT8 KV at 172,032 tokens to `rk4v4-e8` (E8
 Conway-Sloane 4-bit keys, 4-bit values) at the full native 262,144 tokens. This

@@ -1,16 +1,19 @@
 # NInfer documentation
 
-Start with the [project README](../README.md) to build NInfer, download a published artifact, and
-run the CLI or HTTP server.
+Start with the [project README](../README.md) to download the prebuilt Windows binaries or build
+NInfer, download a model, and run the CLI or HTTP server. This fork targets one NVIDIA GeForce
+RTX 4090 (`sm_89`) on native Windows.
 
 ## User guides
 
 | Document | Purpose |
 |---|---|
-| [RTX 3090 Linux build](rtx-3090-linux.md) | Docker and native Ubuntu builds for the `sm_86` applications |
+| [Native Windows port](../WINDOWS_PORT.md) | Windows build details, Qwen3.8 measurements and experiments on the RTX 4090 |
+| [Prebuilt releases](https://github.com/JGamboa/ninfer-4090-windows/releases) | Windows x64 binaries with DLLs, launchers and licenses |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
-| [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
+| [Comparison with llama.cpp](llamacpp-comparison.md) | same-machine prefill comparison on the RTX 4090 (2026-09-26) and the earlier Linux comparison |
+| [Performance (upstream, RTX 5090)](performance.md) | the upstream engine's RTX 5090 serving measurements and publication rules; RTX 4090 figures are in the README and WINDOWS_PORT |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
@@ -18,6 +21,16 @@ run the CLI or HTTP server.
 The executable `--help` output is the exact source for command-line option spelling and defaults.
 
 ## Model artifacts
+
+Artifacts published for this fork (RTX 4090):
+
+| Model | Weights | Download |
+|---|---|---|
+| Ternary Bonsai 2 27B (text + vision + MTP) | `t5_g128_fp16` ternary | [Hugging Face](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) |
+| Qwen3.8-27B, int8 prefill | official `groupwise-int` weights with `AllowA8` | [Hugging Face](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) |
+| Swift 1.5 Qwen3.8-27B, int8 prefill | `groupwise-int` with `AllowA8` | [Hugging Face](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) |
+
+Upstream artifacts (the `groupwise-int` ones run on the RTX 4090; `nvfp4` needs Blackwell):
 
 | Model | Weights | Download | Versioned model card source |
 |---|---|---|---|
@@ -46,6 +59,8 @@ other references own narrower contracts:
 | Document | Responsibility |
 |---|---|
 | [Engine architecture](maintainer/engine-architecture.md) | model/config/weight ownership, loading-to-execution flow, requests, scheduling, transactions and graphs |
+| [Ternary Bonsai design notes](maintainer/bonsai-ternary-design.md) | ternary format, kernels, speculation work and every measurement of this fork (section 9.1) |
+| [Ternary Bonsai conversion](maintainer/bonsai-ternary-conversion.md) | Prism GGUF reading, tensor mapping and conversion checks |
 | [Build system](maintainer/build-system.md) | CMake targets, explicit source ownership, CUDA compilation boundaries, presets and developer configuration |
 | [Artifact container](maintainer/artifact-container.md) | v3 directory, objects, logical bindings, Uses, resources and file framing/sharding |
 | [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |

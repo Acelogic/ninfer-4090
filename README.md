@@ -492,7 +492,7 @@ The full protocol reference, including every field and error code, is in
 | Benchmarks and tests | [bench/README.md](bench/README.md), [tests/README.md](tests/README.md) |
 | Engine architecture | [docs/maintainer/engine-architecture.md](docs/maintainer/engine-architecture.md) |
 | Context cache and scheduling | [docs/maintainer/resource-scheduling-and-context-cache.md](docs/maintainer/resource-scheduling-and-context-cache.md) |
-| Comparison with llama.cpp (Linux, upstream port) | [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md) |
+| Comparison with llama.cpp (same machine, and the earlier Linux run) | [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md) |
 
 ## Lineage and credits
 
