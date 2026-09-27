@@ -123,10 +123,8 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
 
 template <bool Normalize>
 __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
-                                                  const __nv_bfloat16* query, __nv_bfloat16* output,
-                                                  std::uint32_t dqk_base, std::uint32_t dv_base,
-                                                  int lane, float scale) {
-    RawQkLane q = load_raw_qk_lane(query, dqk_base);
+                                                  RawQkLane q, __nv_bfloat16* output,
+                                                  std::uint32_t dv_base, int lane, float scale) {
     normalize_qk_lane<Normalize>(q.value, lane);
 
     float attn_val = 0.0f;
@@ -169,7 +167,11 @@ __device__ __forceinline__ RecurrentCoordinates make_coordinates(std::int32_t ba
             qk_head, dv_base,    static_cast<std::uint32_t>(lane * kQkPerLane)};
 }
 
+// Effects of the token loop. kReadout: the loop publishes an output per token from the query,
+// which it loads with the token's key, value and gate.
 struct OutputEffects {
+    static constexpr bool kReadout = true;
+
     template <class Access>
     __device__ __forceinline__ static void observe_key(const Access&, const RecurrentCoordinates&,
                                                        std::int32_t, const RawQkLane&) {}
@@ -182,14 +184,15 @@ struct OutputEffects {
     template <bool NormalizeInputs, class Access>
     __device__ __forceinline__ static void
     publish_output(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
-                   const RecurrentCoordinates& coord, std::int32_t token) {
-        readout_and_store<NormalizeInputs>(state, access.query_ptr(coord, token),
-                                           access.output_ptr(coord, token), coord.dqk_base,
+                   const RecurrentCoordinates& coord, std::int32_t token, const RawQkLane& query) {
+        readout_and_store<NormalizeInputs>(state, query, access.output_ptr(coord, token),
                                            coord.dv_base, coord.lane, access.scale);
     }
 };
 
 struct RecordEffects {
+    static constexpr bool kReadout = true;
+
     template <class Access>
     __device__ __forceinline__ static void observe_key(const Access& access,
                                                        const RecurrentCoordinates& coord,
@@ -208,12 +211,14 @@ struct RecordEffects {
     template <bool NormalizeInputs, class Access>
     __device__ __forceinline__ static void
     publish_output(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
-                   const RecurrentCoordinates& coord, std::int32_t token) {
-        OutputEffects::publish_output<NormalizeInputs>(state, access, coord, token);
+                   const RecurrentCoordinates& coord, std::int32_t token, const RawQkLane& query) {
+        OutputEffects::publish_output<NormalizeInputs>(state, access, coord, token, query);
     }
 };
 
 struct FoldEffects {
+    static constexpr bool kReadout = false;
+
     template <class Access>
     __device__ __forceinline__ static void observe_key(const Access&, const RecurrentCoordinates&,
                                                        std::int32_t, const RawQkLane&) {}
@@ -226,7 +231,7 @@ struct FoldEffects {
     template <bool NormalizeInputs, class Access>
     __device__ __forceinline__ static void
     publish_output(float (&)[kDvPerWarp][kQkPerLane], const Access&, const RecurrentCoordinates&,
-                   std::int32_t) {}
+                   std::int32_t, const RawQkLane&) {}
 };
 
 struct DirectAccess {
@@ -613,29 +618,57 @@ __device__ __forceinline__ void store_state_tile(const float (&state)[kDvPerWarp
     }
 }
 
+// A token's inputs: key, value, gate and (with a readout) query.
+struct TokenInputs {
+    RawQkLane key;
+    RawValuePack value;
+    RawGatePair gate;
+    RawQkLane query;
+};
+
+template <bool Readout, class Access>
+__device__ __forceinline__ TokenInputs load_token_inputs(const Access& access,
+                                                         const RecurrentCoordinates& coord,
+                                                         std::int32_t token) {
+    TokenInputs in;
+    in.key   = load_raw_qk_lane(access.key_ptr(coord, token), coord.dqk_base);
+    in.gate  = access.load_gate(coord, token);
+    in.value = load_value_pack(access.value_ptr(coord, token), coord.dv_base);
+    if constexpr (Readout) {
+        in.query = load_raw_qk_lane(access.query_ptr(coord, token), coord.dqk_base);
+    }
+    return in;
+}
+
+// The token loop. Every input of token t + 1 is loaded before token t's transition and readout,
+// so each token waits for at most one round of global loads; the arithmetic is unchanged.
 template <bool NormalizeInputs, class Effects, class Access>
 __device__ __forceinline__ void
 run_recurrent_sequence(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
                        const RecurrentCoordinates& coord, std::int32_t valid) {
-    RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
-    Effects::observe_key(access, coord, 0, key);
-    normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
+    constexpr bool kReadout = Effects::kReadout;
+    if (valid <= 0) {
+        // The key of column 0 is still observed (recorded) when no column is valid.
+        const RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+        Effects::observe_key(access, coord, 0, key);
+        return;
+    }
+    TokenInputs next = load_token_inputs<kReadout>(access, coord, 0);
+    Effects::observe_key(access, coord, 0, next.key);
 
     for (std::int32_t token = 0; token < valid; ++token) {
-        const RawGatePair gate = access.load_gate(coord, token);
-        const RawValuePack value =
-            load_value_pack(access.value_ptr(coord, token), coord.dv_base);
-        Effects::observe_value_gate(access, coord, token, value, gate);
+        TokenInputs current = next;
+        if (token + 1 < valid) { next = load_token_inputs<kReadout>(access, coord, token + 1); }
+        normalize_qk_lane<NormalizeInputs>(current.key.value, coord.lane);
+        Effects::observe_value_gate(access, coord, token, current.value, current.gate);
 
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+        apply_gdn_transition(state, current.key.value, current.value.value, current.gate.g,
+                             current.gate.beta);
 
-        if (token + 1 < valid) {
-            key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
-            Effects::observe_key(access, coord, token + 1, key);
-            normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
-        }
+        if (token + 1 < valid) { Effects::observe_key(access, coord, token + 1, next.key); }
 
-        Effects::template publish_output<NormalizeInputs>(state, access, coord, token);
+        Effects::template publish_output<NormalizeInputs>(state, access, coord, token,
+                                                          current.query);
     }
 }
 
