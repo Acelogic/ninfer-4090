@@ -104,8 +104,11 @@ constexpr int kUnitBytes   = 13;
 // 128-column group w of the block. With a rotated weight the block first goes through
 // (1/32) H (signs * x) in FP32 (the butterfly of ops/hadamard, stage by stage in increasing
 // stride, rotate_block below). Neither the prologue's result nor its rotation is rounded to BF16.
-// A prologue with per-token state (RMSNorm) runs one CTA per token over all blocks and prepares
-// that state once; the others run one CTA per (block, token).
+// A prologue with per-token state (RMSNorm) prepares that state in every CTA, in the same fixed
+// order, so the result does not depend on the grid: with many tokens one CTA per token visits all
+// blocks and prepares it once; with few tokens (decode and verification) one CTA per (block, token)
+// prepares it itself, so the blocks run in parallel. The other prologues run one CTA per (block,
+// token).
 constexpr int kQuantizeBlock   = 1024;
 constexpr int kQuantizeThreads = 256;
 
@@ -120,7 +123,7 @@ __device__ __forceinline__ void unpack_bf16x4(uint2 word, float (&value)[4]) {
 
 // The input x [K,T] itself.
 struct PlainInput {
-    static constexpr bool kWholeRow = false;
+    static constexpr bool kTokenState = false;
     const __nv_bfloat16* x;
 
     struct Token {};
@@ -134,7 +137,7 @@ struct PlainInput {
 // ops::rmsnorm of the raw rows x [K,T]: x rsqrt(mean(x^2) + eps) gain, gain = 1 + weight with
 // unit_offset, else weight. The row's sum of squares is reduced once per token, in a fixed order.
 struct RmsNormInput {
-    static constexpr bool kWholeRow = true;
+    static constexpr bool kTokenState = true;
     const __nv_bfloat16* x;
     const __nv_bfloat16* weight;
     float eps;
@@ -189,7 +192,7 @@ struct RmsNormInput {
 
 // SwiGLU of the gate and up rows [K,T]: silu(gate) * up (exact silu, as ops::silu_mul).
 struct SwiGluInput {
-    static constexpr bool kWholeRow = false;
+    static constexpr bool kTokenState = false;
     const __nv_bfloat16* gate;
     const __nv_bfloat16* up;
 
@@ -262,18 +265,18 @@ __device__ __forceinline__ void rotate_block(float (&value)[4],
     value[3]             = rotated.w * 0x1p-5f;
 }
 
-// Grid: (K / 1024, T) CTAs, or (1, T) for a whole-row prologue.
+// Grid: (K / 1024, T) CTAs, or (1, T) with `whole_row` (token-state prologues only).
 template <class Input, bool Rotate>
 __global__ void __launch_bounds__(kQuantizeThreads)
-    quantize_kernel(Input input, const __nv_bfloat16* __restrict__ signs, int k,
+    quantize_kernel(Input input, const __nv_bfloat16* __restrict__ signs, int k, bool whole_row,
                     std::uint32_t* __restrict__ qx, float* __restrict__ group_scale,
                     int* __restrict__ group_sum, int* __restrict__ slice_sum) {
     __shared__ __align__(16) float values[Rotate ? kQuantizeBlock : 1];
     const int tid                   = static_cast<int>(threadIdx.x);
     const int token                 = static_cast<int>(blockIdx.y);
     const typename Input::Token state = input.prepare(k, token);
-    const int first = Input::kWholeRow ? 0 : static_cast<int>(blockIdx.x);
-    const int last  = Input::kWholeRow ? k / kQuantizeBlock : first + 1;
+    const int first = whole_row ? 0 : static_cast<int>(blockIdx.x);
+    const int last  = whole_row ? k / kQuantizeBlock : first + 1;
     for (int block = first; block < last; ++block) {
         const int column = block * kQuantizeBlock + 4 * tid;
         float value[4];

@@ -41,14 +41,18 @@ QuantizedX quantize(const Input& input, int k, int tokens, const void* signs,
     auto* gsum  = static_cast<int*>(result.group_sum.data);
     auto* ssum  = static_cast<int*>(result.slice_sum.data);
     const auto* sign = static_cast<const __nv_bfloat16*>(signs);
-    const dim3 grid(Input::kWholeRow ? 1u : static_cast<unsigned>(k / t5_a8::kQuantizeBlock),
+    // A token-state prologue visits all blocks from one CTA per token once the tokens alone fill
+    // the SMs (prefill); with fewer tokens each CTA prepares the state for its own block, so a
+    // decode or verification quantization is not K / 1024 blocks in series.
+    const bool whole_row = Input::kTokenState && tokens >= device_sm_count();
+    const dim3 grid(whole_row ? 1u : static_cast<unsigned>(k / t5_a8::kQuantizeBlock),
                     static_cast<unsigned>(tokens));
     if (sign != nullptr) {
-        t5_a8::quantize_kernel<Input, true>
-            <<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(input, sign, k, q, scale, gsum, ssum);
+        t5_a8::quantize_kernel<Input, true><<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(
+            input, sign, k, whole_row, q, scale, gsum, ssum);
     } else {
-        t5_a8::quantize_kernel<Input, false>
-            <<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(input, sign, k, q, scale, gsum, ssum);
+        t5_a8::quantize_kernel<Input, false><<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(
+            input, sign, k, whole_row, q, scale, gsum, ssum);
     }
     CUDA_CHECK(cudaGetLastError());
     return result;
