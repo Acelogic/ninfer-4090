@@ -41,7 +41,7 @@ QuantizedX quantize(const Input& input, int k, int tokens, const void* signs,
     auto* gsum  = static_cast<int*>(result.group_sum.data);
     auto* ssum  = static_cast<int*>(result.slice_sum.data);
     const auto* sign = static_cast<const __nv_bfloat16*>(signs);
-    const dim3 grid(static_cast<unsigned>(k / t5_a8::kQuantizeBlock),
+    const dim3 grid(Input::kWholeRow ? 1u : static_cast<unsigned>(k / t5_a8::kQuantizeBlock),
                     static_cast<unsigned>(tokens));
     if (sign != nullptr) {
         t5_a8::quantize_kernel<Input, true>
