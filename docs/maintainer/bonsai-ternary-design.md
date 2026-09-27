@@ -2524,7 +2524,7 @@ Next steps, in order:
       54.5 tok/s. The base times above are faster than the figures measured on 2026-09-26 while
       three agents shared the machine; compare within one table only.
 
-30. Decode round audit and three exact fixes (`65158ee0`, `c6995676`, `e589f505`, measured 2026-09-27,
+30. Decode round audit and three exact fixes (`dfca4519`, `23cdbe02`, `eabcb014`, measured 2026-09-27,
     RTX 4090, base `12f87c61`; the Qwen3.8 side and the whole-round table are in WINDOWS_PORT.md,
     "Decode round audit").
     - Where an MTP 2 round goes (`nsys --cuda-graph-trace=node`, `scenario_story_en_mystery`, bf16
@@ -2540,13 +2540,13 @@ Next steps, in order:
       instruction, issue slots 25-36 % busy, 0.48 warp instructions per weight byte. DRAM throughput is
       82-89 % of peak on the >= 14336-row weights and 63-75 % on the 5120-row ones (640 CTAs, 10 warps
       per SM): the GEMV is latency-bound on its weight loads, not on the trit decode.
-    - `65158ee0`: the RMSNorm-input quantization ran one CTA per token over the K / 1024 blocks, so at
+    - `dfca4519`: the RMSNorm-input quantization ran one CTA per token over the K / 1024 blocks, so at
       decode widths five blocks ran in series (5.3-5.8 us, 80 calls per round). Below one token per SM
       each CTA prepares the row's RMS itself (same fixed-order reduction) and quantizes one block
       (2.1 us): -0.26 ms per round and per token.
-    - `c6995676`: the GDN recurrence loads token t + 1's key, value, gate and query before applying
+    - `23cdbe02`: the GDN recurrence loads token t + 1's key, value, gate and query before applying
       token t (record 6.78 -> 6.43 us per layer).
-    - `e589f505` (both models): the round's ingress, MTP hidden and egress copies run as kernels
+    - `eabcb014` (both models): the round's ingress, MTP hidden and egress copies run as kernels
       instead of copy-engine nodes, which idled the GPU 15-35 us each, and a continuing round submits
       its GDN fold without waiting for it. Host and copy-engine gaps fall from 3.0 to 1.0 per round.
     - Checks: `ninfer_linear_t5_test`, `ninfer_gated_delta_net_test`,

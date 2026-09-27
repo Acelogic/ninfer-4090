@@ -1210,7 +1210,7 @@ a kernel node and a copy-engine node idled the GPU for 15-35 us (ingress copy ->
 us, D2D hidden copy -> egress copy 13-27 us, sampling -> egress copy 18-21 us), and the host waited
 for the GDN replay fold before preparing the next round (fold -> next round 26-32 us).
 
-`e589f505` runs these copies as kernels (`kernel_copy_async`, pinned host memory read or written over
+`eabcb014` runs these copies as kernels (`kernel_copy_async`, pinned host memory read or written over
 PCIe) and lets a continuing round submit its fold without waiting for it (rows that end or are
 cancelled still wait). Bonsai's items (quantization at decode widths, GDN input loads) are in the
 Bonsai design notes, section 9.1, item 30. Measured 2026-09-27, base (`12f87c61`) and new alternated
