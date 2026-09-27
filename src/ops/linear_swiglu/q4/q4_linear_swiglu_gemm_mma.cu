@@ -77,6 +77,27 @@ void q4_linear_swiglu_a8_mma_folded_pipelined_r64_c128_launch(const A8G64Activat
                                           stream);
 }
 
+void q4_linear_swiglu_a8_quantized_mma_folded_pipelined_r64_c128_launch(const A8G64Activation& x,
+                                                                        const Weight& weight,
+                                                                        A8G64Activation& out,
+                                                                        cudaStream_t stream) {
+    const std::int32_t k      = x.q.ne[0];
+    const std::int32_t tokens = x.q.ne[1];
+    Tensor unused(nullptr, DType::BF16, {out.q.ne[0], tokens});
+    const rowsplit_tall_a8::SwiGluQ4QuantizedProblem problem{
+        folded_problem(weight, unused, k), static_cast<std::int8_t*>(out.q.data),
+        static_cast<float*>(out.scale.data), tokens};
+    if (out.q.ne[1] != tokens || out.scale.ne[0] != tokens ||
+        out.scale.ne[1] != problem.folded.intermediate / 64 ||
+        (reinterpret_cast<std::uintptr_t>(out.q.data) & 15) != 0) {
+        throw std::invalid_argument("q4 linear_swiglu: invalid quantized output");
+    }
+    rowsplit_tall_a8::launch<kTallTokens>(problem, problem.folded.intermediate / 64,
+                                          static_cast<const std::int8_t*>(x.q.data),
+                                          static_cast<const float*>(x.scale.data), k, tokens,
+                                          stream);
+}
+
 void q4_linear_swiglu_mma_folded_pipelined_r64_c128_launch(const Tensor& x, const Weight& weight,
                                                            Tensor& out, cudaStream_t stream) {
     const std::int32_t k = x.ne[0];

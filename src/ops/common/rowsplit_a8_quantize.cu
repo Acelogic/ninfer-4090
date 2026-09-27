@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/common/memory.cuh"
+#include "ops/kernel/rmsnorm.cuh"
 
 #include <cuda_bf16.h>
 
@@ -54,6 +55,37 @@ __global__ void __launch_bounds__(kThreads)
     if (part == 0) { scale[static_cast<std::int64_t>(group) * tokens + token] = amax / 127.0f; }
 }
 
+// The 5120-wide route of ops::rmsnorm (launcher/rmsnorm.cu): one CTA of 256 threads per token,
+// ten BF16x2 pairs per thread. Its k-th store of warp w is the 64-column group 8 k + w, one pair
+// per lane, so the warp quantizes the BF16 pairs it would have stored.
+constexpr int kRmsHidden = 5120;
+
+template <RmsEpilogue Epilogue>
+__global__ void __launch_bounds__(kThreads)
+    rmsnorm_a8_g64_quantize_kernel(const __nv_bfloat162* __restrict__ x,
+                                   const __nv_bfloat162* __restrict__ weight, float eps,
+                                   std::int32_t tokens, std::int8_t* __restrict__ q,
+                                   float* __restrict__ scale) {
+    const std::int64_t token = static_cast<std::int64_t>(blockIdx.x);
+    const int lane           = static_cast<int>(threadIdx.x) & 31;
+    rmsnorm_cta_bf16x2_row<Epilogue, kThreads, 10, true, kRmsHidden>(
+        x, weight, nullptr, kRmsHidden, token, eps, [&](int pair, __nv_bfloat162 normalized) {
+            const float2 value = __bfloat1622float2(normalized);
+            float amax         = fmaxf(0.0f, fmaxf(fabsf(value.x), fabsf(value.y)));
+#pragma unroll
+            for (int offset_lanes = 1; offset_lanes < 32; offset_lanes <<= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset_lanes));
+            }
+            const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+            const int low       = max(-127, min(127, __float2int_rn(value.x * inverse)));
+            const int high      = max(-127, min(127, __float2int_rn(value.y * inverse)));
+            *reinterpret_cast<std::uint16_t*>(q + token * kRmsHidden + 2 * pair) =
+                static_cast<std::uint16_t>((static_cast<unsigned>(low) & 0xffu) |
+                                           ((static_cast<unsigned>(high) & 0xffu) << 8));
+            if (lane == 0) { scale[static_cast<std::int64_t>(pair / 32) * tokens + token] = amax / 127.0f; }
+        });
+}
+
 } // namespace
 
 void a8_g64_quantize(const Tensor& x, A8G64Activation& out, cudaStream_t stream) {
@@ -73,6 +105,33 @@ void a8_g64_quantize(const Tensor& x, A8G64Activation& out, cudaStream_t stream)
     a8_g64_quantize_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), k, tokens, items,
         static_cast<std::int8_t*>(out.q.data), static_cast<float*>(out.scale.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rmsnorm_a8_g64_quantize(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+                             A8G64Activation& out, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    if (x.dtype != DType::BF16 || !x.is_contiguous() || x.ne[0] != kRmsHidden || x.ne[2] != 1 ||
+        x.ne[3] != 1 || tokens <= 0 || weight.dtype != DType::BF16 || !weight.is_contiguous() ||
+        weight.ne[0] != kRmsHidden || weight.ne[1] != 1 || weight.ne[2] != 1 ||
+        weight.ne[3] != 1 || out.q.dtype != DType::I8 || out.q.ne[0] != kRmsHidden ||
+        out.q.ne[1] != tokens || out.scale.dtype != DType::FP32 || out.scale.ne[0] != tokens ||
+        out.scale.ne[1] != kRmsHidden / 64 || (reinterpret_cast<std::uintptr_t>(x.data) & 15) != 0 ||
+        (reinterpret_cast<std::uintptr_t>(weight.data) & 3) != 0 ||
+        (reinterpret_cast<std::uintptr_t>(out.q.data) & 15) != 0 || !(eps > 0.0f)) {
+        throw std::invalid_argument("rmsnorm_a8_g64_quantize: invalid input, weight or destination");
+    }
+    const auto* xp = static_cast<const __nv_bfloat162*>(x.data);
+    const auto* wp = static_cast<const __nv_bfloat162*>(weight.data);
+    auto* q        = static_cast<std::int8_t*>(out.q.data);
+    auto* scale    = static_cast<float*>(out.scale.data);
+    if (unit_offset) {
+        rmsnorm_a8_g64_quantize_kernel<RmsEpilogue::Offset>
+            <<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(xp, wp, eps, tokens, q, scale);
+    } else {
+        rmsnorm_a8_g64_quantize_kernel<RmsEpilogue::Plain>
+            <<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(xp, wp, eps, tokens, q, scale);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -344,7 +344,8 @@ int mlp_case(const Ternary& gate_up, const Ternary& down, std::int32_t t, bool u
     Tensor tr(device_residual.p, DType::BF16, {d, t});
     const ops::RmsNormPrologue norm{Tensor(device_gain.p, DType::BF16, {d}), kEps, unit_offset};
     DeviceArena workspace(ops::rmsnorm_swiglu_mlp_workspace_capacity_bytes(
-                              QType::T5_G128_FP16, gate_up.n, d, policy, policy, 1, t) +
+                              QType::T5_G128_FP16, QType::T5_G128_FP16, gate_up.n, d, policy,
+                              policy, 1, t) +
                           256);
     ops::rmsnorm_swiglu_mlp(norm, gate_up.rows(0, gate_up.n), policy, down.rows(0, d), policy, tr,
                             workspace, nullptr);
@@ -500,7 +501,8 @@ int main() {
         for (std::int32_t t : {1, 3, 8, 16}) failures += mlp_case(gate_up, down, t, true);
     }
     {
-        // The fused forms are registered only for t5 under AllowA8.
+        // The fused forms are registered for t5 under AllowA8 (the MLP also for Q4/Q5, tested
+        // with the Q4/Q5 MLP).
         const bool registered =
             ops::attn_input_proj_accepts_rmsnorm(QType::T5_G128_FP16, ops::LinearPolicy::AllowA8) &&
             ops::rmsnorm_swiglu_mlp_accepts(QType::T5_G128_FP16, ops::LinearPolicy::AllowA8,

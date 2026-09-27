@@ -78,6 +78,10 @@ __device__ __forceinline__ unsigned with_q5_high(unsigned bytes, unsigned high) 
     return bytes | ((((high & 0xfu) * 0x00204081u) & 0x01010101u) * 0xF0u);
 }
 
+// A problem whose epilogue quantizes its BF16 outputs (see SwiGluQ4QuantizedProblem).
+template <class Problem>
+concept QuantizingProblem = requires { Problem::kQuantizesOutput; };
+
 template <int Tokens, class Problem>
 __global__ void __launch_bounds__(kThreads, 1)
     rowsplit_tall_a8_kernel(const std::int8_t* __restrict__ qx,
@@ -313,7 +317,8 @@ __global__ void __launch_bounds__(kThreads, 1)
     if (pong) { update(g); }
 
     // Epilogue: the problem stages bf16 outputs as [token][row] in shared memory, then writes
-    // 16-byte row chunks of each live token.
+    // 16-byte row chunks of each live token (a quantizing problem is called for every token, so
+    // the lanes of a token can reduce across the chunks; it stores only the live ones).
     constexpr int kOutRows = Problem::kOutRows;
     constexpr int kLd      = rowsplit_tall::kOutLd<kOutRows>;
     __syncthreads();
@@ -323,12 +328,14 @@ __global__ void __launch_bounds__(kThreads, 1)
     constexpr int kChunks = kOutRows / 8;
 #pragma unroll
     for (int i = 0; i < Tokens * kChunks / kThreads; ++i) {
-        const int item  = tid + i * kThreads;
-        const int token = item / kChunks;
-        const int chunk = item % kChunks;
-        if (token < live) {
-            problem.write(row_block, token0 + token, chunk * 8,
-                          *reinterpret_cast<const uint4*>(&staged[token * kLd + chunk * 8]));
+        const int item   = tid + i * kThreads;
+        const int token  = item / kChunks;
+        const int chunk  = item % kChunks;
+        const uint4 data = *reinterpret_cast<const uint4*>(&staged[token * kLd + chunk * 8]);
+        if constexpr (QuantizingProblem<Problem>) {
+            problem.write_quantized(row_block, token0 + token, chunk * 8, data, token < live);
+        } else if (token < live) {
+            problem.write(row_block, token0 + token, chunk * 8, data);
         }
     }
 }
@@ -353,5 +360,60 @@ void launch(const Problem& problem, std::int32_t row_blocks, const std::int8_t* 
         <<<grid, kThreads, kSmem, stream>>>(qx, x_scale, problem, k, tokens, token_tiles);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// The folded Q4 gate/up SwiGLU whose output is the A8 activation of the next projection. Row
+// block b produces SwiGLU rows 64 b .. 64 b + 63, i.e. 64-column group b of that activation: the
+// BF16 values SwiGluQ4Problem would store are quantized per token exactly as
+// rowsplit_a8_quantize does it (amax over the group, scale = amax / 127, q = rint(x * (127 /
+// amax)) clamped, all in FP32) and written as int8 [intermediate, T] with FP32 scales [T, groups].
+struct SwiGluQ4QuantizedProblem {
+    static constexpr int kOutRows         = 64;
+    static constexpr bool kQuantizesOutput = true;
+    rowsplit_tall::SwiGluQ4Problem folded; // its bf16 output is unused
+    std::int8_t* q;
+    float* scale;
+    std::int32_t tokens;
+
+    __device__ bool q5(int row_block) const { return folded.q5(row_block); }
+    __device__ RowSource source(int row_block, int row, int half, int groups) const {
+        return folded.source(row_block, row, half, groups);
+    }
+    template <int MT>
+    __device__ void stage_outputs(const float (&acc)[MT][4][4], __nv_bfloat16* staged, int ld,
+                                  int warp_row, int warp_token, int lane) const {
+        folded.template stage_outputs<MT>(acc, staged, ld, warp_row, warp_token, lane);
+    }
+    // Rows 0, 8, .., 56 of one token's group sit in eight consecutive lanes; every lane of the
+    // warp calls this, and only live tokens are stored.
+    __device__ void write_quantized(int row_block, int token, int row, uint4 values,
+                                    bool live) const {
+        const unsigned words[4] = {values.x, values.y, values.z, values.w};
+        float value[8];
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 pair =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words[i]));
+            value[2 * i]     = pair.x;
+            value[2 * i + 1] = pair.y;
+            amax             = fmaxf(amax, fmaxf(fabsf(pair.x), fabsf(pair.y)));
+        }
+#pragma unroll
+        for (int offset_lanes = 1; offset_lanes < 8; offset_lanes <<= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset_lanes));
+        }
+        const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+        unsigned packed[2]  = {0u, 0u};
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int code = max(-127, min(127, __float2int_rn(value[i] * inverse)));
+            packed[i >> 2] |= (static_cast<unsigned>(code) & 0xffu) << (8 * (i & 3));
+        }
+        if (!live) { return; }
+        *reinterpret_cast<uint2*>(&q[static_cast<std::int64_t>(token) * folded.intermediate +
+                                     row_block * 64 + row]) = make_uint2(packed[0], packed[1]);
+        if (row == 0) { scale[static_cast<std::int64_t>(row_block) * tokens + token] = amax / 127.0f; }
+    }
+};
 
 } // namespace ninfer::ops::detail::rowsplit_tall_a8

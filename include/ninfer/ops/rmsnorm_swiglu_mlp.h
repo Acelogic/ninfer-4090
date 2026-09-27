@@ -16,9 +16,9 @@
 namespace ninfer::ops {
 
 /**
- * Whether rmsnorm_swiglu_mlp is registered for these weight formats and policies: both weights
- * T5_G128_FP16 and both policies allowing A8. Other dense MLPs compose rmsnorm(),
- * linear_swiglu() and linear_add().
+ * Whether rmsnorm_swiglu_mlp is registered for these weight formats and policies, both policies
+ * allowing A8: both weights T5_G128_FP16, or a Q4_G64_FP16 gate/up with a Q5_G64_FP16 down.
+ * Other dense MLPs compose rmsnorm(), linear_swiglu() and linear_add().
  */
 [[nodiscard]] bool rmsnorm_swiglu_mlp_accepts(QType gate_up_qtype, LinearPolicy gate_up_policy,
                                               QType down_qtype, LinearPolicy down_policy);
@@ -29,8 +29,9 @@ namespace ninfer::ops {
  * projection [input_rows,gate_up_rows/2]. Unregistered profiles or invalid intervals throw.
  */
 [[nodiscard]] std::size_t rmsnorm_swiglu_mlp_workspace_capacity_bytes(
-    QType qtype, std::int32_t gate_up_rows, std::int32_t input_rows, LinearPolicy gate_up_policy,
-    LinearPolicy down_policy, std::int32_t min_tokens, std::int32_t max_tokens);
+    QType gate_up_qtype, QType down_qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+    LinearPolicy gate_up_policy, LinearPolicy down_policy, std::int32_t min_tokens,
+    std::int32_t max_tokens);
 
 /**
  * Op: rmsnorm_swiglu_mlp
@@ -41,19 +42,27 @@ namespace ninfer::ops {
  *   a[i,t]     = SiLU(g[i,t]) * u[i,t]
  *   ideal[:,t] = residual[:,t] + Linear(a, down)[:,t].
  *
- * Registered domain (rmsnorm_swiglu_mlp_accepts()):
- *   T5_G128_FP16 TernaryRowK128 gate_up [2M,D] (gate rows [0,M) before up rows [M,2M)) and
- *   down [D,M], D and M multiples of 1024, both under AllowA8/AllowA4 (Bonsai: D = 5120,
- *   M = 17408). A weight carrying input signs is stored in the Prism-rotated basis and rotates
- *   its input itself. T may be any positive value. The residual is contiguous, 16-byte aligned
- *   BF16 [D,T]; the norm weight is contiguous BF16 [D].
+ * Registered domain (rmsnorm_swiglu_mlp_accepts()), both policies AllowA8/AllowA4, T any
+ * positive value, the residual contiguous 16-byte aligned BF16 [D,T], the norm weight contiguous
+ * BF16 [D]:
+ *   - T5_G128_FP16 TernaryRowK128 gate_up [2M,D] (gate rows [0,M) before up rows [M,2M)) and
+ *     down [D,M], D and M multiples of 1024 (Bonsai: D = 5120, M = 17408). A weight carrying
+ *     input signs is stored in the Prism-rotated basis and rotates its input itself.
+ *   - Q4_G64_FP16 RowSplit gate_up [34816,5120] (folded as linear_swiglu()) and Q5_G64_FP16
+ *     RowSplit down [5120,17408] (Qwen3.8).
  *
  * Numeric:
  *   The oracle evaluates n, g, u, a and ideal naively in FP64 from the represented residual,
- *   norm weight and decoded weights. n and a are private arithmetic, not semantic rounding
- *   boundaries: each is evaluated inside the int8 quantization of the following projection and
- *   never rounded to BF16. g and u are staged in BF16. The updated BF16 residual is compared
- *   with ideal under the A8 criterion (activation quantization plus BF16 storage).
+ *   norm weight and decoded weights, and the updated BF16 residual is compared with ideal under
+ *   the A8 criterion (activation quantization plus BF16 storage).
+ *   - T5: n and a are private arithmetic, not semantic rounding boundaries: each is evaluated
+ *     inside the int8 quantization of the following projection and never rounded to BF16. g and
+ *     u are staged in BF16.
+ *   - Q4/Q5: the block equals rmsnorm(), linear_swiglu() and linear_add() composed, bit for bit:
+ *     n and a are rounded to BF16 as those Ops store them, and each projection takes its
+ *     documented A8 quantization of that BF16 input from the width at which it does so (129
+ *     columns), otherwise its A16 route. At those widths n and a are quantized where they are
+ *     produced (RMSNorm row kernel, gate/up epilogue) and never stored in BF16.
  *
  * Effects:
  *   Updates the full residual in place; the weights, the norm weight and the workspace must not
@@ -61,8 +70,8 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   Caller-owned transient storage reported by rmsnorm_swiglu_mlp_workspace_capacity_bytes(),
- *   scoped to the call: g and u, and the quantized activation of each projection. There is no
- *   persistent state side effect.
+ *   scoped to the call: g and u (T5) or n and a (Q4/Q5, BF16 or quantized), and the quantized
+ *   activation of each projection. There is no persistent state side effect.
  */
 void rmsnorm_swiglu_mlp(const RmsNormPrologue& norm, const Weight& gate_up,
                         LinearPolicy gate_up_policy, const Weight& down, LinearPolicy down_policy,

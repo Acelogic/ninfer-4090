@@ -29,4 +29,10 @@ A8G64Activation allocate_a8_g64_activation(Allocator& allocator, std::int32_t k,
 // x: contiguous BF16 [K, T], K a multiple of 64; `out` allocated for the same K and T.
 void a8_g64_quantize(const Tensor& x, A8G64Activation& out, cudaStream_t stream);
 
+// The A8 activation of n = rmsnorm(x, weight, eps, unit_offset) for x contiguous 16-byte aligned
+// BF16 [5120, T]: n is rounded to BF16 exactly as ops::rmsnorm stores it (the same 5120-wide CTA
+// row kernel) and quantized as a8_g64_quantize, without materializing n.
+void rmsnorm_a8_g64_quantize(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+                             A8G64Activation& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

@@ -36,7 +36,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                                                                       p.down.policy, first, last));
     } else if (ffn_fuses_rmsnorm(parameters)) {
         return ops::rmsnorm_swiglu_mlp_workspace_capacity_bytes(
-            gu.qtype, gu.n, gu.k, p.gate_up.policy, p.down.policy, first, last);
+            gu.qtype, down.qtype, gu.n, gu.k, p.gate_up.policy, p.down.policy, first, last);
     } else {
         (void)layout.alloc(DType::BF16, {gu.n / 2, last});
         {
