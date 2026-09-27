@@ -74,9 +74,7 @@ static_assert(kCausalPromptI8SmemBytes == 93696);
 // each code to unsigned, splice it under exponent 2^10 (0x64xx is 1024 + byte), and subtract
 // the bias back. Integer halves are exact, and the scale product is one correctly rounded FP16
 // multiply, as for a converted code.
-__device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t* codes8,
-                                                             __half scale) {
-    const int2 raw       = load_vec<int2>(codes8);
+__device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(uint2 raw, __half scale) {
     const __half2 s2     = __halves2half2(scale, scale);
     const __half2 magic2 = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
     const unsigned x0    = static_cast<unsigned>(raw.x) ^ 0x80808080u;
@@ -294,7 +292,13 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
     };
 
     // Workers stage V codes and scales. Keys past the last query stay unstaged: the FP16
-    // dequantizer writes zeros for them without reading the codes.
+    // dequantizer writes zeros for them without reading the codes. Each worker thread copies the
+    // same 16-byte code chunks of every V tile, so the addresses are loop invariant.
+    constexpr int VRowChunks = (PackedV ? D / 2 : D) / 16;
+    constexpr int VCopies    = Bc * VRowChunks / WorkerThreads;
+    static_assert(Bc * VRowChunks % WorkerThreads == 0);
+    const int v_copy_key     = wtid / VRowChunks;
+    const int v_copy_col     = (wtid % VRowChunks) * 16;
     auto issue_v_tile = [&](int kb, auto full_tag) {
         constexpr bool FullTile = decltype(full_tag)::value;
         const int tile_k0       = kb * Bc;
@@ -304,46 +308,50 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
                 kv_cache_int8_quant_scale_index<Geometry>(physical_page, kv_head, 0, wtid);
             ninfer::ops::cp_async<8>(&v_scale_s[wtid * Groups], &cache_v_scale[off]);
         }
+        const std::uint8_t* page_codes =
+            cache_v + (PackedV ? kv_cache_i4_code_index<Geometry>(physical_page, kv_head, 0, 0)
+                               : kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head,
+                                                                          0, 0));
 #pragma unroll
-        for (int chunk = wtid; chunk < Bc * (D / 16); chunk += WorkerThreads) {
-            const int key_l = chunk / (D / 16);
-            const int d     = (chunk - key_l * (D / 16)) * 16;
+        for (int i = 0; i < VCopies; ++i) {
+            const int key_l = v_copy_key + i * (WorkerThreads / VRowChunks);
             if (FullTile || tile_k0 + key_l <= max_query_abs) {
-                if constexpr (PackedV) {
-                    const std::int64_t voff =
-                        kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d / 2, key_l);
-                    ninfer::ops::cp_async<8>(&v_i8[key_l * D + d / 2], &cache_v[voff]);
-                } else {
-                    const std::int64_t off =
-                        kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
-                    cp_async<16, Cache::cg>(&v_i8[key_l * D + d],
-                                            &reinterpret_cast<const std::int8_t*>(cache_v)[off]);
-                }
+                cp_async<16, Cache::cg>(&v_i8[key_l * D + v_copy_col],
+                                        page_codes + key_l * (VRowChunks * 16) + v_copy_col);
             }
         }
         ninfer::ops::cp_commit();
     };
 
     // The workers expand the staged V codes into the swizzled FP16 tile between their PV passes,
-    // off the producers' scoring path.
+    // off the producers' scoring path. A thread converts 16 dimensions of four keys: one row
+    // offset, one scale group and one swizzle phase for the whole tile.
+    constexpr int DequantKeysStep = WorkerThreads / (D / 16);
+    const int dq_key              = wtid / (D / 16);
+    const int dq_d                = (wtid % (D / 16)) * 16;
+    const int dq_group            = dq_d / kKVCacheInt8Group;
     auto dequant_v_tile = [&](int kb, auto full_tag) {
         constexpr bool FullTile = decltype(full_tag)::value;
         const int tile_k0       = kb * Bc;
-#pragma unroll 2
-        for (int chunk = wtid; chunk < Bc * (D / 8); chunk += WorkerThreads) {
-            const int key_l = chunk / (D / 8);
-            const int d     = (chunk - key_l * (D / 8)) * 8;
-            __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
+#pragma unroll
+        for (int i = 0; i < Bc / DequantKeysStep; ++i) {
+            const int key_l = dq_key + i * DequantKeysStep;
+            __half* dst0    = &v_f16[key_l * D + causal_prompt_swz(key_l, dq_d)];
+            __half* dst1    = &v_f16[key_l * D + causal_prompt_swz(key_l, dq_d + 8)];
             if (FullTile || tile_k0 + key_l <= max_query_abs) {
-                const __half vs = v_scale_s[key_l * Groups + (d >> 6)];
+                const __half vs = v_scale_s[key_l * Groups + dq_group];
                 if constexpr (PackedV) {
-                    store_vec(dst, causal_prompt_i4_dequant_f16x8(
-                                       load_vec<std::uint32_t>(&v_i8[key_l * D + d / 2]), vs));
+                    const uint2 raw = load_vec<uint2>(&v_i8[key_l * D + dq_d / 2]);
+                    store_vec(dst0, causal_prompt_i4_dequant_f16x8(raw.x, vs));
+                    store_vec(dst1, causal_prompt_i4_dequant_f16x8(raw.y, vs));
                 } else {
-                    store_vec(dst, causal_prompt_i8_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                    const uint4 raw = load_vec<uint4>(&v_i8[key_l * D + dq_d]);
+                    store_vec(dst0, causal_prompt_i8_dequant_f16x8(make_uint2(raw.x, raw.y), vs));
+                    store_vec(dst1, causal_prompt_i8_dequant_f16x8(make_uint2(raw.z, raw.w), vs));
                 }
             } else {
-                store_vec(dst, make_int4(0, 0, 0, 0));
+                store_vec(dst0, make_int4(0, 0, 0, 0));
+                store_vec(dst1, make_int4(0, 0, 0, 0));
             }
         }
     };
