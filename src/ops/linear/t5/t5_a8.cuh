@@ -399,28 +399,19 @@ __global__ void __launch_bounds__(kGemvThreads)
 // the load latency hides behind the MMAs. The token tiles of a row block are adjacent in launch
 // order and share its code bytes in L2. The arithmetic per output is the same in both kernels.
 //
-// gemm_kernel: 64-row tiles (the 5120-row weights). A CTA of 2 x WarpsN warps owns 64 rows and
-// 32 WarpsN tokens, warp (wm, wn) 32 x 32. The stage's 64 rows x 2 units are decoded into a
-// single code-word buffer, one unit per thread (WarpsN = 2) or split between the two halves of
-// the CTA's warps (WarpsN = 4: bytes 0-7 in the first half, bytes 8-12 in the second, so the
-// decode never diverges within a warp), after the step's MMAs between two barriers. The
-// activation and the token scales and sums are double-buffered with cp.async.
+// gemm_kernel: 64 x 64 tiles for T = 33..64 (and wider T when N % 128 != 0). A CTA of four
+// warps (wm, wn) of 32 x 32 owns 64 rows and 64 tokens, three CTAs per SM. The stage's 64 rows x
+// 2 units are decoded into a single code-word buffer, one unit per thread, after the step's MMAs
+// between two barriers. The activation and the token scales and sums are double-buffered with
+// cp.async.
 //
-// gemm_tall_kernel: 128 x 128 tiles (weights of at least 8192 rows), below.
+// gemm_tall_kernel: 128-row tiles of 128 or 64 tokens for wider T, below.
 
 constexpr int kStageK = 128;
 
-template <int WarpsM, int WarpsN>
-struct GemmConfig {
-    static_assert(WarpsM == 2);
-    static_assert(WarpsN == 2 || WarpsN == 4);
-    static constexpr int kRows    = 32 * WarpsM;
-    static constexpr int kTokens  = 32 * WarpsN;
-    static constexpr int kThreads = 32 * WarpsM * WarpsN;
-    static constexpr int kParts   = WarpsN / 2; // decoding threads per (row, unit)
-    // At <= 128 registers: 64 x 64 CTAs fit three per SM (shared memory), 64 x 128 two.
-    static constexpr int kMinBlocks = WarpsN == 2 ? 3 : 2;
-};
+constexpr int kGemmRows    = 64;
+constexpr int kGemmTokens  = 64;
+constexpr int kGemmThreads = 128;
 
 __device__ __forceinline__ int gemm_word(int row, int word) { return row * 32 + (word ^ ((row & 7) << 2)); }
 
@@ -435,75 +426,43 @@ struct GemmStage {
 // |x| < 2^22 (a step's |code . q| <= 2 * 127 * 128), and 12582912 + sum(q) is exact as well.
 constexpr int kFloatMagic = 0x4B400000;
 
-// Part `part` of `Parts` of one unit's 13 bytes as aligned streaming loads of the 16-byte window
-// that holds them: all four words, or words 0-2 (part 0: bytes 0-7) and words 2-3 (part 1: bytes
-// 8-12) in r[0..2] and r[0..1]. shift_unit_words aligns them to the unit.
-template <int Parts>
+// One unit's 13 bytes as aligned streaming loads of the 16-byte window that holds them;
+// shift_unit_words aligns them to the unit.
 __device__ __forceinline__ void load_unit_words(const std::uint8_t* __restrict__ row_codes, int unit,
-                                                int part, std::uint32_t (&r)[4]) {
+                                                std::uint32_t (&r)[4]) {
     const auto* base = reinterpret_cast<const std::uint32_t*>(row_codes + ((unit * kUnitBytes) & ~3));
-    if (Parts == 1) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) r[i] = __ldcs(base + i);
-    } else if (part == 0) {
-        r[0] = __ldcs(base);
-        r[1] = __ldcs(base + 1);
-        r[2] = __ldcs(base + 2);
-    } else {
-        r[0] = __ldcs(base + 2);
-        r[1] = __ldcs(base + 3);
-    }
+    for (int i = 0; i < 4; ++i) r[i] = __ldcs(base + i);
 }
 
-// The unit's bytes as little-endian words (bytes 0-3, 4-7, 8-11, 12) of the part: a[0..1] for
-// part 0, a[2..3] for part 1, all four when Parts == 1.
-template <int Parts>
-__device__ __forceinline__ void shift_unit_words(const std::uint32_t (&r)[4], int unit, int part,
+// The unit's bytes as little-endian words (bytes 0-3, 4-7, 8-11, 12).
+__device__ __forceinline__ void shift_unit_words(const std::uint32_t (&r)[4], int unit,
                                                  std::uint32_t (&a)[4]) {
     const unsigned shift = unsigned((unit * kUnitBytes) & 3) * 8u;
-    if (Parts == 1) {
-        a[0] = __funnelshift_r(r[0], r[1], shift);
-        a[1] = __funnelshift_r(r[1], r[2], shift);
-        a[2] = __funnelshift_r(r[2], r[3], shift);
-        a[3] = r[3] >> shift;
-    } else if (part == 0) {
-        a[0] = __funnelshift_r(r[0], r[1], shift);
-        a[1] = __funnelshift_r(r[1], r[2], shift);
-    } else {
-        a[2] = __funnelshift_r(r[0], r[1], shift);
-        a[3] = r[1] >> shift;
-    }
+    a[0] = __funnelshift_r(r[0], r[1], shift);
+    a[1] = __funnelshift_r(r[1], r[2], shift);
+    a[2] = __funnelshift_r(r[2], r[3], shift);
+    a[3] = r[3] >> shift;
 }
 
-// Decodes part `part` of a unit and stores its code words: all 16 words (Parts == 1), or
-// words 0-9 (part 0: byte groups 0 and 1) and words 10-15 (part 1: group 2 and byte 12).
-template <int Parts>
-__device__ __forceinline__ void decode_store_part(const std::uint32_t (&a)[4], int part,
-                                                  std::uint32_t* __restrict__ code_words,
-                                                  int row, int unit) {
+// Decodes a unit and stores its 16 code words in the row's swizzled chunks.
+__device__ __forceinline__ void decode_store_unit(const std::uint32_t (&a)[4],
+                                                  std::uint32_t* __restrict__ code_words, int row,
+                                                  int unit) {
     std::uint32_t* base = code_words + row * 32;
     const auto chunk    = [&](int c) { return base + ((unit * 4 + c) ^ (row & 7)) * 4; };
-    if (Parts == 1 || part == 0) {
-        std::uint32_t words[10];
-        group_words(a[0], words);
-        group_words(a[1], words + 5);
-        *reinterpret_cast<uint4*>(chunk(0)) = make_uint4(words[0], words[1], words[2], words[3]);
-        *reinterpret_cast<uint4*>(chunk(1)) = make_uint4(words[4], words[5], words[6], words[7]);
-        *reinterpret_cast<uint2*>(chunk(2)) = make_uint2(words[8], words[9]);
-    }
-    if (Parts == 1 || part == 1) {
-        std::uint32_t words[5];
-        group_words(a[2], words);
-        *reinterpret_cast<uint2*>(chunk(2) + 2) = make_uint2(words[0], words[1]);
-        *reinterpret_cast<uint4*>(chunk(3)) = make_uint4(words[2], words[3], words[4], last_word(a[3]));
-    }
+    std::uint32_t words[15];
+#pragma unroll
+    for (int g = 0; g < 3; ++g) group_words(a[g], words + 5 * g);
+    *reinterpret_cast<uint4*>(chunk(0)) = make_uint4(words[0], words[1], words[2], words[3]);
+    *reinterpret_cast<uint4*>(chunk(1)) = make_uint4(words[4], words[5], words[6], words[7]);
+    *reinterpret_cast<uint4*>(chunk(2)) = make_uint4(words[8], words[9], words[10], words[11]);
+    *reinterpret_cast<uint4*>(chunk(3)) = make_uint4(words[12], words[13], words[14], last_word(a[3]));
 }
 
 // Shared memory of one CTA: the double-buffered activation stages, then the code words.
-template <int WarpsM, int WarpsN>
 constexpr std::size_t gemm_shared_bytes() {
-    return 2 * sizeof(GemmStage<GemmConfig<WarpsM, WarpsN>::kTokens>) +
-           std::size_t(GemmConfig<WarpsM, WarpsN>::kRows) * 32 * sizeof(std::uint32_t);
+    return 2 * sizeof(GemmStage<kGemmTokens>) + std::size_t(kGemmRows) * 32 * sizeof(std::uint32_t);
 }
 
 // Stores a warp's (16 MTiles) x 32 tile. Fragment C: [0], [1] are row gid, tokens 2 lid and
@@ -531,18 +490,14 @@ __device__ __forceinline__ void store_tile(const Outputs& outputs, const float (
     }
 }
 
-template <int WarpsM, int WarpsN>
-__global__ void __launch_bounds__(GemmConfig<WarpsM, WarpsN>::kThreads,
-                                  GemmConfig<WarpsM, WarpsN>::kMinBlocks)
+__global__ void __launch_bounds__(kGemmThreads, 3)
     gemm_kernel(const std::uint8_t* __restrict__ qx, const float* __restrict__ group_scale,
                 const int* __restrict__ group_sum, const std::uint8_t* __restrict__ codes,
                 const __half* __restrict__ scales, std::int64_t scale_row_halves, int k,
                 int tokens, int token_tiles, Outputs outputs, bool accumulate) {
-    using Config             = GemmConfig<WarpsM, WarpsN>;
-    constexpr int kRows      = Config::kRows;
-    constexpr int kTokens    = Config::kTokens;
-    constexpr int kThreads   = Config::kThreads;
-    constexpr int kParts     = Config::kParts;
+    constexpr int kRows      = kGemmRows;
+    constexpr int kTokens    = kGemmTokens;
+    constexpr int kThreads   = kGemmThreads;
     extern __shared__ __align__(128) std::uint8_t gemm_smem[];
     auto* stages     = reinterpret_cast<GemmStage<kTokens>*>(gemm_smem);
     auto* code_words = reinterpret_cast<std::uint32_t*>(gemm_smem + 2 * sizeof(GemmStage<kTokens>));
@@ -551,18 +506,16 @@ __global__ void __launch_bounds__(GemmConfig<WarpsM, WarpsN>::kThreads,
     const int lane   = tid & 31;
     const int gid    = lane >> 2;
     const int lid    = lane & 3;
-    const int wm     = warp % WarpsM;
-    const int wn     = warp / WarpsM;
+    const int wm     = warp % 2;
+    const int wn     = warp / 2;
     const int row0   = static_cast<int>(blockIdx.x) / token_tiles * kRows;
     const int token0 = static_cast<int>(blockIdx.x) % token_tiles * kTokens;
     const int live   = min(kTokens, tokens - token0);
     const int steps  = k / kStageK;
     const std::int64_t row_bytes = std::int64_t(k / kUnitColumns) * kUnitBytes;
-    // Decode item (row, unit) = (item / 2, item % 2); the part is uniform per warp.
-    const int my_part = tid / (kThreads / kParts);
-    const int my_item = tid % (kThreads / kParts);
-    const int my_unit = my_item & 1;
-    const int my_row  = my_item >> 1;
+    // Decode item (row, unit) = (tid / 2, tid % 2).
+    const int my_unit = tid & 1;
+    const int my_row  = tid >> 1;
     const std::uint8_t* my_codes = codes + std::int64_t(row0 + my_row) * row_bytes;
 
     const auto stage_x = [&](int step, GemmStage<kTokens>& s) {
@@ -599,16 +552,16 @@ __global__ void __launch_bounds__(GemmConfig<WarpsM, WarpsN>::kThreads,
 
     float acc[2][4][4] = {};
     std::uint32_t raw[4] = {};
-    load_unit_words<kParts>(my_codes, my_unit, my_part, raw);
+    load_unit_words(my_codes, my_unit, raw);
     std::uint32_t words[4] = {};
-    shift_unit_words<kParts>(raw, my_unit, my_part, words);
-    decode_store_part<kParts>(words, my_part, code_words, my_row, my_unit);
+    shift_unit_words(raw, my_unit, words);
+    decode_store_unit(words, code_words, my_row, my_unit);
     stage_x(0, stages[0]);
     cp_commit();
     for (int step = 0; step < steps; ++step) {
         if (step + 1 < steps) {
             stage_x(step + 1, stages[(step + 1) & 1]);
-            load_unit_words<kParts>(my_codes, 2 * (step + 1) + my_unit, my_part, raw);
+            load_unit_words(my_codes, 2 * (step + 1) + my_unit, raw);
         }
         cp_commit();
         cp_wait<1>();
@@ -672,18 +625,20 @@ __global__ void __launch_bounds__(GemmConfig<WarpsM, WarpsN>::kThreads,
         // Every warp has read this stage's code words before they are overwritten.
         __syncthreads();
         if (step + 1 < steps) {
-            shift_unit_words<kParts>(raw, 2 * (step + 1) + my_unit, my_part, words);
-            decode_store_part<kParts>(words, my_part, code_words, my_row, my_unit);
+            shift_unit_words(raw, 2 * (step + 1) + my_unit, words);
+            decode_store_unit(words, code_words, my_row, my_unit);
         }
     }
     store_tile(outputs, acc, row0 + wm * 32, wn * 32, token0, live, lane, accumulate);
 }
 
 // ---------------------------------------------------------------------------------------------
-// gemm_tall_kernel: 128 x 128 tiles for the weights of at least 8192 rows (design 9.1). Eight
-// warps of 64 rows x 32 tokens, one CTA per SM, one barrier per step: the activation stages and
-// the code-word stages are both double-buffered, so the next step's activations (cp.async) and
-// code words (decoded by all threads, one unit each) are written while this step's are read.
+// gemm_tall_kernel: tiles of 128 rows x 128 or 64 tokens for T > 64 (design 9.1). Eight warps of
+// 64 x 32 (128 tokens) or 32 x 32 (64 tokens), one CTA per SM, one barrier per step: the
+// activation stages and the code-word stages are both double-buffered, so the next step's
+// activations (cp.async) and code words (decoded by all threads, one unit each) are written while
+// this step's are read. A 64-token tile decodes as much per step for half the MMAs; the launch
+// mixes both widths so that the last resident wave is filled (t5_project.cu).
 
 template <int Rows>
 struct GemmCodeStage {
@@ -773,11 +728,21 @@ __device__ __forceinline__ FragOffsets frag_offsets(int a_row, int b_token, int 
 }
 
 constexpr int kTallRows    = 128;
-constexpr int kTallTokens  = 128;
 constexpr int kTallThreads = 256;
 
+// A tile of 128 rows x Tokens (128 or 64) tokens: eight warps of kWarpRows rows x 32 tokens.
+template <int Tokens>
+struct TallTile {
+    static_assert(Tokens == 128 || Tokens == 64);
+    static constexpr int kWarpsN   = Tokens / 32;
+    static constexpr int kWarpsM   = kTallThreads / 32 / kWarpsN;
+    static constexpr int kWarpRows = kTallRows / kWarpsM;
+    static constexpr int kMTiles   = kWarpRows / 16; // 16-row MMA tiles per warp
+};
+
+// Sized for the 128-token tile; a 64-token tile uses the same stage offsets.
 constexpr std::size_t gemm_tall_shared_bytes() {
-    return 2 * sizeof(GemmStage<kTallTokens>) + 2 * sizeof(GemmCodeStage<kTallRows>);
+    return 2 * sizeof(GemmStage<128>) + 2 * sizeof(GemmCodeStage<kTallRows>);
 }
 
 // Each SM sub-partition holds one warp of each half of the CTA. Warps 0-3 ("ping") multiply, then
@@ -785,31 +750,32 @@ constexpr std::size_t gemm_tall_shared_bytes() {
 // apply the previous step's update and decode, then multiply, carrying their int32 sums and the
 // step's scales across the barrier. A sub-partition's tensor pipe then runs one warp's MMAs while
 // the other warp does its integer and FP32 work, instead of both doing the same phase at once.
-__global__ void __launch_bounds__(kTallThreads, 1)
-    gemm_tall_kernel(const std::uint8_t* __restrict__ qx, const float* __restrict__ group_scale,
-                     const int* __restrict__ group_sum, const std::uint8_t* __restrict__ codes,
-                     const __half* __restrict__ scales, std::int64_t scale_row_halves, int k,
-                     int tokens, int token_tiles, Outputs outputs, bool accumulate) {
+template <int Tokens>
+__device__ __forceinline__ void gemm_tall_tile(const std::uint8_t* __restrict__ qx,
+                                               const float* __restrict__ group_scale,
+                                               const int* __restrict__ group_sum,
+                                               const std::uint8_t* __restrict__ codes,
+                                               const __half* __restrict__ scales,
+                                               std::int64_t scale_row_halves, int k, int tokens,
+                                               int row0, int token0, const Outputs& outputs,
+                                               bool accumulate, std::uint8_t* gemm_smem) {
+    using Tile             = TallTile<Tokens>;
     constexpr int kRows    = kTallRows;
-    constexpr int kTokens  = kTallTokens;
+    constexpr int kTokens  = Tokens;
     constexpr int kThreads = kTallThreads;
-    constexpr int MTiles   = 4; // 16-row MMA tiles per warp
+    constexpr int MTiles   = Tile::kMTiles;
     using XStage           = GemmStage<kTokens>;
     using CodeStage        = GemmCodeStage<kRows>;
-    extern __shared__ __align__(128) std::uint8_t gemm_smem[];
     auto* xs = reinterpret_cast<XStage*>(gemm_smem);
-    auto* cs = reinterpret_cast<CodeStage*>(gemm_smem + 2 * sizeof(XStage));
+    auto* cs = reinterpret_cast<CodeStage*>(gemm_smem + 2 * sizeof(GemmStage<128>));
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
     const int gid     = lane >> 2;
     const int lid     = lane & 3;
-    const int wm      = warp % 2;
-    const int wn      = warp / 2;
+    const int wm      = warp % Tile::kWarpsM;
+    const int wn      = warp / Tile::kWarpsM;
     const bool pong   = warp >= 4;
-    const int tile    = static_cast<int>(blockIdx.x);
-    const int row0    = tile / token_tiles * kRows;
-    const int token0  = tile % token_tiles * kTokens;
     const int live    = min(kTokens, tokens - token0);
     const int steps   = k / kStageK;
     // Decode item: row tid / 2, unit tid % 2 of each step.
@@ -821,17 +787,17 @@ __global__ void __launch_bounds__(kTallThreads, 1)
     std::uint32_t raw[4]    = {};
     __half raw_scale        = {};
     const auto load = [&](int step) {
-        load_unit_words<1>(my_codes, 2 * step + my_unit, 0, raw);
+        load_unit_words(my_codes, 2 * step + my_unit, raw);
         if (my_unit == 0) raw_scale = __ldg(my_scales + step);
     };
     const auto decode = [&](int step, CodeStage& c) {
         std::uint32_t a[4];
-        shift_unit_words<1>(raw, 2 * step + my_unit, 0, a);
-        decode_store_part<1>(a, 0, c.words, my_row, my_unit);
+        shift_unit_words(raw, 2 * step + my_unit, a);
+        decode_store_unit(a, c.words, my_row, my_unit);
         if (my_unit == 0) c.scale[my_row] = __half2float(raw_scale);
     };
 
-    const FragOffsets f = frag_offsets(wm * 64 + (lane & 7) + ((lane >> 3) & 1) * 8,
+    const FragOffsets f = frag_offsets(wm * Tile::kWarpRows + (lane & 7) + ((lane >> 3) & 1) * 8,
                                        wn * 32 + (lane >> 4) * 8 + (lane & 7), lane);
     const auto multiply = [&](const XStage& s, const CodeStage& c, int (&g)[MTiles][4][4]) {
         const unsigned x_base = smem_addr(s.x);
@@ -876,8 +842,8 @@ __global__ void __launch_bounds__(kTallThreads, 1)
         }
 #pragma unroll
         for (int mt = 0; mt < MTiles; ++mt) {
-            row_scale[mt][0] = c.scale[wm * 64 + mt * 16 + gid];
-            row_scale[mt][1] = c.scale[wm * 64 + mt * 16 + gid + 8];
+            row_scale[mt][0] = c.scale[wm * Tile::kWarpRows + mt * 16 + gid];
+            row_scale[mt][1] = c.scale[wm * Tile::kWarpRows + mt * 16 + gid + 8];
         }
     };
     float acc[MTiles][4][4] = {};
@@ -931,7 +897,30 @@ __global__ void __launch_bounds__(kTallThreads, 1)
         }
     }
     if (pong) update(g);
-    store_tile(outputs, acc, row0 + wm * 64, wn * 32, token0, live, lane, accumulate);
+    store_tile(outputs, acc, row0 + wm * Tile::kWarpRows, wn * 32, token0, live, lane, accumulate);
+}
+
+// A row block's tokens are covered by `wide` 128-token tiles, then `narrow` 64-token tiles. The
+// grid holds every row block's wide tiles first, then every row block's narrow tiles, token
+// tiles fastest within each part, so the cheaper narrow CTAs fill the last resident wave.
+__global__ void __launch_bounds__(kTallThreads, 1)
+    gemm_tall_kernel(const std::uint8_t* __restrict__ qx, const float* __restrict__ group_scale,
+                     const int* __restrict__ group_sum, const std::uint8_t* __restrict__ codes,
+                     const __half* __restrict__ scales, std::int64_t scale_row_halves, int k,
+                     int tokens, int wide, int narrow, Outputs outputs, bool accumulate) {
+    extern __shared__ __align__(128) std::uint8_t gemm_smem[];
+    const int row_blocks = static_cast<int>(gridDim.x) / (wide + narrow);
+    const int tile       = static_cast<int>(blockIdx.x);
+    if (tile < row_blocks * wide) {
+        gemm_tall_tile<128>(qx, group_scale, group_sum, codes, scales, scale_row_halves, k, tokens,
+                            tile / wide * kTallRows, tile % wide * 128, outputs, accumulate,
+                            gemm_smem);
+    } else {
+        const int rest = tile - row_blocks * wide;
+        gemm_tall_tile<64>(qx, group_scale, group_sum, codes, scales, scale_row_halves, k, tokens,
+                           rest / narrow * kTallRows, wide * 128 + rest % narrow * 64, outputs,
+                           accumulate, gemm_smem);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

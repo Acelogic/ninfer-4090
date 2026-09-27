@@ -80,20 +80,74 @@ void launch_small_t(const QuantizedX& q, const Weight& w, int tokens,
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int WarpsM, int WarpsN>
 void launch_gemm(const QuantizedX& q, const Weight& w, int tokens, const t5_a8::Outputs& outputs,
                  bool accumulate, cudaStream_t stream) {
-    using Config                = t5_a8::GemmConfig<WarpsM, WarpsN>;
-    constexpr std::size_t kSmem = t5_a8::gemm_shared_bytes<WarpsM, WarpsN>();
+    constexpr std::size_t kSmem = t5_a8::gemm_shared_bytes();
     static_assert(kSmem <= 48 * 1024);
-    const int token_tiles = (tokens + Config::kTokens - 1) / Config::kTokens;
-    const unsigned grid   = static_cast<unsigned>(w.n / Config::kRows * token_tiles);
-    t5_a8::gemm_kernel<WarpsM, WarpsN><<<grid, Config::kThreads, kSmem, stream>>>(
+    const int token_tiles = (tokens + t5_a8::kGemmTokens - 1) / t5_a8::kGemmTokens;
+    const unsigned grid   = static_cast<unsigned>(w.n / t5_a8::kGemmRows * token_tiles);
+    t5_a8::gemm_kernel<<<grid, t5_a8::kGemmThreads, kSmem, stream>>>(
         static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
         static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, token_tiles, outputs,
         accumulate);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// The token tiles of each 128-row block: `wide` 128-token tiles, then `narrow` 64-token tiles.
+struct TallSplit {
+    int wide, narrow;
+};
+
+// A 128-token CTA of gemm_tall_kernel costs ~1.6x a 64-token one (the decode per step is the
+// same, the MMAs double; measured 1.6-1.75x on the 5120-row weights at T = 512..2048).
+constexpr double kWideCost = 1.6;
+
+// Time until the last CTA ends when `wide` CTAs of cost kWideCost and then `narrow` CTAs of cost 1
+// are started one per SM, each on the SM that frees first (the order of the launch).
+double tall_makespan(std::int64_t wide, std::int64_t narrow, int sms) {
+    const std::int64_t waves = wide / sms, rest = wide % sms;
+    // sms - rest SMs free at `early`, rest SMs at `late`.
+    const double early = double(waves) * kWideCost, late = early + kWideCost;
+    if (narrow == 0) return rest > 0 ? late : early;
+    // The narrow CTAs end at early + i and late + j (i, j >= 1); the last one is the
+    // narrow-th smallest of these ends counted with their SM multiplicities.
+    std::int64_t i = 1, j = 1;
+    for (;;) {
+        const double at_early = early + double(i);
+        const double at_late  = rest > 0 ? late + double(j) : at_early + 1.0;
+        if (at_early <= at_late) {
+            narrow -= sms - rest;
+            ++i;
+            if (narrow <= 0) return rest > 0 ? std::max(at_early, late) : at_early;
+        } else {
+            narrow -= rest;
+            ++j;
+            if (narrow <= 0) return at_late;
+        }
+    }
+}
+
+// The 5120-row weights have only 40 row blocks, so whole 128-token tiles quantize the last wave
+// coarsely (T = 1024: 320 CTAs, 2.5 waves) and whole 64-token tiles pay the decode twice per
+// output. Covering the first tokens of every row block with 128-token tiles and the rest with
+// 64-token tiles lets the cheaper CTAs fill the last wave; the split with the shortest estimated
+// makespan is taken (T = 1024: 4 + 8 tiles per row block, 4-10 % faster than either uniform
+// width). Arithmetic per output does not depend on the split.
+TallSplit choose_tall_split(int row_blocks, int tokens) {
+    const int sms   = device_sm_count();
+    TallSplit best  = {(tokens + 127) / 128, 0};
+    double shortest = tall_makespan(std::int64_t(row_blocks) * best.wide, 0, sms);
+    for (int wide = 0; 128 * wide < tokens; ++wide) {
+        const int narrow  = (tokens - 128 * wide + 63) / 64;
+        const double time = tall_makespan(std::int64_t(row_blocks) * wide,
+                                          std::int64_t(row_blocks) * narrow, sms);
+        if (time < shortest) {
+            shortest = time;
+            best     = {wide, narrow};
+        }
+    }
+    return best;
 }
 
 void launch_tall_gemm(const QuantizedX& q, const Weight& w, int tokens,
@@ -106,36 +160,15 @@ void launch_tall_gemm(const QuantizedX& q, const Weight& w, int tokens,
         return true;
     }();
     (void)opted_in;
-    const int token_tiles = (tokens + t5_a8::kTallTokens - 1) / t5_a8::kTallTokens;
-    const unsigned grid   = static_cast<unsigned>(w.n / t5_a8::kTallRows * token_tiles);
+    const int row_blocks  = w.n / t5_a8::kTallRows;
+    const TallSplit split = choose_tall_split(row_blocks, tokens);
+    const unsigned grid   = static_cast<unsigned>(row_blocks * (split.wide + split.narrow));
     t5_a8::gemm_tall_kernel<<<grid, t5_a8::kTallThreads, kSmem, stream>>>(
         static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
         static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, token_tiles, outputs,
-        accumulate);
+        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, split.wide,
+        split.narrow, outputs, accumulate);
     CUDA_CHECK(cudaGetLastError());
-}
-
-// Short prefills (MTP/DFlash2 tails, chunk remainders) keep 64-token CTAs; longer ones share
-// each decoded weight stage across 128 tokens. The exception is a 128-token grid that leaves SMs
-// idle over a short K: one eight-warp CTA per SM then runs longer than the 64-token CTAs it
-// replaces (o_proj 5120 x 6144 at T = 128: 80 CTAs, +14 %), while a long K still gains (down
-// 5120 x 17408, -3 %) and grids of at least one CTA per SM gain 25-30 % (design 9.1).
-bool use_small_gemm_tile(const Weight& w, int tokens) {
-    using Large = t5_a8::GemmConfig<2, 4>;
-    if (tokens <= t5_a8::GemmConfig<2, 2>::kTokens) return true;
-    constexpr int kLongK = 16384;
-    const std::int64_t large_ctas =
-        std::int64_t(w.n / Large::kRows) * ((tokens + Large::kTokens - 1) / Large::kTokens);
-    return large_ctas < device_sm_count() && w.k < kLongK;
-}
-
-// Weights of at least 8192 rows take the 128 x 128 kernel: each staged activation tile then
-// serves 128 rows, halving the L2 activation reads per output (gate+up, GDN in_proj and attention
-// qkvg). The 5120-row weights keep 64-row CTAs: 40 row blocks leave the one-CTA-per-SM tile too
-// few CTAs per wave (o_proj +8 % at T = 1024, design 9.1).
-bool use_tall_gemm_tile(const Weight& w) {
-    return w.n >= 8192 && w.n % t5_a8::kTallRows == 0;
 }
 
 void require_input(const Tensor& x, const Weight& w, const char* what) {
@@ -148,7 +181,8 @@ void require_input(const Tensor& x, const Weight& w, const char* what) {
 
 // Validates the weight, policy and outputs, then quantizes the input and multiplies: dp4a GEMV
 // through T = 4, the small-T MMA route through T = 32 (and at any T when N % 64 != 0, in 32-token
-// tiles), the int8 MMA GEMM beyond.
+// tiles), the 64 x 64 GEMM through T = 64 (and beyond when N % 128 != 0), the pipelined
+// 128-row GEMM beyond (every Bonsai weight).
 template <class Input>
 void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* const> outputs,
              bool accumulate, LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
@@ -187,19 +221,17 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
     case 4: launch_gemv<4>(q, w, packed, accumulate, stream); return;
     default: break;
     }
-    if (tokens <= kSmallTMaxTokens || w.n % t5_a8::GemmConfig<2, 2>::kRows != 0) {
+    if (tokens <= kSmallTMaxTokens || w.n % t5_a8::kGemmRows != 0) {
         switch ((std::min(tokens, kSmallTMaxTokens) + 7) / 8) {
         case 1: launch_small_t<1>(q, w, tokens, packed, accumulate, stream); break;
         case 2: launch_small_t<2>(q, w, tokens, packed, accumulate, stream); break;
         case 3: launch_small_t<3>(q, w, tokens, packed, accumulate, stream); break;
         default: launch_small_t<4>(q, w, tokens, packed, accumulate, stream); break;
         }
-    } else if (use_small_gemm_tile(w, tokens)) {
-        launch_gemm<2, 2>(q, w, tokens, packed, accumulate, stream);
-    } else if (use_tall_gemm_tile(w)) {
+    } else if (tokens > t5_a8::kGemmTokens && w.n % t5_a8::kTallRows == 0) {
         launch_tall_gemm(q, w, tokens, packed, accumulate, stream);
     } else {
-        launch_gemm<2, 4>(q, w, tokens, packed, accumulate, stream);
+        launch_gemm(q, w, tokens, packed, accumulate, stream);
     }
 }
 

@@ -405,8 +405,8 @@ int main() {
         // bound, with one to four 8-token tiles and partial tiles, on a partial 16-row block
         // (odd N) and a row view of a fused parent; beyond T = 32 a weight whose rows are not a
         // multiple of 64 stays on the small-T route in 32-token tiles (T = 40, 72). Graph replay,
-        // and the 64-token prefill GEMM with partial tiles (this short-K, few-row weight keeps
-        // 64-token CTAs beyond T = 64 as well).
+        // and the 64 x 64 prefill GEMM with partial tiles (448 rows are not a multiple of 128, so
+        // this weight keeps it beyond T = 64 as well).
         const Ternary small(301, 3072, 15u);
         for (std::int32_t t : {1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 25, 32, 40, 72}) {
             failures += linear_case(small, 0, 301, t, t == 3 || t == 9);
@@ -420,15 +420,23 @@ int main() {
         failures += linear_case(gemm, 64, 320, 40, false, ops::LinearPolicy::AllowA4);
         failures += linear_add_case(gemm, 70);
         failures += linear_add_case(gemm, 3);
-        // Weights of at least 8192 rows take the eight-warp 128 x 128 kernel: three token tiles, the
-        // last partial, and a residual epilogue.
+        // Beyond T = 64 weights of 128-row blocks take the eight-warp 128-row kernel, whose launch
+        // covers each row block with 128-token tiles, then 64-token tiles (splits on 128 SMs).
+        // 64 row blocks at T = 300: one 128-token tile and three 64-token tiles, the last
+        // partial; at T = 130 two 128-token tiles, the second of two tokens, and a residual
+        // epilogue.
         const Ternary tall(8192, 2048, 19u);
         failures += linear_case(tall, 0, 8192, 300, false);
         failures += linear_add_case(tall, 130);
-        // A row view of a fused parent on the 128 x 128 tile (row offset into the codes and
+        // A row view of a fused parent on the 128-row tile (row offset into the codes and
         // scales), with a second token tile of one token, under graph replay.
         const Ternary tall_parent(8448, 2048, 20u);
         failures += linear_case(tall_parent, 128, 8192, 129, true);
+        // 40 row blocks (the 5120-row weights) mix both tile widths from T = 400: at T = 500 two
+        // 128-token and four 64-token tiles, at T = 1000 four and eight, the last one partial.
+        const Ternary rows5120(5120, 1024, 21u);
+        failures += linear_add_case(rows5120, 500);
+        failures += linear_case(rows5120, 0, 5120, 1000, true);
     }
     // Bonsai shapes (N, K) at decode and MTP-verify widths: one lane (T = 1, 3, 4), and B
     // concurrent lanes packed as B x (draft + 1) columns (draft 2: 6, 9, 12, ..., 24; draft 3:
@@ -447,8 +455,11 @@ int main() {
         }
     }
     {
-        // 128-token prefill GEMM at the longest K (mlp down, 80 CTAs), accumulating into a
-        // residual.
+        // The 5120-row weights at the GEMM boundaries, accumulating into a residual: the 64 x 64
+        // tile at T = 64, then 64-token tiles of the 128-row kernel (two at T = 65 and 72, three at
+        // T = 129), the last partial; mlp down at the longest K.
+        const Ternary output(5120, 6144, 3099u);
+        for (std::int32_t t : {64, 65, 129}) failures += linear_add_case(output, t);
         const Ternary down(5120, 17408, 3100u);
         failures += linear_add_case(down, 72);
     }
