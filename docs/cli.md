@@ -162,7 +162,7 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
+Speculative decoding is disabled by default. Select MTP with one to seven draft positions, or the
 35B-A3B DFlash or Qwen3.8-27B DFlash2 backend with one to fifteen. Both masked-draft backends
 may be combined with `--vision`.
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:

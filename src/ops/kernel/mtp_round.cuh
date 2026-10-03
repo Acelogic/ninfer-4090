@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/mtp_round.h
-// Match: request-major T=V+1<=16 verify width, K=1..5 autoregressive MTP round transition.
+// Match: request-major T=V+1<=16 verify width, K=1..7 autoregressive MTP round transition.
 
 #include <cstdint>
 

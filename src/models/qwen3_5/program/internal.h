@@ -8,7 +8,7 @@
 namespace ninfer::models::qwen3_5 {
 
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 7;
 // Drafts one MTP round can verify: the MTP proposal plus host-supplied extensions.
 inline constexpr std::uint32_t kMaximumMtpVerifyDrafts = 15;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;

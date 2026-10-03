@@ -54,8 +54,8 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
     const std::int32_t k     = proposal_depth;
-    if (k < 1 || k > 5) {
-        throw std::invalid_argument("mtp_prepare_next_round: K must be in [1,5]");
+    if (k < 1 || k > 7) {
+        throw std::invalid_argument("mtp_prepare_next_round: K must be in [1,7]");
     }
     if (T < k + 1 || T > 16) {
         throw std::invalid_argument("mtp_prepare_next_round: T must be in [K+1,16]");
