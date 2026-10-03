@@ -8,12 +8,14 @@ RTX 4090 (`sm_89`) on native Windows.
 
 | Document | Purpose |
 |---|---|
+| [Full guide](guide.md) | running the CLI and server by hand, performance, settings, benchmarking, model conversion and serving features |
+| [Launcher, profiles and tray](../windows/README.md) | the Windows profile launcher, stop script and tray icon |
 | [Native Windows port](../WINDOWS_PORT.md) | Windows build details, Qwen3.8 measurements and experiments on the RTX 4090 |
-| [Prebuilt releases](https://github.com/JGamboa/ninfer-4090-windows/releases) | Windows x64 binaries with DLLs, launchers and licenses |
+| [Prebuilt releases](https://github.com/Acelogic/ninfer-4090/releases) | Windows x64 binaries with DLLs, the profile launcher, tray icon and licenses |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Comparison with llama.cpp](llamacpp-comparison.md) | same-machine prefill comparison on the RTX 4090 (2026-09-26) and the earlier Linux comparison |
-| [Performance (upstream, RTX 5090)](performance.md) | the upstream engine's RTX 5090 serving measurements and publication rules; RTX 4090 figures are in the README and WINDOWS_PORT |
+| [Performance (upstream, RTX 5090)](performance.md) | the upstream engine's RTX 5090 serving measurements and publication rules; RTX 4090 figures are in the README, the guide and WINDOWS_PORT |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
