@@ -80,11 +80,14 @@ struct ChatRenderOptions {
 struct RenderedChat {
     std::string text;
     std::optional<std::size_t> turn_rewrite_byte_offset;
+    bool enable_thinking = true;
+    bool starts_in_reasoning = false;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
     ReasoningEffort,
+    Froggeric225,
 };
 
 class CompiledChatTemplate {

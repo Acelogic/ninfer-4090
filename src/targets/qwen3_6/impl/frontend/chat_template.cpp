@@ -11,6 +11,7 @@
 #include <string_view>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
+RenderedChat render_froggeric225(const std::vector<ChatMessage>& messages, ChatRenderOptions options);
 namespace {
 
 using OrderedJson = nlohmann::ordered_json;
@@ -280,6 +281,9 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     const Sha256Digest digest = sha256(source);
+    if (sha256_hex(digest) == "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2") {
+        return CompiledChatTemplate(ChatTemplateSemantics::Froggeric225);
+    }
     if (digest == kThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
@@ -293,17 +297,19 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     PromptCapabilities result;
     result.enable_thinking = true;
-    if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
+    if (semantics_ == ChatTemplateSemantics::ReasoningEffort || semantics_ == ChatTemplateSemantics::Froggeric225) {
         result.reasoning_effort.low            = true;
         result.reasoning_effort.medium         = true;
         result.reasoning_effort.xhigh          = true;
-        result.reasoning_effort.default_effort = ReasoningEffort::XHigh;
+        result.reasoning_effort.default_effort = semantics_ == ChatTemplateSemantics::Froggeric225
+            ? ReasoningEffort::Medium : ReasoningEffort::XHigh;
     }
     return result;
 }
 
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
                                           ChatRenderOptions options) const {
+    if (semantics_ == ChatTemplateSemantics::Froggeric225) return render_froggeric225(messages, std::move(options));
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
     const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
@@ -434,7 +440,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     return RenderedChat{.text                     = std::move(rendered),
-                        .turn_rewrite_byte_offset = turn_rewrite_byte_offset};
+                        .turn_rewrite_byte_offset = turn_rewrite_byte_offset,
+                        .enable_thinking = options.enable_thinking,
+                        .starts_in_reasoning = options.add_generation_prompt && options.enable_thinking};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

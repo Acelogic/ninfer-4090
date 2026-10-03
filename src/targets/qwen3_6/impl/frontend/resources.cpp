@@ -2,9 +2,13 @@
 
 #include "artifact/materializer.h"
 #include "artifact/typed_binding.h"
+#include "targets/qwen3_6/impl/frontend/chat_template.h"
 
 #include <cstddef>
 #include <string>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
 
 namespace ninfer::targets::qwen3_6 {
 namespace {
@@ -16,6 +20,20 @@ std::string take_string(artifact::MaterializedArtifact& materialized,
 }
 
 } // namespace
+
+std::string load_chat_template_override(const std::filesystem::path& path) {
+    if (path.empty()) return {};
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) throw std::invalid_argument("cannot open chat template: " + path.string());
+    const auto size = stream.tellg();
+    if (size <= 0 || size > 1024 * 1024)
+        throw std::invalid_argument("chat template must be between 1 byte and 1 MiB");
+    stream.seekg(0);
+    std::string source(static_cast<std::size_t>(size), '\0');
+    if (!stream.read(source.data(), size)) throw std::invalid_argument("cannot read chat template");
+    (void)frontend_internal::CompiledChatTemplate::resolve(source);
+    return source;
+}
 
 FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder) {
     return FrontendResourcePlan{

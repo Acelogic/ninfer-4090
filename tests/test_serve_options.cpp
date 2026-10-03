@@ -29,6 +29,13 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.chat_template_path.empty(), "template override is not opt-in");
+    const auto custom_template = parse({"ninfer-serve", "model.ninfer", "--chat-template", "path with spaces/froggeric.jinja"});
+    failures += check(custom_template.chat_template_path == "path with spaces/froggeric.jinja", "template path not preserved");
+    bool missing_template_value = false;
+    try { (void)parse({"ninfer-serve", "model.ninfer", "--chat-template"}); }
+    catch (const std::exception&) { missing_template_value = true; }
+    failures += check(missing_template_value, "missing template path accepted");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

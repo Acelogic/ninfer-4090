@@ -25,10 +25,13 @@ struct FrontendResources {
     std::string tokenizer_json;
     std::string tokenizer_config_json;
     std::string chat_template_jinja;
+    std::string chat_template_override; // Validated separately; embedded resources stay intact.
     std::string generation_config_json;
     std::string preprocessor_config_json;
     std::string video_preprocessor_config_json;
 };
+
+[[nodiscard]] std::string load_chat_template_override(const std::filesystem::path& path);
 
 [[nodiscard]] FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder);
 [[nodiscard]] FrontendResources take_frontend_resources(artifact::MaterializedArtifact& artifact,

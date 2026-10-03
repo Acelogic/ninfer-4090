@@ -571,6 +571,8 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
     };
     ProcessedInput output;
+    output.enable_thinking = rendered.enable_thinking;
+    output.starts_in_reasoning = rendered.starts_in_reasoning;
     std::vector<VisionItem> items;
     items.reserve(parts.size());
     PreprocessStats stats;

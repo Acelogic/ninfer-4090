@@ -72,6 +72,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 + " <model.ninfer> [options]\n\n"
            "High-performance OpenAI Responses/Chat Completions and Anthropic Messages server\n"
            "for native .ninfer checkpoint artifacts.\n\n"
+           "  --chat-template <FILE>     Select a hash-registered native chat template (default: artifact)\n"
            "Server & Network:\n"
            "  --host <H>                  HTTP listen address (default: 127.0.0.1)\n"
            "  --port <N>                  HTTP listen port (default: 8080)\n"
@@ -239,6 +240,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
             default_max_tokens_explicit = true;
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = require_value("--chat-template");
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {

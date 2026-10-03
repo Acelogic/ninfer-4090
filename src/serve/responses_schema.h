@@ -52,8 +52,8 @@ struct BuiltResponse {
 // accepted; recognized but unsupported OpenAI fields fail explicitly.
 ResponsesRequest parse_responses_request(const nlohmann::json& body, const RequestLimits& limits);
 
-// Parse POST /v1/responses/input_tokens. The current OpenAI endpoint accepts
-// model + input; the result still uses GenerationRequest for shared translation.
+// Parse POST /v1/responses/input_tokens. Count a complete stateless prompt:
+// model, input, instructions, tools, tool_choice, reasoning and template options.
 ResponsesRequest parse_response_input_tokens_request(const nlohmann::json& body,
                                                      const RequestLimits& limits);
 

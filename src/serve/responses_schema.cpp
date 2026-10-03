@@ -936,8 +936,9 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
                                                      const RequestLimits& limits) {
     require_object(body);
     for (auto it = body.begin(); it != body.end(); ++it) {
-        if (it.key() != "model" && it.key() != "input" && it.key() != "chat_template_kwargs" &&
-            it.key() != "preserve_thinking") {
+        if (it.key() != "model" && it.key() != "input" && it.key() != "instructions" &&
+            it.key() != "tools" && it.key() != "tool_choice" && it.key() != "reasoning" &&
+            it.key() != "chat_template_kwargs" && it.key() != "preserve_thinking") {
             bad_request("unknown parameter: " + it.key(), it.key(), "unknown_parameter");
         }
     }
@@ -945,6 +946,9 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
     parsed.store             = false;
     parsed.stream            = false;
     parsed.generation.stream = false;
+    // Count exactly the same stateless prompt used by generation, including
+    // developer instructions, tool definitions, and reasoning/template controls.
+    compose_responses_generation_messages(parsed, {});
     return parsed;
 }
 

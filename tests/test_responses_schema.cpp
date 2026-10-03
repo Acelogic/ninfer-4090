@@ -481,10 +481,28 @@ int test_input_tokens_schema() {
     failures +=
         check(api_code([&] {
                   (void)parse_response_input_tokens_request(
-                      Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "x"}},
+                      Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"stream", true}},
                       limits());
               }) == "unknown_parameter",
-              "input_tokens accepts only model and input");
+              "input_tokens rejects generation-only parameters");
+    const Json body = {
+        {"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "Project rule"},
+        {"reasoning", {{"effort", "medium"}}}, {"preserve_thinking", true},
+        {"tools", Json::array({{{"type", "function"}, {"name", "read_file"},
+                                {"parameters", {{"type", "object"}}}}})}};
+    const auto counted = parse_response_input_tokens_request(body, limits());
+    auto generated = parse_responses_request(body, limits());
+    compose_responses_generation_messages(generated, {});
+    failures += check(counted.generation.messages.size() == 2 &&
+                          counted.generation.messages.front().role == "developer" &&
+                          counted.generation.messages.front().content.front().text == "Project rule",
+                      "count includes instructions before user input");
+    failures += check(counted.generation.tools.size() == 1 &&
+                          counted.generation.tools.front().definition_json ==
+                              generated.generation.tools.front().definition_json &&
+                          counted.generation.reasoning_effort == generated.generation.reasoning_effort &&
+                          counted.generation.preserve_thinking == generated.generation.preserve_thinking,
+                      "count preserves tools and prompt mode used by generation");
     return failures;
 }
 

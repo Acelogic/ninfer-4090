@@ -210,7 +210,9 @@ void validate_tokenizer_config(const FrontendResources& resources) {
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
     validate_tokenizer_config(resources);
-    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    const auto embedded = fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    return resources.chat_template_override.empty() ? embedded
+        : fi::CompiledChatTemplate::resolve(resources.chat_template_override);
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
@@ -722,6 +724,10 @@ double PreparedPrompt::prepare_seconds() const noexcept {
     return data_ != nullptr ? data_->prepare.seconds : 0.0;
 }
 
+SamplingMode PreparedPrompt::sampling_mode() const noexcept {
+    return data_ ? data_->sampling_mode : SamplingMode::Thinking;
+}
+
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
@@ -962,6 +968,8 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
             processed = processor.process(messages, render_options(options));
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
+        result.starts_in_reasoning = processed.starts_in_reasoning;
+        result.sampling_mode = processed.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
         result.token_types = std::move(processed.token_types);
         result.positions   = std::move(processed.positions);
         result.rope_delta  = processed.rope_delta;
@@ -979,6 +987,8 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
+        result.starts_in_reasoning = rendered.starts_in_reasoning;
+        result.sampling_mode = rendered.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
         fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
         result.token_ids        = std::move(encoded.input_ids);
         result.identity.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
@@ -986,7 +996,6 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
-    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

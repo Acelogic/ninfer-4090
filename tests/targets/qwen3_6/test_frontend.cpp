@@ -1090,12 +1090,73 @@ int test_high_resolution_image_resizing_and_budget() {
 
 } // namespace
 
+int test_froggeric_override() {
+    const std::filesystem::path path = NINFER_SOURCE_DIR "/third_party/froggeric/chat_template.jinja";
+    auto owned = resources();
+    owned.chat_template_override = ninfer::targets::qwen3_6::load_chat_template_override(path);
+    const auto frontend = FrontendFactory::create_component(owned);
+    int failures = 0;
+    failures += check(ninfer::targets::qwen3_6::load_chat_template_override({}).empty(), "empty template override is not optional");
+    bool missing_rejected = false;
+    try { (void)ninfer::targets::qwen3_6::load_chat_template_override(path.string() + ".missing"); }
+    catch (const std::exception&) { missing_rejected = true; }
+    failures += check(missing_rejected, "missing template silently accepted");
+    auto invalid = owned;
+    invalid.chat_template_override += " ";
+    bool unknown_rejected = false;
+    try { (void)FrontendFactory::create_component(invalid); }
+    catch (const std::exception&) { unknown_rejected = true; }
+    failures += check(unknown_rejected, "unregistered template hash accepted");
+    invalid = owned;
+    invalid.chat_template_jinja += "bad";
+    bool embedded_rejected = false;
+    try { (void)FrontendFactory::create_component(invalid); }
+    catch (const std::exception&) { embedded_rejected = true; }
+    failures += check(embedded_rejected, "override bypassed embedded tokenizer/template validation");
+    for (bool media : {false, true}) for (bool requested : {false, true}) for (bool effective : {false, true}) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking = requested;
+        ninfer::ChatMessage msg;
+        msg.role = "user";
+        msg.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text,
+            .text = effective ? "<|think_on|> x" : "<|think_off|> x"});
+        if (media) {
+            ninfer::MessagePart part;
+            part.kind = ninfer::MessagePartKind::Media;
+            part.media.kind = ninfer::MediaKind::Image;
+            const std::string header = "P6\n64 64\n255\n";
+            part.media.bytes.assign(header.begin(), header.end());
+            part.media.bytes.resize(header.size() + 64 * 64 * 3, 128);
+            part.media.media_type = "image/x-portable-pixmap";
+            msg.parts.push_back(std::move(part));
+        }
+        input.messages.push_back(std::move(msg));
+        const auto counted = frontend.count_tokens(input);
+        const auto prepared = frontend.prepare(std::move(input));
+        const auto& data = FrontendFactory::inspect(prepared);
+        failures += check(data.starts_in_reasoning == effective, "template thinking toggle disagrees with output channel");
+        failures += check(prepared.sampling_mode() == (effective ? ninfer::SamplingMode::Thinking : ninfer::SamplingMode::NonThinking), "template thinking toggle disagrees with sampling mode");
+        failures += check(prepared.summary().prompt_tokens == counted, "Froggeric prepared/count token mismatch");
+        if (!effective) {
+            auto output_session = frontend.make_output_session(prepared, {});
+            (void)output_session.preview(std::array<ninfer::TokenId, 1>{4}, 1, ninfer::FinishReason::OutputLimit);
+            const auto output = output_session.commit_preview();
+            failures += check(channel_text(output, ninfer::OutputChannel::Content).find("answer") != std::string::npos,
+                              "inline thinking-off hid the answer in the reasoning channel");
+            failures += check(channel_text(output, ninfer::OutputChannel::Reasoning).empty(),
+                              "inline thinking-off emitted reasoning");
+        }
+    }
+    return failures;
+}
+
 int main() {
     try {
         const FrontendResources owned = resources();
         const Frontend frontend       = FrontendFactory::create_component(owned);
         int failures                  = 0;
         failures += test_official_tokenizer_merge();
+        failures += test_froggeric_override();
         failures += test_official_chat_template();
         failures += test_mid_conversation_system_render();
         failures += test_reasoning_effort_chat_template();

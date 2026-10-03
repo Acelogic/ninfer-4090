@@ -167,12 +167,11 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 
 PreparedPrompt Engine::prepare(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const SamplingMode sampling_mode =
-        input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
             auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input));
+            const SamplingMode sampling_mode = prepared.sampling_mode();
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
                 throw RequestError(RequestErrorKind::ContextLengthExceeded,

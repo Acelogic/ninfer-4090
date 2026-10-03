@@ -32,6 +32,7 @@ public:
 
     [[nodiscard]] PromptSummary summary() const;
     [[nodiscard]] double prepare_seconds() const noexcept;
+    [[nodiscard]] SamplingMode sampling_mode() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

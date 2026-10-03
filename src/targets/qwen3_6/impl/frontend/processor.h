@@ -103,6 +103,8 @@ struct ProcessedInput {
     std::vector<VisionItem> vision_items;
     std::optional<std::uint32_t> turn_rewrite_boundary;
     PreprocessStats stats;
+    bool enable_thinking = true;
+    bool starts_in_reasoning = false;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 };

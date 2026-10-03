@@ -18,6 +18,7 @@ public:
 
     WeightsProfile weights_profile;
     ArtifactLoadPlan plan;
+    std::string chat_template_override;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -95,9 +96,12 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(
+    auto template_override = qwen3_6::load_chat_template_override(options.chat_template_path);
+    auto impl = std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options)));
+    impl->chat_template_override = std::move(template_override);
+    return LoadPlan(std::move(impl));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -105,6 +109,7 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
     auto impl = std::make_unique<LoadedModel::Impl>(
         plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
+    impl->data.frontend.chat_template_override = std::move(plan.impl_->chat_template_override);
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }

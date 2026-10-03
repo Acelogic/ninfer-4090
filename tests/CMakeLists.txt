@@ -1,5 +1,17 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# CPU-only independent Jinja oracle for the registered Froggeric native port.
+add_executable(ninfer_froggeric_renderer
+  targets/qwen3_6/froggeric_renderer.cpp
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/frontend/chat_template.cpp
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/frontend/froggeric_template.cpp
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/frontend/digest.cpp)
+target_include_directories(ninfer_froggeric_renderer PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+add_test(NAME ninfer_froggeric_template_parity
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/targets/qwen3_6/test_froggeric_parity.py
+  $<TARGET_FILE:ninfer_froggeric_renderer> ${PROJECT_SOURCE_DIR}/third_party/froggeric/chat_template.jinja)
+
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
 add_executable(ninfer_public_api_test test_public_api.cpp)
