@@ -1,5 +1,12 @@
 # NInfer-4090
 
+> **This is Acelogic's fork of [NInfer-4090](https://github.com/UDPSendToFailed/ninfer-4090).** It adds:
+>
+> - a native **Froggeric v22.5** Qwen chat template, selected with `--chat-template`
+> - **Windows launch scripts with a tray icon** ([`windows/`](windows/README.md))
+>
+> A prebuilt Windows x64 binary is on the Releases page. The rest of this README is upstream's. See [About this fork](#about-this-fork) for what changed and who made what.
+
 NInfer-4090 is a specialized, high-performance C++20/CUDA inference engine for **Qwen3.8-27B** on a single 24 GB **NVIDIA GeForce RTX 4090** (`sm_89`).
 
 The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible HTTP APIs, and features native Ada Lovelace MMA tensor core execution, asynchronous double-buffered DMA memory staging, paged KV caching with 2-bit and 4-bit lattice/cylinder quantization, direct L1 block table lookups up to 1M tokens, D3D12 kernel residency management for Windows memory eviction, compatible-prefix reuse, CUDA Graphs, and ReplaySSM linear attention state transactions.
@@ -154,3 +161,33 @@ Co-developed with Gemini 3.7 Flash.
 * Apache License 2.0.
 * Derived from [Neroued/ninfer](https://github.com/Neroued/ninfer) and [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090).
 * Specialized for native **sm_89** single-GPU execution on the **RTX 4090**.
+
+---
+
+## About this fork
+
+This fork keeps upstream NInfer-4090 v1.2.0 (commit `5c60b7c`) and adds two things:
+
+1. **Native Froggeric v22.5 chat template.**
+   - `ninfer-serve --chat-template PATH` selects a hash-registered template at startup.
+   - This build registers froggeric's [Qwen Fixed Chat Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) v22.5 (revision `855bffc4`, SHA-256 `e57684ba…c4b2`), reimplemented in C++ for the typed Qwen frontend. No Jinja interpreter runs in the inference path.
+   - A parity test compares the rendered bytes against the pinned Jinja.
+   - Details are in [docs/froggeric-template.md](docs/froggeric-template.md).
+2. **Windows tooling** in [`windows/`](windows/README.md): launch and stop scripts, and a tray icon that shows the engine state, frees the GPU on demand, and can stop the engine when the client that started it exits.
+
+### Credits
+
+NInfer-4090 is the latest step in a chain of projects, each building on the one before:
+
+| Project | Author | What it is |
+|---|---|---|
+| [NInfer](https://github.com/Neroued/ninfer) | Neroued | Original engine |
+| [NInfer-3090](https://github.com/Don-Chad/ninfer-3090) | Don-Chad | Ampere port |
+| [NInfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) | UDPSendToFailed | Ada `sm_89` port with Windows support; this fork's base |
+
+Credits for the Froggeric template and the model:
+
+- **Froggeric template:** Copyright Frederic Guigand (froggeric), Apache-2.0. The original template, its README and its license are kept in [`third_party/froggeric`](third_party/froggeric).
+- **Qwen3.8 27B:** by the Qwen team, Apache-2.0.
+
+This fork is distributed under the same Apache License 2.0 as upstream (see [LICENSE](LICENSE)). Modified files are listed in this fork's commits on top of upstream `5c60b7c`.

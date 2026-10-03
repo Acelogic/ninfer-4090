@@ -1,0 +1,10 @@
+{
+  "endpoint": "http://127.0.0.1:18085",
+  "autoStopWhenPiExits": true,
+  "exitWhenStopped": true,
+  "logs": "logs",
+  "engines": [
+    { "label": "Qwen3.8 27B", "start": "Start-Qwen27.ps1", "stop": "Stop-Qwen27.ps1" },
+    { "label": "Qwen3.8 27B Huihui (abliterated)", "start": "Start-Qwen27-Huihui.ps1", "stop": "Stop-Qwen27.ps1" }
+  ]
+}
