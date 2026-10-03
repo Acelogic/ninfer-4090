@@ -1,4 +1,15 @@
-# NInfer-4090 for Windows
+# NInfer-4090 for Windows — Acelogic build
+
+> **This is Acelogic's build of [JGamboa's NInfer-4090 for Windows](https://github.com/JGamboa/ninfer-4090-windows).** On top of his engine (int8 prefill, n-gram speculation, DFlash2, ternary Bonsai), it adds:
+>
+> - **MTP speculation up to 7 drafts**, up from 5
+> - **Windows VRAM budgeting** that fits **229K context with vision** on a 24 GB card that also drives the desktop
+> - **Windows tooling** in [`windows/`](windows/README.md): profile launcher, tray icon, and Froggeric template support
+>
+> Prebuilt Windows x64 binaries are on the Releases page. The rest of this README is JGamboa's. See [About this build](#about-this-build) for the lineage and the changes.
+>
+> The previous Acelogic engine (UDPSendToFailed's NInfer-4090 with a native Froggeric renderer) remains on branch [`acelogic/froggeric-windows`](https://github.com/Acelogic/ninfer-4090/tree/acelogic/froggeric-windows).
+
 
 A C++20/CUDA inference engine specialized for **one NVIDIA GeForce RTX 4090** (`sm_89`), built
 and run natively on **Windows 11** (MSVC + CUDA; no WSL, no Docker). It serves two 27B models of
@@ -526,3 +537,42 @@ every performance claim measured on the RTX 4090.
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+---
+
+## About this build
+
+### Lineage
+
+Each project builds on the one above it.
+
+| Project | Author | What it adds |
+|---|---|---|
+| [NInfer](https://github.com/Neroued/ninfer) | Neroued | The engine itself; most of this history (1,082 commits) |
+| [NInfer-3090](https://github.com/Don-Chad/ninfer-3090) | Don-Chad | Ampere port |
+| NInfer-4090 | Sergiusz Michalik (sergiuszm) | Ada (`sm_89`) port |
+| [NInfer-4090 for Windows](https://github.com/JGamboa/ninfer-4090-windows) | JGamboa | The base of this build. Native MSVC build, int8-prefill GEMMs, n-gram speculation, ternary Bonsai format, kernels and converter, and the 4090 tuning measured in [WINDOWS_PORT.md](WINDOWS_PORT.md) |
+| [NInfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) | UDPSendToFailed | Base of the previous Acelogic engine (branch `acelogic/froggeric-windows`); source of the WDDM pre-upload VRAM budgeting ported here |
+
+All commits keep their original authors.
+
+### Changes in this build
+
+Changes on top of JGamboa's `v2026.09.27b` (`c6adc56`):
+
+- `feat(mtp)`: MTP proposal depth up to 7 (`--draft-tokens 1..7`). The round transition and buffers were already sized from the depth constants. Deeper drafts trade prose speed for code, math and edit speed.
+- `fix(windows)`: runtime capacity is sized from the VRAM measured before the weight upload, minus the bytes uploaded. On WDDM the figure measured after the upload reads about 1 GiB low. With this change, Qwen3.8 27B fits 229K context with vision instead of 196K.
+- `upgrade_ninfer_v2_to_v3.py` runs on Windows (part of the `feat(windows)` commit). Its POSIX-only `fdatasync` and `posix_fadvise` calls now fall back to `fsync`, or are skipped.
+- `feat(windows)`: the profile launcher, stop script and tray icon in `windows/`, and froggeric's template in `third_party/froggeric`.
+
+### Credits for models and templates
+
+- **Ternary Bonsai 2 27B:** Prism ML (Apache-2.0).
+- **Heretic abliteration profile:** converted from OS-Software's `Ternary-Bonsai-2-27B-Uncensored-Heretic-GGUF` (Apache-2.0).
+- **Huihui abliterated Qwen3.8 27B:** huihui-ai, converted to groupwise-int by Barding-Defense (Apache-2.0).
+- **Qwen Fixed Chat Templates v22.5:** Frederic Guigand (froggeric), Apache-2.0. Kept in [`third_party/froggeric`](third_party/froggeric).
+- **Qwen3.8:** the Qwen team (Apache-2.0).
+
+### Licenses
+
+Licensed under Apache-2.0, as upstream (see [LICENSE](LICENSE)). The Windows release zip bundles the licenses of its redistributed libraries (FFmpeg LGPL-2.1, curl, zlib) in `licenses/`.

@@ -1,0 +1,5 @@
+Qwen Fixed Chat Templates v22.5
+Copyright Frederic Guigand (froggeric)
+Apache License 2.0, as declared in upstream README.md.
+Source: https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+Native C++ adaptation: froggeric_template.cpp.

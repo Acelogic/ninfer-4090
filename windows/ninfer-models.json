@@ -1,0 +1,126 @@
+{
+  "endpoint": "http://127.0.0.1:18085",
+  "autoStopWhenPiExits": true,
+  "exitWhenStopped": true,
+  "common": [
+    "--max-concurrency",
+    "1",
+    "--max-pending-requests",
+    "16",
+    "--pending-timeout-ms",
+    "600000",
+    "--preserve-thinking"
+  ],
+  "profiles": {
+    "qwen3.8-27b-fast": {
+      "label": "Qwen3.8 27B Fast (DFlash2, 131K, no vision)",
+      "file": "qwen3_8_27b_a8.ninfer",
+      "args": [
+        "--max-context",
+        "131072",
+        "--kv-capacity",
+        "131072",
+        "--kv-dtype",
+        "rk4v4-e8",
+        "--prefill-chunk",
+        "1408",
+        "--spec",
+        "dflash2",
+        "--draft-tokens",
+        "12",
+        "--lm-head-draft"
+      ]
+    },
+    "qwen3.8-27b": {
+      "label": "Qwen3.8 27B (int8 prefill)",
+      "file": "qwen3_8_27b_a8.ninfer",
+      "args": [
+        "--max-context",
+        "229376",
+        "--kv-capacity",
+        "229376",
+        "--kv-dtype",
+        "rk4v4-e8",
+        "--prefill-chunk",
+        "1408",
+        "--spec",
+        "mtp",
+        "--draft-tokens",
+        "5",
+        "--lm-head-draft",
+        "--ngram",
+        "chain",
+        "--vision"
+      ]
+    },
+    "qwen3.8-27b-huihui": {
+      "label": "Qwen3.8 27B Huihui (abliterated)",
+      "file": "qwen3_8_27b_huihui_v3.ninfer",
+      "args": [
+        "--max-context",
+        "229376",
+        "--kv-capacity",
+        "229376",
+        "--kv-dtype",
+        "rk4v4-e8",
+        "--prefill-chunk",
+        "1408",
+        "--spec",
+        "mtp",
+        "--draft-tokens",
+        "5",
+        "--lm-head-draft",
+        "--ngram",
+        "chain",
+        "--vision"
+      ]
+    },
+    "bonsai2-27b": {
+      "label": "Ternary Bonsai 2 27B",
+      "file": "bonsai2_27b_vl_mtp_q4q5.ninfer",
+      "args": [
+        "--max-context",
+        "262144",
+        "--kv-capacity",
+        "262144",
+        "--kv-dtype",
+        "int8",
+        "--prefill-chunk",
+        "1024",
+        "--spec",
+        "mtp",
+        "--draft-tokens",
+        "2",
+        "--lm-head-draft",
+        "--ngram",
+        "chain",
+        "--vision"
+      ]
+    },
+    "bonsai2-27b-heretic": {
+      "label": "Ternary Bonsai 2 27B Heretic (abliterated)",
+      "file": "bonsai2_27b_heretic_vl_mtp_q4q5.ninfer",
+      "args": [
+        "--max-context",
+        "262144",
+        "--kv-capacity",
+        "262144",
+        "--kv-dtype",
+        "int8",
+        "--prefill-chunk",
+        "1024",
+        "--spec",
+        "mtp",
+        "--draft-tokens",
+        "2",
+        "--lm-head-draft",
+        "--ngram",
+        "chain",
+        "--vision"
+      ]
+    }
+  },
+  "templates": {
+    "froggeric": "templates/froggeric-v22.5/chat_template.jinja"
+  }
+}
