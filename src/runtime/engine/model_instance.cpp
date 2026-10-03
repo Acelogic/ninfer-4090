@@ -66,6 +66,24 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
+// Under WDDM, cudaMemGetInfo taken after the weight upload under-reports what the runtime can still
+// place: on a 24 GB RTX 4090 that also drives the desktop it read ~4.7 GiB while ~5.7 GiB was
+// placeable. Budget from the pre-upload measurement minus the bytes uploaded, as NInfer-4090 does,
+// and never report less than the live figure. Other platforms keep the live figure.
+std::size_t runtime_budget_after_weights(std::size_t free_before_weights,
+                                         std::size_t weight_bytes) {
+    const std::size_t live = current_free_device_bytes();
+#if defined(_WIN32)
+    if (free_before_weights > weight_bytes) {
+        return std::max(live, free_before_weights - weight_bytes);
+    }
+#else
+    (void)free_before_weights;
+    (void)weight_bytes;
+#endif
+    return live;
+}
+
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
@@ -163,6 +181,7 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
     binding.complete();
+    const std::size_t free_before_weights = current_free_device_bytes();
     auto model =
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
@@ -177,8 +196,10 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
             .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          current_free_device_bytes());
+    auto resolution = resolve_kv_capacity(
+        options.kv_capacity, planner.capacity_curve(),
+        runtime_budget_after_weights(free_before_weights,
+                                     instance->model->storage_stats().h2d_bytes));
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {
