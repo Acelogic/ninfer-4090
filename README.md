@@ -1,4 +1,4 @@
-# NInfer-4090 for Windows (Acelogic build)
+# NInfer-4090 Extreme
 
 Fast local inference for **Qwen3.8 27B** and **Ternary Bonsai 2 27B** on one **RTX 4090** under
 **Windows 11**. It's a native C++/CUDA engine with no WSL or Docker. It serves an OpenAI- and
@@ -40,7 +40,7 @@ Each row is a ready-made profile. The profile name is also the model id that cli
 - PowerShell 7.
 
 1. Download `ninfer-4090-acelogic-<date>-windows-x64.zip` from the
-   [latest release](https://github.com/Acelogic/ninfer-4090/releases/latest) and unzip it, for
+   [latest release](https://github.com/Acelogic/ninfer-4090-extreme/releases/latest) and unzip it, for
    example to `C:\ninfer`.
 2. Download a model into its `models` folder, using the
    [`hf` tool](https://huggingface.co/docs/huggingface_hub/guides/cli) or a browser:
@@ -77,7 +77,7 @@ On top of JGamboa's `v2026.09.27b`:
 
 The previous Acelogic engine, based on UDPSendToFailed's NInfer-4090 with a native Froggeric
 renderer, is still available as release
-[`v1.2.0-froggeric-v22.5`](https://github.com/Acelogic/ninfer-4090/releases/tag/v1.2.0-froggeric-v22.5).
+[`v1.2.0-froggeric-v22.5`](https://github.com/Acelogic/ninfer-4090-extreme/releases/tag/v1.2.0-froggeric-v22.5).
 
 ## Build from source
 
@@ -85,8 +85,8 @@ From an "x64 Native Tools" prompt, with CUDA 12.8 or newer, CMake 3.28+, Ninja a
 [vcpkg](https://github.com/microsoft/vcpkg):
 
 ```bat
-git clone https://github.com/Acelogic/ninfer-4090
-cd ninfer-4090
+git clone https://github.com/Acelogic/ninfer-4090-extreme
+cd ninfer-4090-extreme
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake ^
   -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_CUDA_ARCHITECTURES=89

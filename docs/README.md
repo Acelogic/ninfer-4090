@@ -11,7 +11,7 @@ RTX 4090 (`sm_89`) on native Windows.
 | [Full guide](guide.md) | running the CLI and server by hand, performance, settings, benchmarking, model conversion and serving features |
 | [Launcher, profiles and tray](../windows/README.md) | the Windows profile launcher, stop script and tray icon |
 | [Native Windows port](../WINDOWS_PORT.md) | Windows build details, Qwen3.8 measurements and experiments on the RTX 4090 |
-| [Prebuilt releases](https://github.com/Acelogic/ninfer-4090/releases) | Windows x64 binaries with DLLs, the profile launcher, tray icon and licenses |
+| [Prebuilt releases](https://github.com/Acelogic/ninfer-4090-extreme/releases) | Windows x64 binaries with DLLs, the profile launcher, tray icon and licenses |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Comparison with llama.cpp](llamacpp-comparison.md) | same-machine prefill comparison on the RTX 4090 (2026-09-26) and the earlier Linux comparison |
