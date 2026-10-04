@@ -16,6 +16,8 @@ namespace {
 // with few rows (the hyper-connection projections have 320, the router 512) still fill the GPU.
 constexpr int kWarps = 8;
 
+int split_of(const GpuWeight & w);
+
 template <int T, int WPR>
 __device__ __forceinline__ void finish(float (&acc)[T], float * __restrict__ y, int n, int row) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -177,14 +179,135 @@ void launch(const GpuWeight & w, const float * x, float * y, cudaStream_t stream
 
 template <int T>
 void launch_split(const GpuWeight & w, const float * x, float * y, cudaStream_t stream) {
-    // Split K across warps until there are enough warps in flight, keeping at least 512 weights per warp.
-    int wpr = 1;
-    while (wpr < kWarps && std::int64_t(w.n) * wpr < 8192 && w.k >= 512 * wpr) wpr *= 2;
-    switch (wpr) {
+    switch (split_of(w)) {
     case 1: launch<T, 1>(w, x, y, stream); break;
     case 2: launch<T, 2>(w, x, y, stream); break;
     case 4: launch<T, 4>(w, x, y, stream); break;
     default: launch<T, 8>(w, x, y, stream); break;
+    }
+}
+
+int split_of(const GpuWeight & w) {
+    // Split K across warps until there are enough warps in flight, keeping at least 512 weights per warp.
+    int wpr = 1;
+    while (wpr < kWarps && std::int64_t(w.n) * wpr < 8192 && w.k >= 512 * wpr) wpr *= 2;
+    return wpr;
+}
+
+struct MultiSeg {
+    WeightFormat format;
+    int n, k, wpr, block_begin;
+    const void * data;
+    const void * scales;
+    float * y;
+};
+struct MultiArgs {
+    MultiSeg seg[kMaxMulti];
+    int count;
+};
+
+// One launch over several matrices; each block belongs to one matrix and follows the same loops as
+// the single-matrix kernels above, so the sums are formed in the same order.
+template <int T>
+__global__ void __launch_bounds__(32 * kWarps) gemv_multi_kernel(const MultiArgs a, const float * __restrict__ x) {
+    int s = 0;
+    while (s + 1 < a.count && int(blockIdx.x) >= a.seg[s + 1].block_begin) ++s;
+    const MultiSeg & g = a.seg[s];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpr = g.wpr, part = warp % wpr;
+    const int row = (int(blockIdx.x) - g.block_begin) * (kWarps / wpr) + warp / wpr;
+    const int n = g.n, k = g.k;
+    float acc[T] = {};
+    if (row < n) {
+        switch (g.format) {
+        case WeightFormat::Q8_SPLIT: {
+            const std::int8_t * wr = static_cast<const std::int8_t *>(g.data) + std::size_t(row) * k;
+            const __half * sr = static_cast<const __half *>(g.scales) + std::size_t(row) * (k / 32);
+#pragma unroll 4
+            for (int c = 128 * part + 4 * lane; c < k; c += 128 * wpr) {
+                const int packed = __ldg(reinterpret_cast<const int *>(wr + c));
+                const float sc = __half2float(__ldg(sr + c / 32));
+                const float w0 = float(std::int8_t(packed)), w1 = float(std::int8_t(packed >> 8));
+                const float w2 = float(std::int8_t(packed >> 16)), w3 = float(packed >> 24);
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    const float4 xv = __ldg(reinterpret_cast<const float4 *>(x + std::size_t(t) * k + c));
+                    acc[t] += sc * (w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w);
+                }
+            }
+            break;
+        }
+        case WeightFormat::F32: {
+            const float * wr = static_cast<const float *>(g.data) + std::size_t(row) * k;
+#pragma unroll 4
+            for (int c = 128 * part + 4 * lane; c < k; c += 128 * wpr) {
+                const float4 wv = __ldg(reinterpret_cast<const float4 *>(wr + c));
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    const float4 xv = __ldg(reinterpret_cast<const float4 *>(x + std::size_t(t) * k + c));
+                    acc[t] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+                }
+            }
+            break;
+        }
+        case WeightFormat::BF16: {
+            const __nv_bfloat16 * wr = static_cast<const __nv_bfloat16 *>(g.data) + std::size_t(row) * k;
+#pragma unroll 4
+            for (int c = 128 * part + 4 * lane; c < k; c += 128 * wpr) {
+                const uint2 raw = __ldg(reinterpret_cast<const uint2 *>(wr + c));
+                const float w0 = __uint_as_float(raw.x << 16), w1 = __uint_as_float(raw.x & 0xffff0000u);
+                const float w2 = __uint_as_float(raw.y << 16), w3 = __uint_as_float(raw.y & 0xffff0000u);
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    const float4 xv = __ldg(reinterpret_cast<const float4 *>(x + std::size_t(t) * k + c));
+                    acc[t] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;
+                }
+            }
+            break;
+        }
+        case WeightFormat::Q6_K: {
+            const BlockQ6K * br = static_cast<const BlockQ6K *>(g.data) + std::size_t(row) * (k / 256);
+            for (int b = part; b < k / 256; b += wpr) {
+                const BlockQ6K & blk = br[b];
+                const float d = __half2float(blk.d);
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int ql0 = blk.ql[64 * half + lane], ql1 = blk.ql[64 * half + lane + 32], qh = blk.qh[32 * half + lane];
+                    const std::int8_t * sc = blk.scales + 8 * half + lane / 16;
+                    const float v0 = d * sc[0] * float(((ql0 & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
+                    const float v1 = d * sc[2] * float(((ql1 & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+                    const float v2 = d * sc[4] * float(((ql0 >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+                    const float v3 = d * sc[6] * float(((ql1 >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+                    const int base = 256 * b + 128 * half + lane;
+#pragma unroll
+                    for (int t = 0; t < T; ++t) {
+                        const float * xt = x + std::size_t(t) * k + base;
+                        acc[t] += v0 * __ldg(xt) + v1 * __ldg(xt + 32) + v2 * __ldg(xt + 64) + v3 * __ldg(xt + 96);
+                    }
+                }
+            }
+            break;
+        }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t)
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], o);
+    if (wpr == 1) {
+        if (lane == 0 && row < n)
+#pragma unroll
+            for (int t = 0; t < T; ++t) g.y[std::size_t(t) * n + row] = acc[t];
+        return;
+    }
+    __shared__ float red[kWarps][T];
+    if (lane == 0)
+#pragma unroll
+        for (int t = 0; t < T; ++t) red[warp][t] = acc[t];
+    __syncthreads();
+    if (part == 0 && lane < T && row < n) {
+        float sum = 0.0f;
+        for (int w = 0; w < wpr; ++w) sum += red[warp + w][lane];
+        g.y[std::size_t(lane) * n + row] = sum;
     }
 }
 
@@ -243,6 +366,37 @@ void gemv(const GpuWeight & w, const float * x, float * y, int tokens, cudaStrea
     case 4: launch_split<4>(w, x, y, stream); break;
     default: throw std::runtime_error("gemv: tokens must be 1..4");
     }
+}
+
+void gemv_multi(const GemvTarget * targets, int count, const float * x, int tokens, cudaStream_t stream) {
+    if (count < 1 || count > kMaxMulti) throw std::runtime_error("gemv_multi: 1 to 4 matrices");
+    MultiArgs a{};
+    a.count = count;
+    int blocks = 0;
+    for (int i = 0; i < count; ++i) {
+        const GpuWeight & w = *targets[i].w;
+        const int align = w.format == WeightFormat::Q8_SPLIT ? 32 : w.format == WeightFormat::Q6_K ? 256 : 4;
+        if (w.n <= 0 || w.k <= 0 || w.k % align != 0) throw std::runtime_error("gemv_multi: bad matrix shape");
+        if (i > 0 && w.k != targets[0].w->k) throw std::runtime_error("gemv_multi: matrices must share the input length");
+        MultiSeg & g = a.seg[i];
+        g.format = w.format;
+        g.n = w.n;
+        g.k = w.k;
+        g.wpr = split_of(w);
+        g.block_begin = blocks;
+        g.data = w.data;
+        g.scales = w.scales;
+        g.y = targets[i].y;
+        blocks += (w.n + kWarps / g.wpr - 1) / (kWarps / g.wpr);
+    }
+    switch (tokens) {
+    case 1: gemv_multi_kernel<1><<<blocks, 32 * kWarps, 0, stream>>>(a, x); break;
+    case 2: gemv_multi_kernel<2><<<blocks, 32 * kWarps, 0, stream>>>(a, x); break;
+    case 3: gemv_multi_kernel<3><<<blocks, 32 * kWarps, 0, stream>>>(a, x); break;
+    case 4: gemv_multi_kernel<4><<<blocks, 32 * kWarps, 0, stream>>>(a, x); break;
+    default: throw std::runtime_error("gemv_multi: tokens must be 1..4");
+    }
+    check(cudaGetLastError(), "gemv_multi");
 }
 
 }  // namespace ninfer::flashnext::cuda

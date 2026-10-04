@@ -6,8 +6,10 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 #include <cuda_runtime.h>
 #include <immintrin.h>
@@ -521,6 +523,18 @@ struct Engine::Impl {
         fc::gemv(w.view, in.as<float>() + in_off, o.as<float>(), T, stream);
     }
 
+    // several dense layers that read the same input: one fused launch for decode steps
+    void linear_multi(std::initializer_list<std::pair<const fc::DeviceWeight *, fc::DeviceBuffer *>> outs, const fc::DeviceBuffer & in, int T) {
+        if (T <= fc::kMaxTokens) {
+            fc::GemvTarget tg[fc::kMaxMulti];
+            int n = 0;
+            for (const auto & [w, o] : outs) tg[n++] = {&w->view, o->as<float>()};
+            fc::gemv_multi(tg, n, in.as<float>(), T, stream);
+        } else {
+            for (const auto & [w, o] : outs) gemm->run(w->view, in.as<float>(), o->as<float>(), T);
+        }
+    }
+
     // a dense layer over T tokens: matrix-vector kernels for decode steps, FP32 GEMM for prompts
     void linear(const fc::DeviceWeight & w, const fc::DeviceBuffer & in, fc::DeviceBuffer & o, int T) {
         if (T <= fc::kMaxTokens) fc::gemv(w.view, in.as<float>(), o.as<float>(), T, stream);
@@ -531,11 +545,11 @@ struct Engine::Impl {
     void hc_mix(const fc::DeviceBuffer & norm, const fc::DeviceWeight & down, const fc::DeviceWeight & up, const fc::DeviceWeight * inj,
                 int T, int t0 = 0) {
         fc::hc_norm(res.as<float>() + std::size_t(t0) * fc::kHcd, norm.as<float>(), xn.as<float>(), T, cfg.rms_eps, stream);
-        linear(down, xn, lo, T);
+        if (inj) linear_multi({{&down, &lo}, {inj, &inject}}, xn, T);
+        else linear(down, xn, lo, T);
         fc::hc_lowrank_act(lo.as<float>(), T * fc::kHcRank, stream);
         linear(up, lo, gate, T);
         fc::hc_gate_mean(xn.as<float>(), gate.as<float>(), mixed.as<float>(), T, stream);
-        if (inj) linear(*inj, xn, inject, T);
     }
 
     void ple_rows(std::int64_t pos, std::int32_t * idx) const {
@@ -587,10 +601,7 @@ struct Engine::Impl {
     }
 
     void deltanet(Layer & L, int il, int T) {
-        linear(L.wqkv, mixed, qkv, T);
-        linear(L.wgate, mixed, z, T);
-        linear(L.ssm_beta, mixed, beta, T);
-        linear(L.ssm_alpha, mixed, alpha, T);
+        linear_multi({{&L.wqkv, &qkv}, {&L.wgate, &z}, {&L.ssm_beta, &beta}, {&L.ssm_alpha, &alpha}}, mixed, T);
         emit("linear_attn_qkv_mixed", il, qkv.get(), n_past, T, fc::kDnConvDim);
         emit("z", il, z.get(), n_past, T, fc::kDnVDim);
         fc::dn_conv(qkv.as<float>(), L.conv_state.as<float>(), L.conv1d.as<float>(), conv.as<float>(), T, cfg.rms_eps, stream);
@@ -601,15 +612,12 @@ struct Engine::Impl {
     }
 
     void attention(Layer & L, int il, int T) {
-        linear(L.wq, mixed, qfull, T);
-        linear(L.wk, mixed, k, T);
-        linear(L.wv, mixed, v, T);
+        linear_multi({{&L.wq, &qfull}, {&L.wk, &k}, {&L.wv, &v}, {&L.idx_k, &kraw}}, mixed, T);
         emit("Qcur_full", il, qfull.get(), n_past, T, 2 * fc::kHeads * fc::kHeadDim);
         fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
                       q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), d_step.as<std::int64_t>(), T,
                       cfg.rms_eps, stream);
         emit("Qcur", il, q.get(), n_past, T, fc::kHeads * fc::kHeadDim);
-        linear(L.idx_k, mixed, kraw, T);
         emit("indexer_k_raw", il, kraw.get(), n_past, T, fc::kIdxDim);
         fc::store_rows(kraw.as<float>(), L.idx_raw.as<float>(), d_step.as<std::int64_t>(), fc::kIdxDim, T, stream);
         if (T <= fc::kMaxTokens) {
@@ -638,11 +646,9 @@ struct Engine::Impl {
         fc::moe_slots(ids.as<std::int32_t>(), C.dmap.as<std::int32_t>(), slots.as<std::int32_t>(), T, stream);
         fc::experts_gpu(C.lay, C.pool.as<std::uint8_t>(), slots.as<std::int32_t>(), wts.as<float>(), mixed.as<float>(), eh.as<float>(),
                         ypairs.as<float>(), T, stream);
-        gemv(L.sh_gate, mixed, sh_g, T);
-        gemv(L.sh_up, mixed, sh_u, T);
+        linear_multi({{&L.sh_gate, &sh_g}, {&L.sh_up, &sh_u}, {&L.sh_gate_inp, &sg}}, mixed, T);
         fc::swiglu(sh_g.as<float>(), sh_u.as<float>(), sh_h.as<float>(), T * fc::kFfShared, stream);
         gemv(L.sh_down, sh_h, sd, T);
-        gemv(L.sh_gate_inp, mixed, sg, T);
         fc::link_wait(link_d + il, dseq, moe.as<float>(), T, d_error.as<int>(), stream);
         fc::moe_combine(ypairs.as<float>(), moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
     }

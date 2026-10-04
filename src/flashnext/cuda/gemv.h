@@ -41,4 +41,13 @@ DeviceWeight upload_gemv_weight(const GgufTensor & t);
 // x: device FP32 [T][K], y: device FP32 [T][N]. T in 1..4. Asynchronous on `stream`.
 void gemv(const GpuWeight & w, const float * x, float * y, int tokens, cudaStream_t stream);
 
+// Up to kMaxMulti matrices that read the same input, in one launch: a decode step has many small
+// products, and each separate kernel pays its own ramp-up and tail. Same results as gemv(), bit for bit.
+constexpr int kMaxMulti = 4;
+struct GemvTarget {
+    const GpuWeight * w = nullptr;
+    float * y = nullptr;
+};
+void gemv_multi(const GemvTarget * targets, int count, const float * x, int tokens, cudaStream_t stream);
+
 }  // namespace ninfer::flashnext::cuda

@@ -125,6 +125,34 @@ int main(int argc, char ** argv) {
         double & wv = worst[kind_of(t.name) + " " + type_name(t.type) + " " + std::to_string(w.k) + "->" + std::to_string(w.n)];
         wv = std::max(wv, rel);
     }
+    // gemv_multi: groups of up to 4 matrices with the same input length must equal separate gemv calls
+    {
+        std::map<int, std::vector<std::size_t>> by_k;
+        for (std::size_t i = 0; i < mats.size(); ++i) by_k[dev[i].view.k].push_back(i);
+        int groups = 0, differ = 0;
+        fc::DeviceBuffer ym(4 * std::size_t(4) * max_n * 4);
+        for (const auto & [kk, idx] : by_k) {
+            for (std::size_t g0 = 0; g0 < idx.size() && groups < 64; g0 += 4, ++groups) {
+                const std::size_t cnt = std::min<std::size_t>(4, idx.size() - g0);
+                fc::GemvTarget tg[4];
+                for (std::size_t j = 0; j < cnt; ++j) tg[j] = {&dev[idx[g0 + j]].view, ym.as<float>() + j * 4 * std::size_t(max_n)};
+                for (int nt = 1; nt <= 4; ++nt) {
+                    fc::gemv_multi(tg, int(cnt), dx.as<float>(), nt, nullptr);
+                    for (std::size_t j = 0; j < cnt; ++j) {
+                        const fc::GpuWeight & w = dev[idx[g0 + j]].view;
+                        fc::gemv(w, dx.as<float>(), dy.as<float>(), nt, nullptr);
+                        std::vector<float> a(std::size_t(nt) * w.n), b(a.size());
+                        fc::check(cudaMemcpy(a.data(), tg[j].y, a.size() * 4, cudaMemcpyDeviceToHost), "multi");
+                        fc::check(cudaMemcpy(b.data(), dy.get(), b.size() * 4, cudaMemcpyDeviceToHost), "single");
+                        differ += std::memcmp(a.data(), b.data(), a.size() * 4) != 0;
+                    }
+                }
+            }
+        }
+        printf("gemv_multi: %d groups x 1..4 tokens, %d results differ from gemv\n", groups, differ);
+        failures += differ;
+    }
+
     printf("\naccuracy (worst relative error over sampled rows, 1..4 tokens):\n");
     for (const auto & [k, v] : worst) printf("  %-52s %.2e\n", k.c_str(), v);
 
