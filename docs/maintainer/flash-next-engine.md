@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next in NInfer Extreme
 
-Status: the engine runs end to end (decode and prompts up to 2,051 tokens), 2026-10-04.
+Status: the engine runs end to end at full context with speculative decoding, 2026-10-04.
 
 This document plans a Flash-Next runtime tailored to one machine: an RTX 4090 that also drives the
 desktop (about 22.5 GiB usable), a Ryzen 9 7950X (16 cores, AVX-512 with VNNI), and 192 GiB of
@@ -97,32 +97,65 @@ routing predicts its continuation well: on a 2,000-token code prompt, decode hit
 
 ### 3.5 Prompts
 
-Chunks of up to 512 tokens: dense layers as exact FP32 GEMMs (each matrix dequantized into a scratch
-buffer, cuBLAS SGEMM without TF32), the DeltaNet recurrence over the whole chunk, and the experts
-split between the GPU cache and the CPU. Batched expert kernels (GPU and CPU) and batched attention
-are in progress; until then prompts run at about 75 tok/s.
+Chunks of 512 to 2,048 tokens (`prefill_chunk`):
+- dense layers as exact FP32 GEMMs (each matrix dequantized into a scratch buffer, cuBLAS SGEMM
+  without TF32);
+- the DeltaNet recurrence over the whole chunk;
+- cached experts as tensor-core GEMMs grouped by expert (`experts_gpu_batch`: exact weights,
+  activations as two fp16 terms, 4e-7 relative error, bitwise reproducible);
+- the other experts on the CPU (`CpuExperts::run_batch`: each expert read from RAM once per chunk,
+  register-tiled VNNI micro-kernels), concurrently;
+- the expert cache re-ranked between chunks, since a chunk's routing predicts the rest of the prompt.
 
-## 4. Measurements (RTX 4090 + Ryzen 9 7950X, decode, short context)
+### 3.6 Long context: QSA
 
-| Configuration | Decode |
+Every attention layer keeps pooled indexer keys for blocks of 4 tokens; each query selects its 2,051
+cells (the best blocks by the indexer score, ties to the lower block, plus its own incomplete block)
+and attention is gathered over them (`cuda/qsa.cu`). Given the same inputs, selections are identical to
+the FP32 reference. Decode costs 0.05 to 0.1 ms per attention layer even at 262K context. Raw indexer
+keys live in a ring of a step's worth (a block needs them only until it is complete).
+
+### 3.7 Speculative decoding (MTP)
+
+The MTP head (shared-Q8_0 GGUF) is one more layer fed with the main model's last hidden streams and the
+next token's embedding. `draft(next, k)` proposes tokens, `forward({next, drafts...}, true)` verifies
+them in one step, and `rollback(n)` keeps the accepted prefix: DeltaNet conv and recurrent states are
+kept after each token of a 2 to 4 token step and the PLE history is rebuilt, so rejected drafts are
+undone exactly. Before every step the MTP layer catches up on the main model's tokens with their true
+hidden states, so drafts always attend to exact entries. Its 512 experts stay in VRAM (2.5 GB).
+
+### 3.8 Serving state
+
+`snapshot()` / `restore()` save and return to the recurrent state after a token sequence (116 MiB, about
+20 ms); attention keys stay in the caches by position, and restore checks they still hold the
+snapshot's tokens. A server reuses a conversation's prefix this way.
+
+## 4. Measurements (RTX 4090 + Ryzen 9 7950X)
+
+| Configuration | Result |
 |---|---:|
-| llama.cpp fork, CPU experts, no MTP | 18.6 tok/s |
-| llama.cpp fork, 68-slot GPU expert cache, MTP 2 | 43.7 tok/s |
-| This engine, every expert on the CPU | 19.0 tok/s |
-| This engine, 15 GiB expert cache (69% hits), kernels launched one by one | 40.1 tok/s |
-| This engine, 15 GiB expert cache (69% hits), one CUDA graph per step | **56.0 tok/s** |
+| llama.cpp fork: decode with a 68-slot GPU expert cache and MTP 2 | 43.7 tok/s |
+| llama.cpp fork: prompt processing | 240 to 280 tok/s |
+| This engine: decode, every expert on the CPU | 19.0 tok/s |
+| This engine: decode, 15 GiB expert cache, one CUDA graph per step (code prompt, 66 to 69% hits) | 54 to 56 tok/s |
+| This engine: decode after a 2,600-token prompt (cache re-ranked, 85 to 92% hits) | 63 to 69 tok/s |
+| This engine: greedy decode with MTP, 2 to 3 drafts (chat prompt, 72 to 84% accepted) | **78 tok/s** |
+| This engine: prompt processing, 2,600 tokens, 512- and 1,024-token chunks | 427 and 512 tok/s |
+| This engine: prompt processing, 7,800 tokens, 2,048-token chunks | **757 tok/s** |
 
 Profile of one decode token at about 66% cache hits (Nsight Systems): about 9.3 ms waiting for the
 CPU's experts and about 10 ms of GPU kernels (5.1 ms dense GEMVs at about 850 GB/s, 1.9 ms cached
 experts, 0.6 ms output head, about 2 ms of small kernels).
 
+Measured and rejected: letting the GPU read a share of each step's cache misses straight from host
+memory. Those reads draw on the same DRAM bandwidth as the CPU experts; a 30% share made decode 2.7x
+slower.
+
 ## 5. Next
 
-1. Long context: QSA selection and gathered attention on the GPU (beyond 2,051 tokens).
-2. Prompt speed: batched GPU expert GEMMs over the cache, a batched CPU expert mode, batched
-   attention. Target: thousands of tokens per second.
-3. Split each layer's cache misses between the CPU (RAM, about 52 GB/s) and the GPU reading the same
-   bytes over PCIe (about 22 GB/s): about a third less waiting.
-4. 16-bit activations for the CPU experts (quality), MTP (10 to 20% at today's miss cost).
-5. Serving through NInfer's OpenAI/Anthropic server and Qwen frontend; Pi profile; evaluation;
-   higher-precision expert quantizations within the RAM budget.
+1. Serving through NInfer's OpenAI/Anthropic server and Qwen frontend, with prefix reuse and MTP.
+2. 16-bit activations for the CPU experts (removes the main deviation from exact math).
+3. Cache swaps from the CPU's resident copy of the experts (exact inverse repack) instead of the
+   memory-mapped GGUF.
+4. Fewer VRAM bytes for the MTP layer's experts, and a Pi profile, evaluation, and higher-precision
+   expert quantizations within the RAM budget.

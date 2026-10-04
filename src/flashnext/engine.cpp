@@ -165,6 +165,10 @@ struct Engine::Impl {
         Pinned<std::int64_t> h_step{1};
         Pinned<std::int32_t> h_tok{1};
         std::int64_t pos = 0;
+        cudaGraphExec_t graph = nullptr;  // the single-token draft pass
+        ~Mtp() {
+            if (graph) cudaGraphExecDestroy(graph);
+        }
     };
     std::unique_ptr<Mtp> mtp;
     // the main model's hidden rows of the last step (in res): rows [0, rows_valid) at positions rows_pos0..
@@ -439,9 +443,37 @@ struct Engine::Impl {
     // pair is returned.
     std::int32_t mtp_pass(int T, std::int64_t pos0, bool want_draft) {
         Mtp & M = *mtp;
+        M.h_step.get()[0] = pos0;
+        if (T == 1 && want_draft && opt.cuda_graphs) {
+            // a draft pass is replayed as one CUDA graph (positions and inputs come from pinned memory)
+            if (!M.graph) {
+                cudaGraph_t g = nullptr;
+                check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "MTP capture");
+                try {
+                    mtp_enqueue(1, true);
+                } catch (...) {
+                    cudaStreamEndCapture(stream, &g);
+                    if (g) cudaGraphDestroy(g);
+                    throw;
+                }
+                check(cudaStreamEndCapture(stream, &g), "MTP capture");
+                const cudaError_t err = cudaGraphInstantiate(&M.graph, g, 0);
+                cudaGraphDestroy(g);
+                check(err, "MTP graph");
+            }
+            check(cudaGraphLaunch(M.graph, stream), "MTP graph");
+        } else {
+            mtp_enqueue(T, want_draft);
+        }
+        if (!want_draft) return -1;
+        check(cudaStreamSynchronize(stream), "draft");
+        return M.h_tok.get()[0];
+    }
+
+    void mtp_enqueue(int T, bool want_draft) {
+        Mtp & M = *mtp;
         Layer & L = M.L;
         const std::int64_t * pos = M.step.as<std::int64_t>();
-        M.h_step.get()[0] = pos0;
         check(cudaMemcpyAsync(M.step.get(), M.h_step.get(), sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "MTP step");
         check(cudaMemcpyAsync(M.e_in.get(), M.h_e->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "MTP embed");
         // inputs: per-stream RMSNorm of the hidden streams, RMSNorm of the embedding, concatenated per stream
@@ -478,13 +510,11 @@ struct Engine::Impl {
                             out.as<float>() + xo, n, stream);
         }
         fc::hc_combine(M.res.as<float>(), out.as<float>(), inject.as<float>(), T, stream);
-        if (!want_draft) return -1;
+        if (!want_draft) return;
         hc_mix(M.head_norm, M.head_down, M.head_up, nullptr, 1, T - 1, M.res.as<float>());
         gemv(output, mixed, logits, 1);
         fc::argmax(logits.as<float>(), cfg.n_vocab, M.dtok.as<std::int32_t>(), stream);
         check(cudaMemcpyAsync(M.h_tok.get(), M.dtok.get(), sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream), "draft");
-        check(cudaStreamSynchronize(stream), "draft");
-        return M.h_tok.get()[0];
     }
 
     void mtp_embed(int t, std::int32_t token) {
