@@ -155,7 +155,7 @@ __global__ void k_ple_conv_add(float * __restrict__ res, const float * __restric
 
 // One block per head of 128 channels (32 q/k heads, then 48 v heads).
 __global__ void __launch_bounds__(kDnState) k_dn_conv(const float * __restrict__ qkv, float * __restrict__ state, const float * __restrict__ w,
-                                                      float * __restrict__ out, int T, float eps) {
+                                                      float * __restrict__ out, int T, float eps, float * __restrict__ snap) {
     __shared__ float sh[32];
     const int c = blockIdx.x * kDnState + threadIdx.x;
     const bool qk = blockIdx.x < 2 * kDnKHeads;
@@ -174,6 +174,12 @@ __global__ void __launch_bounds__(kDnState) k_dn_conv(const float * __restrict__
         s0 = s1;
         s1 = s2;
         s2 = x;
+        if (snap && t + 1 < T) {
+            float * sp = snap + std::size_t(t) * 3 * kDnConvDim;
+            sp[c] = s0;
+            sp[kDnConvDim + c] = s1;
+            sp[2 * kDnConvDim + c] = s2;
+        }
     }
     state[c] = s0;
     state[kDnConvDim + c] = s1;
@@ -188,7 +194,7 @@ __global__ void __launch_bounds__(kDnThreads) k_dn_recurrence(const float * __re
                                                               const float * __restrict__ beta, const float * __restrict__ alpha,
                                                               const float * __restrict__ dt, const float * __restrict__ a,
                                                               const float * __restrict__ norm_w, float * __restrict__ S,
-                                                              float * __restrict__ out, int T, float eps) {
+                                                              float * __restrict__ out, int T, float eps, float * __restrict__ snap) {
     __shared__ float o_sh[kDnState];
     __shared__ float sh[32];
     const int h = blockIdx.x, hk = h % kDnKHeads;
@@ -222,6 +228,11 @@ __global__ void __launch_bounds__(kDnThreads) k_dn_recurrence(const float * __re
         if (threadIdx.x < kDnState) {
             const std::size_t i = std::size_t(t) * kDnVDim + h * kDnState + threadIdx.x;
             out[i] = ((o * rs) * norm_w[threadIdx.x]) * sigmoidf_(z[i]);
+        }
+        if (snap && t + 1 < T) {
+            float4 * sp = reinterpret_cast<float4 *>(snap + (std::size_t(t) * kDnVHeads + h) * kDnState * kDnState);
+#pragma unroll
+            for (int r = 0; r < kDnRowsPerWarp; ++r) sp[(warp * kDnRowsPerWarp + r) * (kDnState / 4) + lane] = st[r];
         }
     }
 #pragma unroll
@@ -443,6 +454,71 @@ __global__ void k_ffn_combine(const float * __restrict__ moe, const float * __re
     if (i < n) out[i] = moe[i] + shared[i] * sigmoidf_(sg[i / kEmbd]);
 }
 
+__global__ void k_ple_hist_rebuild(const float * __restrict__ prev, const float * __restrict__ normalized, float * __restrict__ hist,
+                                   int n_keep) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= kHcd) return;
+    for (int j = 0; j < kPleHist; ++j) {
+        const int r = n_keep - kPleHist + j;  // row of [prev | normalized] relative to the step's first token
+        hist[std::size_t(j) * kHcd + ch] = r < 0 ? prev[std::size_t(kPleHist + r) * kHcd + ch] : normalized[std::size_t(r) * kHcd + ch];
+    }
+}
+
+__global__ void __launch_bounds__(256) k_rms_norm_rows(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
+                                                       int n, float eps) {
+    __shared__ float sh[32];
+    const float * xr = x + std::size_t(blockIdx.x) * n;
+    float * yr = y + std::size_t(blockIdx.x) * n;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += 256) ss += xr[i] * xr[i];
+    const float scale = 1.0f / sqrtf(block_sum(ss, sh) / float(n) + eps);
+    for (int i = threadIdx.x; i < n; i += 256) yr[i] = (xr[i] * scale) * w[i];
+}
+
+__global__ void k_mtp_concat(const float * __restrict__ e, const float * __restrict__ h, float * __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int t = i / (kHc * 2 * kEmbd), rem = i % (kHc * 2 * kEmbd), c = rem / (2 * kEmbd), j = rem % (2 * kEmbd);
+    out[i] = j < kEmbd ? e[std::size_t(t) * kEmbd + j] : h[(std::size_t(t) * kHc + c) * kEmbd + (j - kEmbd)];
+}
+
+__global__ void k_window_cells(const std::int64_t * __restrict__ pos0p, int width, std::int32_t * __restrict__ cells,
+                               std::int32_t * __restrict__ n_cells) {
+    const std::int64_t p = *pos0p + blockIdx.x;
+    const std::int64_t n = p + 1 < width ? p + 1 : width, first = p + 1 - n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) cells[std::size_t(blockIdx.x) * width + i] = std::int32_t(first + i);
+    if (threadIdx.x == 0) n_cells[blockIdx.x] = std::int32_t(n);
+}
+
+__global__ void __launch_bounds__(1024) k_argmax(const float * __restrict__ x, int n, std::int32_t * __restrict__ out) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    float v = -INFINITY;
+    int idx = n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (x[i] > v) { v = x[i]; idx = i; }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+        if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+    }
+    if (lane == 0) { bv[warp] = v; bi[warp] = idx; }
+    __syncthreads();
+    if (warp == 0) {
+        v = lane < int(blockDim.x / 32) ? bv[lane] : -INFINITY;
+        idx = lane < int(blockDim.x / 32) ? bi[lane] : n;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+            if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+        }
+        if (lane == 0) *out = idx;
+    }
+}
+
 __global__ void k_store_rows(const float * __restrict__ src, float * __restrict__ dst, const std::int64_t * __restrict__ pos0p, int row,
                              int n, std::int64_t ring) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -570,13 +646,13 @@ void ple_conv_add(float * res, const float * gated, const float * normalized, co
     launched("ple_conv_add");
 }
 
-void dn_conv(const float * qkv, float * conv_state, const float * conv_w, float * out, int T, float eps, cudaStream_t s) {
-    k_dn_conv<<<kDnConvDim / kDnState, kDnState, 0, s>>>(qkv, conv_state, conv_w, out, T, eps);
+void dn_conv(const float * qkv, float * conv_state, const float * conv_w, float * out, int T, float eps, cudaStream_t s, float * snap) {
+    k_dn_conv<<<kDnConvDim / kDnState, kDnState, 0, s>>>(qkv, conv_state, conv_w, out, T, eps, snap);
     launched("dn_conv");
 }
 void dn_recurrence(const float * conv_out, const float * z, const float * beta, const float * alpha, const float * dt_bias,
-                   const float * a, const float * norm_w, float * S, float * out, int T, float eps, cudaStream_t s) {
-    k_dn_recurrence<<<kDnVHeads, kDnThreads, 0, s>>>(conv_out, z, beta, alpha, dt_bias, a, norm_w, S, out, T, eps);
+                   const float * a, const float * norm_w, float * S, float * out, int T, float eps, cudaStream_t s, float * snap) {
+    k_dn_recurrence<<<kDnVHeads, kDnThreads, 0, s>>>(conv_out, z, beta, alpha, dt_bias, a, norm_w, S, out, T, eps, snap);
     launched("dn_recurrence");
 }
 
@@ -625,6 +701,28 @@ void link_signal(const std::int32_t * ids, const float * weights, const std::uin
 void link_wait(ExpertLink * link, const std::int64_t * seq, float * out, int T, int * error, cudaStream_t s) {
     k_link_wait<<<1, 256, 0, s>>>(link, seq, out, T, error);
     launched("link_wait");
+}
+
+void ple_hist_rebuild(const float * prev, const float * normalized, float * hist, int n_keep, cudaStream_t s) {
+    k_ple_hist_rebuild<<<blocks(kHcd, 256), 256, 0, s>>>(prev, normalized, hist, n_keep);
+    launched("ple_hist_rebuild");
+}
+void rms_norm_rows(const float * x, const float * w, float * y, int rows, int n, float eps, cudaStream_t s) {
+    k_rms_norm_rows<<<rows, 256, 0, s>>>(x, w, y, n, eps);
+    launched("rms_norm_rows");
+}
+void mtp_concat(const float * e, const float * h, float * out, int T, cudaStream_t s) {
+    const int n = T * kHc * 2 * kEmbd;
+    k_mtp_concat<<<blocks(n, 256), 256, 0, s>>>(e, h, out, n);
+    launched("mtp_concat");
+}
+void window_cells(const std::int64_t * pos0, int T, int width, std::int32_t * cells, std::int32_t * n_cells, cudaStream_t s) {
+    k_window_cells<<<T, 256, 0, s>>>(pos0, width, cells, n_cells);
+    launched("window_cells");
+}
+void argmax(const float * x, int n, std::int32_t * out, cudaStream_t s) {
+    k_argmax<<<1, 1024, 0, s>>>(x, n, out);
+    launched("argmax");
 }
 
 void init_kernels() {

@@ -3,7 +3,7 @@
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
-//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot]
+//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot] [--mtp mtp.gguf [--draft K]]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
@@ -85,6 +85,10 @@ std::vector<Top> top_k(const float * logits, std::size_t n, int k) {
     return out;
 }
 
+std::int32_t argmax(const float * x, std::size_t n) {
+    return std::int32_t(std::max_element(x, x + n) - x);  // first of equal maxima, like top_k
+}
+
 double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -122,6 +126,7 @@ static int run(int argc, char ** argv) {
     std::string model_path, tokens_arg, tokens_file, json_path, dump_dir;
     int n_gen = 16;
     bool compare_ref = false, test_snapshot = false;
+    int n_draft = 2;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -145,6 +150,8 @@ static int run(int argc, char ** argv) {
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--test-snapshot") test_snapshot = true;
         else if (a == "--no-host-images") opt.host_expert_images = false;
+        else if (a == "--mtp") opt.mtp_path = next();
+        else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--gpu-miss-permille") opt.gpu_miss_permille = std::stoi(next());
         else throw std::runtime_error("unknown argument " + a);
     }
@@ -293,6 +300,55 @@ static int run(int argc, char ** argv) {
     std::vector<double> step_times;
     const EngineStats after_prompt = engine.stats();
     const std::size_t V = std::size_t(engine.n_vocab());
+    if (engine.has_mtp() && n_draft > 0) {
+        // greedy speculative decoding: draft with the MTP head, verify in one step, keep the agreed prefix
+        std::int32_t tok = top_k(logits.data(), V, 1)[0].id;
+        int steps = 0, drafted = 0, accepted = 0;
+        double draft_s = 0, verify_s = 0;
+        const double cpu0 = engine.stats().cpu_experts_ms;
+        auto ts = std::chrono::steady_clock::now();
+        while (int(generated.size()) < n_gen) {
+            generated.push_back(tok);
+            if (int(generated.size()) == n_gen) break;
+            std::vector<std::int32_t> seq{tok};
+            auto td = std::chrono::steady_clock::now();
+            const std::vector<std::int32_t> d = engine.draft(tok, n_draft);
+            draft_s += seconds_since(td);
+            seq.insert(seq.end(), d.begin(), d.end());
+            auto tv = std::chrono::steady_clock::now();
+            const std::vector<float> lg = engine.forward(seq, true);
+            verify_s += seconds_since(tv);
+            int keep = 1;
+            std::int32_t next = argmax(lg.data(), V);
+            for (std::size_t i = 0; i < d.size() && next == d[i]; ++i) {
+                generated.push_back(d[i]);
+                ++keep;
+                next = argmax(lg.data() + std::size_t(keep - 1) * V, V);
+            }
+            engine.rollback(keep);
+            ++steps;
+            drafted += int(d.size());
+            accepted += keep - 1;
+            tok = next;
+        }
+        const double total = seconds_since(ts);
+        if (int(generated.size()) > n_gen) generated.resize(std::size_t(n_gen));
+        std::printf("generated:");
+        for (std::int32_t id : generated) std::printf(" %d", id);
+        std::printf("\nMTP decode: %zu tokens in %d steps, %.2f ms/token (%.2f tok/s); drafts accepted %d/%d (%.1f%%), %.2f tokens per step\n",
+                    generated.size(), steps, 1e3 * total / double(generated.size()), double(generated.size()) / total, accepted, drafted,
+                    100.0 * accepted / std::max(1, drafted), double(generated.size()) / std::max(1, steps));
+        std::printf("per step: draft %.2f ms, verify %.2f ms (CPU experts %.2f ms), other %.2f ms\n", 1e3 * draft_s / steps, 1e3 * verify_s / steps,
+                    (engine.stats().cpu_experts_ms - cpu0) / steps, 1e3 * (total - draft_s - verify_s) / steps);
+        if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
+        if (!json_path.empty()) {
+            std::ofstream f(json_path);
+            f << "{\n  \"prompt_tokens\": " << prompt.size() << ",\n  \"tokens\": [";
+            for (std::size_t i = 0; i < generated.size(); ++i) f << (i ? ", " : "") << generated[i];
+            f << "]\n}\n";
+        }
+        return 0;
+    }
     for (int step = 0; step < n_gen; ++step) {
         std::vector<Top> top = top_k(logits.data(), V, 5);
         const std::int32_t next = top[0].id;

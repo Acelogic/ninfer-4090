@@ -68,10 +68,28 @@ void ple_conv_add(float * res, const float * gated, const float * normalized, co
 
 // ---- Gated DeltaNet ----
 // conv over [state | qkv] (kernel 4) then SiLU; q and k heads L2-normalised; state updated.
-void dn_conv(const float * qkv, float * conv_state, const float * conv_w, float * out, int T, float eps, cudaStream_t s);
+// snap (optional): [T-1][3][conv dim], the state after each token but the last (for rolling back
+// rejected draft tokens).
+void dn_conv(const float * qkv, float * conv_state, const float * conv_w, float * out, int T, float eps, cudaStream_t s,
+             float * snap = nullptr);
 // Gated delta rule per v head (k/q head h % 16), then RMSNorm(o) * norm_w * sigmoid(z). S: [48][128][128].
+// snap (optional): [T-1][48][128][128], S after each token but the last.
 void dn_recurrence(const float * conv_out, const float * z, const float * beta, const float * alpha, const float * dt_bias,
-                   const float * a, const float * norm_w, float * S, float * out, int T, float eps, cudaStream_t s);
+                   const float * a, const float * norm_w, float * S, float * out, int T, float eps, cudaStream_t s,
+                   float * snap = nullptr);
+// PLE history after keeping only the first n_keep of the last step's T tokens: the last 9 rows of
+// [prev (the history before that step) | normalized[0 .. n_keep)].
+void ple_hist_rebuild(const float * prev, const float * normalized, float * hist, int n_keep, cudaStream_t s);
+
+// ---- MTP ----
+// y[r] = RMSNorm(x[r]) * w over rows of n (n a multiple of 32)
+void rms_norm_rows(const float * x, const float * w, float * y, int rows, int n, float eps, cudaStream_t s);
+// out[t][c] = [e[t] | h[t][c]] for the 4 hyper-connection streams: [T][4][2 * 2560]
+void mtp_concat(const float * e, const float * h, float * out, int T, cudaStream_t s);
+// cells[t] = the last min(p + 1, 2051) positions up to p = pos0 + t; n_cells[t] = their count
+void window_cells(const std::int64_t * pos0, int T, int width, std::int32_t * cells, std::int32_t * n_cells, cudaStream_t s);
+// index of the largest of n values (ties to the lower index)
+void argmax(const float * x, int n, std::int32_t * out, cudaStream_t s);
 
 // ---- full attention ----
 // Positions are read from device memory (pos0: the first token's position) so that a decode step

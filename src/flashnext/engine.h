@@ -29,6 +29,7 @@ struct EngineOptions {
     // 30% share made decode 2.7x slower), and pinning 55 GB more puts the machine under memory pressure.
     bool host_expert_images = false;
     int gpu_miss_permille = 0;            // share of each step's cache misses the GPU reads from host memory
+    std::string mtp_path;                 // the MTP head's GGUF (shared-Q8_0 variant) for draft tokens; "" = none
 };
 
 // Named intermediate activations, row-major [n_tokens][width], with the same names and layout as
@@ -84,6 +85,16 @@ public:
     const EngineStats & stats() const;
     // Writes the routing counts (the loaded ones plus everything seen since) for the next start.
     void save_routing_stats(const std::string & path) const;
+
+    // Speculative decoding with the model's MTP head (EngineOptions::mtp_path). draft() proposes k
+    // tokens to follow `next`, the token the caller feeds next; verify them with
+    // forward({next, drafts...}, true) and keep the accepted prefix with rollback(n), where n counts
+    // `next` itself. The MTP layer's own cache is kept in step with the main model automatically.
+    bool has_mtp() const;
+    std::vector<std::int32_t> draft(std::int32_t next, int k);
+    // Undoes all but the first n_keep tokens of the last forward() call, which must have had at most
+    // 4 tokens (1 <= n_keep <= that count). Needs MTP to be enabled (it keeps the per-token states).
+    void rollback(int n_keep);
 
     struct Impl;
 

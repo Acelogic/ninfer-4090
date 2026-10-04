@@ -118,6 +118,7 @@ struct Engine::Impl {
         fc::DeviceBuffer ple_nk, ple_nq, ple_nc, ple_conv;
         fc::DeviceWeight router, sh_gate, sh_up, sh_down, sh_gate_inp;  // FFN
         fc::DeviceBuffer conv_state, S, k_cache, v_cache, idx_raw, blocks;  // state
+        fc::DeviceBuffer conv_snap, S_snap;  // DeltaNet states after each token of a step but the last (rollback)
     };
     std::vector<Layer> layers;
     fc::DeviceWeight output, out_hc_down, out_hc_up;
@@ -150,6 +151,30 @@ struct Engine::Impl {
         std::vector<std::int32_t> map;
     };
     std::vector<LayerCache> cache;
+    // MTP head: one more layer (attention + MoE, every expert in VRAM) fed with the main model's last
+    // hidden streams and the next token's embedding. Its KV cache holds positions [0, pos) computed
+    // from the main model's hidden states; draft positions beyond are scratch, overwritten later.
+    struct Mtp {
+        std::unique_ptr<GgufModel> gguf;
+        Layer L;
+        fc::DeviceWeight eh_proj, head_down, head_up;
+        fc::DeviceBuffer enorm, hnorm, head_norm;
+        LayerCache experts;  // all 512, slot = expert id
+        fc::DeviceBuffer step, pending_h, h_in, e_in, en, hn, cat, res, dtok;
+        std::unique_ptr<Pinned<float>> h_e;
+        Pinned<std::int64_t> h_step{1};
+        Pinned<std::int32_t> h_tok{1};
+        std::int64_t pos = 0;
+    };
+    std::unique_ptr<Mtp> mtp;
+    // the main model's hidden rows of the last step (in res): rows [0, rows_valid) at positions rows_pos0..
+    std::int64_t rows_pos0 = 0;
+    int rows_valid = 0;
+    // rollback of the last step (when MTP is on and the step had at most kMaxTokens tokens)
+    bool snaps_valid = false;
+    int last_T = 0;
+    fc::DeviceBuffer ple_hist_prev;
+
     // pinned images of every expert in the GPU layout, [layer][expert]; device addresses for zero-copy
     std::vector<std::uint8_t *> images, images_d;
     fc::DeviceBuffer host_slots, ypairs_host, plan_oncpu;
@@ -190,6 +215,7 @@ struct Engine::Impl {
         fc::experts_batch_init();
         load();
         allocate();
+        if (!opt.mtp_path.empty()) load_mtp();
         experts = std::make_unique<CpuExperts>(model, CpuExpertsConfig{opt.cpu_threads, {}});
         counts.assign(std::size_t(cfg.n_layer) * fc::kExperts, 0);
         recent.assign(counts.size(), 0.0);
@@ -323,6 +349,215 @@ struct Engine::Impl {
             }
         stats.cache_swaps += std::int64_t(swaps.size());
         stats.cache_swap_ms += std::chrono::duration<double, std::milli>(clk::now() - t_adapt).count();
+    }
+
+    void load_mtp() {
+        mtp = std::make_unique<Mtp>();
+        Mtp & M = *mtp;
+        M.gguf = std::make_unique<GgufModel>(std::vector<std::string>{opt.mtp_path});
+        const GgufModel & g = *M.gguf;
+        const int il = cfg.n_layer, E = fc::kEmbd, HCD = fc::kHcd, R = fc::kHcRank;
+        if (!g.has("qwen4exp.nextn_predict_layers") || g.get_int("qwen4exp.nextn_predict_layers") != 1)
+            throw std::runtime_error("engine: " + opt.mtp_path + " is not a single-layer qwen4exp MTP head");
+        const std::string b = "blk." + std::to_string(il) + ".";
+        auto W = [&](const std::string & name, int k, int n) {
+            fc::DeviceWeight w = fc::upload_gemv_weight(g.tensor(name));
+            if (w.view.k != k || w.view.n != n) throw std::runtime_error("engine: unexpected shape for MTP " + name);
+            return w;
+        };
+        auto V = [&](const std::string & name, std::int64_t n) { return upload_f32(g.tensor(name), n); };
+        Layer & L = M.L;
+        L.hc_attn_norm = V(b + "hc_attn_norm.weight", HCD);
+        L.hc_ffn_norm = V(b + "hc_ffn_norm.weight", HCD);
+        L.hc_attn_down = W(b + "hc_attn_down.weight", HCD, R);
+        L.hc_attn_up = W(b + "hc_attn_up.weight", R, HCD);
+        L.hc_attn_inject = W(b + "hc_attn_inject.weight", HCD, fc::kHc);
+        L.hc_ffn_down = W(b + "hc_ffn_down.weight", HCD, R);
+        L.hc_ffn_up = W(b + "hc_ffn_up.weight", R, HCD);
+        L.hc_ffn_inject = W(b + "hc_ffn_inject.weight", HCD, fc::kHc);
+        L.wq = W(b + "attn_q.weight", E, 2 * fc::kHeads * fc::kHeadDim);
+        L.wk = W(b + "attn_k.weight", E, fc::kKvHeads * fc::kHeadDim);
+        L.wv = W(b + "attn_v.weight", E, fc::kKvHeads * fc::kHeadDim);
+        L.wo = W(b + "attn_output.weight", fc::kHeads * fc::kHeadDim, E);
+        L.q_norm = V(b + "attn_q_norm.weight", fc::kHeadDim);
+        L.k_norm = V(b + "attn_k_norm.weight", fc::kHeadDim);
+        L.router = W(b + "ffn_gate_inp.weight", E, fc::kExperts);
+        L.sh_gate = W(b + "ffn_gate_shexp.weight", E, fc::kFfShared);
+        L.sh_up = W(b + "ffn_up_shexp.weight", E, fc::kFfShared);
+        L.sh_down = W(b + "ffn_down_shexp.weight", fc::kFfShared, E);
+        L.sh_gate_inp = W(b + "ffn_gate_inp_shexp.weight", E, 1);
+        M.eh_proj = W(b + "nextn.eh_proj.weight", 2 * E, E);
+        M.enorm = V(b + "nextn.enorm.weight", E);
+        M.hnorm = V(b + "nextn.hnorm.weight", HCD);
+        M.head_norm = V(b + "nextn.hc_head_norm.weight", HCD);
+        M.head_down = W(b + "nextn.hc_head_down.weight", HCD, R);
+        M.head_up = W(b + "nextn.hc_head_up.weight", R, HCD);
+        const std::size_t kv = std::size_t(opt.max_ctx) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
+        L.k_cache = zeros(kv);
+        L.v_cache = zeros(kv);
+        // every expert in VRAM: the MTP layer has no CPU path
+        const GgufTensor & ge = g.tensor(b + "ffn_gate_exps.weight");
+        const GgufTensor & ue = g.tensor(b + "ffn_up_exps.weight");
+        const GgufTensor & de = g.tensor(b + "ffn_down_exps.weight");
+        M.experts.lay = fc::expert_layout(ge.type, de.type);
+        M.experts.map.resize(fc::kExperts);
+        M.experts.pool = fc::DeviceBuffer(std::size_t(fc::kExperts) * M.experts.lay.slot_bytes);
+        {
+            Pinned<std::uint8_t> staging(std::size_t(64) * M.experts.lay.slot_bytes);
+            for (int e0 = 0; e0 < fc::kExperts; e0 += 64) {
+                std::vector<std::thread> workers;
+                for (int t = 0; t < 16; ++t)
+                    workers.emplace_back([&, t] {
+                        for (int e = e0 + t; e < e0 + 64; e += 16)
+                            fc::pack_expert(M.experts.lay, ge, ue, de, e, staging.get() + std::size_t(e - e0) * M.experts.lay.slot_bytes);
+                    });
+                for (auto & w : workers) w.join();
+                check(cudaMemcpy(M.experts.pool.as<std::uint8_t>() + std::size_t(e0) * M.experts.lay.slot_bytes, staging.get(),
+                                 std::size_t(64) * M.experts.lay.slot_bytes, cudaMemcpyHostToDevice),
+                      "MTP experts");
+            }
+        }
+        for (int e = 0; e < fc::kExperts; ++e) M.experts.map[std::size_t(e)] = e;
+        M.experts.dmap = fc::DeviceBuffer(fc::kExperts * sizeof(std::int32_t));
+        check(cudaMemcpy(M.experts.dmap.get(), M.experts.map.data(), M.experts.dmap.bytes(), cudaMemcpyHostToDevice), "MTP map");
+        const std::size_t T = std::size_t(cap), f = sizeof(float);
+        M.step = zeros(sizeof(std::int64_t));
+        M.pending_h = zeros(HCD * f);
+        M.h_in = fc::DeviceBuffer(T * HCD * f);
+        M.e_in = fc::DeviceBuffer(T * E * f);
+        M.en = fc::DeviceBuffer(T * E * f);
+        M.hn = fc::DeviceBuffer(T * HCD * f);
+        M.cat = fc::DeviceBuffer(T * fc::kHc * 2 * E * f);
+        M.res = fc::DeviceBuffer(T * HCD * f);
+        M.dtok = fc::DeviceBuffer(sizeof(std::int32_t));
+        M.h_e = std::make_unique<Pinned<float>>(T * E);
+        ple_hist_prev = fc::DeviceBuffer(ple_hist.bytes());
+    }
+
+    // One pass of the MTP layer over T (hidden, token) pairs at positions pos0.. (h_in and the
+    // embeddings in M.h_e are filled by the caller). With want_draft, the head's argmax for the last
+    // pair is returned.
+    std::int32_t mtp_pass(int T, std::int64_t pos0, bool want_draft) {
+        Mtp & M = *mtp;
+        Layer & L = M.L;
+        const std::int64_t * pos = M.step.as<std::int64_t>();
+        M.h_step.get()[0] = pos0;
+        check(cudaMemcpyAsync(M.step.get(), M.h_step.get(), sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "MTP step");
+        check(cudaMemcpyAsync(M.e_in.get(), M.h_e->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "MTP embed");
+        // inputs: per-stream RMSNorm of the hidden streams, RMSNorm of the embedding, concatenated per stream
+        fc::hc_norm(M.h_in.as<float>(), M.hnorm.as<float>(), M.hn.as<float>(), T, cfg.rms_eps, stream);
+        fc::rms_norm_rows(M.e_in.as<float>(), M.enorm.as<float>(), M.en.as<float>(), T, fc::kEmbd, cfg.rms_eps, stream);
+        fc::mtp_concat(M.en.as<float>(), M.hn.as<float>(), M.cat.as<float>(), T, stream);
+        linear(M.eh_proj, M.cat, M.res, T * fc::kHc);  // [T][4] rows of 5120 -> the layer's residual streams
+
+        hc_mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, &L.hc_attn_inject, T, 0, M.res.as<float>());
+        linear_multi({{&L.wq, &qfull}, {&L.wk, &k}, {&L.wv, &v}}, mixed, T);
+        fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
+                      q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), pos, T, cfg.rms_eps, stream);
+        // the most recent 2051 positions (llama.cpp attends densely; drafts are verified either way)
+        fc::window_cells(pos, T, fc::kQsaWidth, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), stream);
+        fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
+                        n_cells.as<std::int32_t>(), T, cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
+        linear(L.wo, att, out, T);
+        fc::hc_combine(M.res.as<float>(), out.as<float>(), inject.as<float>(), T, stream);
+
+        hc_mix(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, &L.hc_ffn_inject, T, 0, M.res.as<float>());
+        linear(L.router, mixed, rlogits, T);
+        fc::router_topk(rlogits.as<float>(), ids.as<std::int32_t>(), wts.as<float>(), T, stream);
+        fc::moe_slots(ids.as<std::int32_t>(), M.experts.dmap.as<std::int32_t>(), slots.as<std::int32_t>(), T, stream);
+        linear_multi({{&L.sh_gate, &sh_g}, {&L.sh_up, &sh_u}, {&L.sh_gate_inp, &sg}}, mixed, T);
+        fc::swiglu(sh_g.as<float>(), sh_u.as<float>(), sh_h.as<float>(), T * fc::kFfShared, stream);
+        linear(L.sh_down, sh_h, sd, T);
+        check(cudaMemsetAsync(moe.get(), 0, std::size_t(T) * fc::kEmbd * sizeof(float), stream), "MTP moe");
+        for (int t0 = 0; t0 < T; t0 += fc::kMaxTokens) {  // the per-pair expert kernels, kMaxTokens tokens at a time
+            const int n = std::min(fc::kMaxTokens, T - t0);
+            const std::size_t xo = std::size_t(t0) * fc::kEmbd, ko = std::size_t(t0) * fc::kUsed;
+            fc::experts_gpu(M.experts.lay, M.experts.pool.as<std::uint8_t>(), slots.as<std::int32_t>() + ko, wts.as<float>() + ko,
+                            mixed.as<float>() + xo, eh.as<float>(), ypairs.as<float>(), n, stream);
+            fc::moe_combine(ypairs.as<float>(), nullptr, moe.as<float>() + xo, sd.as<float>() + xo, sg.as<float>() + t0,
+                            out.as<float>() + xo, n, stream);
+        }
+        fc::hc_combine(M.res.as<float>(), out.as<float>(), inject.as<float>(), T, stream);
+        if (!want_draft) return -1;
+        hc_mix(M.head_norm, M.head_down, M.head_up, nullptr, 1, T - 1, M.res.as<float>());
+        gemv(output, mixed, logits, 1);
+        fc::argmax(logits.as<float>(), cfg.n_vocab, M.dtok.as<std::int32_t>(), stream);
+        check(cudaMemcpyAsync(M.h_tok.get(), M.dtok.get(), sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream), "draft");
+        check(cudaStreamSynchronize(stream), "draft");
+        return M.h_tok.get()[0];
+    }
+
+    void mtp_embed(int t, std::int32_t token) {
+        const std::size_t rb = row_bytes(tok_embd->type, fc::kEmbd);
+        dequantize_row(tok_embd->type, tok_embd->data + std::size_t(token) * rb, mtp->h_e->get() + std::size_t(t) * fc::kEmbd, fc::kEmbd);
+    }
+
+    // Brings the MTP cache up to the main model's tokens: pairs (h of position q-1, token at q) for the
+    // positions not yet covered, using the hidden rows of the last step. Runs before every step.
+    void mtp_catchup() {
+        if (!mtp) return;
+        Mtp & M = *mtp;
+        if (rows_valid <= 0) return;
+        const std::int64_t end = rows_pos0 + rows_valid;
+        if (M.pos < rows_pos0) M.pos = rows_pos0;  // rows lost (e.g. after restore): a gap in the MTP cache
+        const int n = int(end - M.pos);
+        const std::size_t hb = fc::kHcd * sizeof(float);
+        if (n > 0) {
+            for (int i = 0; i < n; ++i) {
+                const std::int64_t q = M.pos + i;
+                const float * src = q - 1 < rows_pos0 ? M.pending_h.as<float>() : res.as<float>() + std::size_t(q - 1 - rows_pos0) * fc::kHcd;
+                check(cudaMemcpyAsync(M.h_in.as<float>() + std::size_t(i) * fc::kHcd, src, hb, cudaMemcpyDeviceToDevice, stream), "MTP h");
+                mtp_embed(i, history[std::size_t(q)]);
+            }
+            mtp_pass(n, M.pos, false);
+            M.pos = end;
+        }
+        // the next pair starts from the hidden state of the last kept position
+        check(cudaMemcpyAsync(M.pending_h.get(), res.as<float>() + std::size_t(rows_valid - 1) * fc::kHcd, hb, cudaMemcpyDeviceToDevice, stream),
+              "MTP h");
+        rows_pos0 = end;
+        rows_valid = 0;
+    }
+
+    std::vector<std::int32_t> draft(std::int32_t next, int k) {
+        if (!mtp) throw std::runtime_error("engine: no MTP head loaded");
+        if (next < 0 || next >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
+        mtp_catchup();
+        Mtp & M = *mtp;
+        std::vector<std::int32_t> out;
+        const std::size_t hb = fc::kHcd * sizeof(float);
+        std::int32_t tok = next;
+        for (int i = 0; i < k; ++i) {
+            // the first pair uses the main model's hidden state; later ones the MTP layer's own output
+            const float * src = i == 0 ? M.pending_h.as<float>() : M.res.as<float>();
+            check(cudaMemcpyAsync(M.h_in.get(), src, hb, cudaMemcpyDeviceToDevice, stream), "MTP h");
+            mtp_embed(0, tok);
+            tok = mtp_pass(1, n_past + i, true);
+            out.push_back(tok);
+        }
+        // the entry at n_past (true hidden state, the token that will be fed) is final
+        M.pos = n_past + 1;
+        return out;
+    }
+
+    void rollback(int n_keep) {
+        if (!snaps_valid || n_keep < 1 || n_keep > last_T) throw std::runtime_error("engine: nothing to roll back to");
+        if (n_keep < last_T) {
+            for (Layer & L : layers) {
+                if (!L.recurrent) continue;
+                check(cudaMemcpyAsync(L.S.get(), L.S_snap.as<std::uint8_t>() + std::size_t(n_keep - 1) * L.S.bytes(), L.S.bytes(),
+                                      cudaMemcpyDeviceToDevice, stream),
+                      "rollback");
+                check(cudaMemcpyAsync(L.conv_state.get(), L.conv_snap.as<std::uint8_t>() + std::size_t(n_keep - 1) * L.conv_state.bytes(),
+                                      L.conv_state.bytes(), cudaMemcpyDeviceToDevice, stream),
+                      "rollback");
+            }
+            if (ple_table) fc::ple_hist_rebuild(ple_hist_prev.as<float>(), ple_norm.as<float>(), ple_hist.as<float>(), n_keep, stream);
+            n_past -= last_T - n_keep;
+            rows_valid = n_keep;
+            if (mtp && mtp->pos > n_past) mtp->pos = n_past;
+        }
+        snaps_valid = false;
     }
 
     void release_experts() {
@@ -502,6 +737,10 @@ struct Engine::Impl {
                 L.ssm_norm = V(b + "ssm_norm.weight", fc::kDnState);
                 L.conv_state = fc::DeviceBuffer(std::size_t(fc::kDnConv - 1) * fc::kDnConvDim * sizeof(float));
                 L.S = fc::DeviceBuffer(std::size_t(fc::kDnVHeads) * fc::kDnState * fc::kDnState * sizeof(float));
+                if (!opt.mtp_path.empty()) {
+                    L.conv_snap = fc::DeviceBuffer((fc::kMaxTokens - 1) * L.conv_state.bytes());
+                    L.S_snap = fc::DeviceBuffer((fc::kMaxTokens - 1) * L.S.bytes());
+                }
             } else {
                 L.wq = W(b + "attn_q.weight", E, 2 * fc::kHeads * fc::kHeadDim);
                 L.wk = W(b + "attn_k.weight", E, fc::kKvHeads * fc::kHeadDim);
@@ -627,6 +866,13 @@ struct Engine::Impl {
         check(cudaMemset(ple_hist.get(), 0, ple_hist.bytes()), "memset");
         history.clear();
         n_past = 0;
+        rows_pos0 = 0;
+        rows_valid = 0;
+        snaps_valid = false;
+        if (mtp) {
+            mtp->pos = 0;
+            check(cudaMemset(mtp->pending_h.get(), 0, mtp->pending_h.bytes()), "memset");
+        }
     }
 
     // recurrent state buffers, in snapshot order
@@ -641,10 +887,12 @@ struct Engine::Impl {
             }
         }
         v.push_back(&ple_hist);
+        if (mtp) v.push_back(&mtp->pending_h);
         return v;
     }
 
     EngineSnapshot snapshot() {
+        mtp_catchup();
         check(cudaStreamSynchronize(stream), "snapshot");
         EngineSnapshot snap;
         snap.tokens.assign(history.begin(), history.begin() + n_past);
@@ -673,6 +921,10 @@ struct Engine::Impl {
             off += b->bytes();
         }
         n_past = std::int64_t(n);
+        rows_pos0 = n_past;
+        rows_valid = 0;
+        snaps_valid = false;
+        if (mtp) mtp->pos = std::min(mtp->pos, n_past);  // pending_h came back with the snapshot
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -709,8 +961,8 @@ struct Engine::Impl {
 
     // hyper-connection mixer over T tokens of res starting at token t0
     void hc_mix(const fc::DeviceBuffer & norm, const fc::DeviceWeight & down, const fc::DeviceWeight & up, const fc::DeviceWeight * inj,
-                int T, int t0 = 0) {
-        fc::hc_norm(res.as<float>() + std::size_t(t0) * fc::kHcd, norm.as<float>(), xn.as<float>(), T, cfg.rms_eps, stream);
+                int T, int t0 = 0, const float * src = nullptr) {
+        fc::hc_norm((src ? src : res.as<float>()) + std::size_t(t0) * fc::kHcd, norm.as<float>(), xn.as<float>(), T, cfg.rms_eps, stream);
         if (inj) linear_multi({{&down, &lo}, {inj, &inject}}, xn, T);
         else linear(down, xn, lo, T);
         fc::hc_lowrank_act(lo.as<float>(), T * fc::kHcRank, stream);
@@ -755,6 +1007,8 @@ struct Engine::Impl {
     }
 
     void run_ple(const Layer & L, int il, int T) {
+        if (mtp && T <= fc::kMaxTokens)  // for rollback(): the history before this step
+            check(cudaMemcpyAsync(ple_hist_prev.get(), ple_hist.get(), ple_hist.bytes(), cudaMemcpyDeviceToDevice, stream), "ple history");
         check(cudaMemcpyAsync(ple_emb.get(), h_ple->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "ple");
         emit("ple_embd", il, ple_emb.get(), n_past, T, fc::kEmbd);
         linear(L.ple_key, ple_emb, ple_key_out, T);
@@ -770,9 +1024,12 @@ struct Engine::Impl {
         linear_multi({{&L.wqkv, &qkv}, {&L.wgate, &z}, {&L.ssm_beta, &beta}, {&L.ssm_alpha, &alpha}}, mixed, T);
         emit("linear_attn_qkv_mixed", il, qkv.get(), n_past, T, fc::kDnConvDim);
         emit("z", il, z.get(), n_past, T, fc::kDnVDim);
-        fc::dn_conv(qkv.as<float>(), L.conv_state.as<float>(), L.conv1d.as<float>(), conv.as<float>(), T, cfg.rms_eps, stream);
+        const bool snap = mtp && T > 1 && T <= fc::kMaxTokens;  // keep per-token states for rollback()
+        fc::dn_conv(qkv.as<float>(), L.conv_state.as<float>(), L.conv1d.as<float>(), conv.as<float>(), T, cfg.rms_eps, stream,
+                    snap ? L.conv_snap.as<float>() : nullptr);
         fc::dn_recurrence(conv.as<float>(), z.as<float>(), beta.as<float>(), alpha.as<float>(), L.dt.as<float>(), L.a.as<float>(),
-                          L.ssm_norm.as<float>(), L.S.as<float>(), dn_out.as<float>(), T, cfg.rms_eps, stream);
+                          L.ssm_norm.as<float>(), L.S.as<float>(), dn_out.as<float>(), T, cfg.rms_eps, stream,
+                          snap ? L.S_snap.as<float>() : nullptr);
         emit("final_output", il, dn_out.get(), n_past, T, fc::kDnVDim);
         linear(L.ssm_out, dn_out, out, T);
     }
@@ -1014,6 +1271,7 @@ struct Engine::Impl {
 
     // T tokens (1..cap; all_logits only up to kMaxTokens); returns logits of the last token or of all T
     std::vector<float> step(const std::int32_t * tokens, int T, bool all_logits) {
+        mtp_catchup();  // the MTP layer consumes the previous step's hidden rows before res is overwritten
         const std::int64_t pos0 = n_past;
         if (T < 1 || T > cap || (all_logits && T > fc::kMaxTokens)) throw std::runtime_error("engine: bad step size");
         prepare(tokens, T);
@@ -1041,6 +1299,10 @@ struct Engine::Impl {
             hook("result_output", -1, pos0 + t_first, n_out, cfg.n_vocab, lg.data());
         }
         n_past += T;
+        rows_pos0 = pos0;
+        rows_valid = T;
+        snaps_valid = mtp && T <= fc::kMaxTokens;
+        last_T = T;
         return lg;
     }
 };
@@ -1089,5 +1351,8 @@ int Engine::n_vocab() const { return impl_->cfg.n_vocab; }
 void Engine::set_activation_hook(EngineHook hook) { impl_->hook = std::move(hook); }
 const EngineStats & Engine::stats() const { return impl_->stats; }
 void Engine::save_routing_stats(const std::string & path) const { impl_->save_routing(path); }
+bool Engine::has_mtp() const { return impl_->mtp != nullptr; }
+std::vector<std::int32_t> Engine::draft(std::int32_t next, int k) { return impl_->draft(next, k); }
+void Engine::rollback(int n_keep) { impl_->rollback(n_keep); }
 
 }  // namespace ninfer::flashnext
