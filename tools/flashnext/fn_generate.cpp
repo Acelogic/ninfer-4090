@@ -151,6 +151,8 @@ static int run(int argc, char ** argv) {
         else if (a == "--test-snapshot") test_snapshot = true;
         else if (a == "--no-host-images") opt.host_expert_images = false;
         else if (a == "--mtp") opt.mtp_path = next();
+        else if (a == "--int8-cpu-experts") opt.precise_cpu_experts = false;
+        else if (a == "--no-pin") opt.pin_cpu_threads = false;
         else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--gpu-miss-permille") opt.gpu_miss_permille = std::stoi(next());
         else throw std::runtime_error("unknown argument " + a);

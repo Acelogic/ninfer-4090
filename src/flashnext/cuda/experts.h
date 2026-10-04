@@ -31,6 +31,9 @@ ExpertLayout expert_layout(GgufType gate_up, GgufType down);
 // Writes expert e of one layer into a slot image of layout.slot_bytes bytes.
 void pack_expert(const ExpertLayout & layout, const GgufTensor & gate, const GgufTensor & up, const GgufTensor & down, int e,
                  std::uint8_t * dst);
+// The same from one expert's matrices in GGUF bytes: gate and up 640 rows, down 2560 rows.
+void pack_expert_rows(const ExpertLayout & layout, const std::uint8_t * gate, const std::uint8_t * up, const std::uint8_t * down,
+                      std::uint8_t * dst);
 
 // Uploads the IQ3_S grid; called by init_kernels().
 void experts_init();

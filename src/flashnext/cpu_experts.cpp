@@ -14,9 +14,11 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include <immintrin.h>
 
+#include "flashnext/iq3s_grid.h"
 #include "flashnext/quants.h"
 
 namespace ninfer::flashnext {
@@ -115,6 +117,18 @@ inline __m512i lut_iq4() {
     return _mm512_broadcast_i32x4(_mm_load_si128(reinterpret_cast<const __m128i *>(t)));
 }
 
+inline __m512i load_2x256(const std::uint8_t * lo, const std::uint8_t * hi) {
+    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(lo))),
+                              _mm256_loadu_si256(reinterpret_cast<const __m256i *>(hi)), 1);
+}
+
+// Code -> signed weight, for the 16-bit activation kernels.
+inline __m512i lut_q4l_signed() {
+    alignas(16) static const std::int8_t t[16] = {1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15};
+    return _mm512_broadcast_i32x4(_mm_load_si128(reinterpret_cast<const __m128i *>(t)));
+}
+inline __m512i lut_iq4_signed() { return _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i *>(kIQ4NLValues))); }
+
 // 32 bytes of chunked nibbles -> 64 codes in weight order.
 inline __m512i chunk_codes(const std::uint8_t * p) {
     const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
@@ -137,6 +151,18 @@ inline float quantize_q8(const float * x, std::int8_t * q, std::int32_t * sums) 
         _mm_storeu_si128(reinterpret_cast<__m128i *>(q + 32 * k + 16), _mm512_cvtepi32_epi8(b));
         sums[k] = _mm512_reduce_add_epi32(_mm512_add_epi32(a, b));
     }
+    return d;
+}
+
+// 16-bit quantization of N floats (N a multiple of 16) with one scale amax/32767, round to nearest even.
+template <int N>
+inline float quantize_q16(const float * x, std::int16_t * q) {
+    __m512 m = _mm512_setzero_ps();
+    for (int j = 0; j < N / 16; ++j) m = _mm512_max_ps(m, _mm512_abs_ps(_mm512_loadu_ps(x + 16 * j)));
+    const float d = _mm512_reduce_max_ps(m) / 32767.0f, id = d > 0 ? 1.0f / d : 0.0f;
+    const __m512 vid = _mm512_set1_ps(id);
+    for (int j = 0; j < N / 16; ++j)
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(q + 16 * j), _mm512_cvtepi32_epi16(_mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(x + 16 * j), vid))));
     return d;
 }
 
@@ -231,6 +257,17 @@ struct alignas(64) HAct {
     float d[20];
     __m512i corr[10];
 };
+// Precise mode: the same blocks with 16-bit values (scale amax/32767). The kernels widen the weights to signed int16,
+// so no offset correction is needed. run() stores the values of each 64-column chunk in "lane order" (see
+// widen_lanes), run_batch() in column order.
+struct alignas(64) XAct16 {
+    std::int16_t q[2560];
+    float d[10];
+};
+struct alignas(64) HAct16 {
+    std::int16_t q[640];
+    float d[20];
+};
 
 struct CpuExperts::Layer {
     GateUp gu{};
@@ -242,6 +279,8 @@ struct CpuExperts::Layer {
 struct CpuExperts::Scratch {
     XAct x[kMaxTokens];
     HAct h[kMaxTokens * kUsed];
+    XAct16 x16[kMaxTokens];
+    HAct16 h16[kMaxTokens * kUsed];
     alignas(64) float g[kMaxTokens * kUsed][kFF];
     alignas(64) float u[kMaxTokens * kUsed][kFF];
 };
@@ -257,6 +296,33 @@ void quantize_h(const float * h, HAct & a) {
     for (int b = 0; b < 20; ++b) a.d[b] = quantize_q8<32>(h + 32 * b, a.q + 32 * b, sums + b);
     for (int c = 0; c < 10; ++c)
         a.corr[c] = _mm512_inserti64x4(_mm512_set1_epi32(16 * sums[2 * c]), _mm256_set1_epi32(16 * sums[2 * c + 1]), 1);
+}
+
+void quantize_x16(const float * x, XAct16 & a) {
+    for (int b = 0; b < 10; ++b) a.d[b] = quantize_q16<256>(x + 256 * b, a.q + 256 * b);
+}
+
+// Column order -> lane order within each 64-column chunk: first the columns 16L..16L+7 of each 128-bit lane L, then
+// 16L+8..16L+15, which is the order in which widen_lanes produces the weights.
+void to_lane_order(std::int16_t * q, int n) {
+    alignas(64) static const std::int16_t ia[32] = {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23,
+                                                    32, 33, 34, 35, 36, 37, 38, 39, 48, 49, 50, 51, 52, 53, 54, 55};
+    const __m512i a = _mm512_load_si512(ia), b = _mm512_add_epi16(a, _mm512_set1_epi16(8));
+    for (int c = 0; c < n; c += 64) {
+        const __m512i lo = _mm512_loadu_si512(q + c), hi = _mm512_loadu_si512(q + c + 32);
+        _mm512_storeu_si512(q + c, _mm512_permutex2var_epi16(lo, a, hi));
+        _mm512_storeu_si512(q + c + 32, _mm512_permutex2var_epi16(lo, b, hi));
+    }
+}
+
+void quantize_x16_lanes(const float * x, XAct16 & a) {
+    quantize_x16(x, a);
+    to_lane_order(a.q, 2560);
+}
+
+void quantize_h16_lanes(const float * h, HAct16 & a) {
+    for (int b = 0; b < 20; ++b) a.d[b] = quantize_q16<32>(h + 32 * b, a.q + 32 * b);
+    to_lane_order(a.q, 640);
 }
 
 // Gate and up rows (Q4L) against NT tokens' activations, one pass over the weights.
@@ -361,10 +427,89 @@ void dn_q8(const BlockQ8_0 * row, const HAct * const * hs, float * out) {
     for (int t = 0; t < NT; ++t) out[t] = _mm512_reduce_add_ps(acc[t]);
 }
 
+// Precise mode (16-bit activations): 64 int8 weights of a chunk (columns in byte order) -> int16, without crossing
+// 128-bit lanes: a holds columns 16L..16L+7 of each lane L, b columns 16L+8..16L+15. Both hold the chunk's first
+// 32-column block in dword lanes 0-7 and the second in lanes 8-15; the activations are stored in the same order.
+inline void widen_lanes(__m512i v, __m512i & a, __m512i & b) {
+    a = _mm512_srai_epi16(_mm512_unpacklo_epi8(v, v), 8);
+    b = _mm512_srai_epi16(_mm512_unpackhi_epi8(v, v), 8);
+}
+
+// Gate and up rows against NT tokens, int16 x int16. The sub-block scale is folded into the int16 weights (|w x s| <=
+// 15 x 31 for Q4L, 127 x 32 for Q4X); each int32 lane sums 16 products per 256-block, at most 2.13e9, so the block sums
+// are exact. They are converted to float once per block.
+template <int NT, bool Q4X, class Block>
+void gu_p(const Block * g, const Block * u, const XAct16 * const * xs, float * og, float * ou) {
+    const __m512i lut = Q4X ? lut_iq4_signed() : lut_q4l_signed();
+    __m512 ag[NT], au[NT];
+    for (int t = 0; t < NT; ++t) ag[t] = au[t] = _mm512_setzero_ps();
+    for (int b = 0; b < 10; ++b) {
+        __m512i ig[NT], iu[NT];
+        for (int t = 0; t < NT; ++t) ig[t] = iu[t] = _mm512_setzero_si512();
+        for (int c = 0; c < 4; ++c) {
+            short sg0, sg1, su0, su1;
+            if constexpr (Q4X) {
+                sg0 = g[b].scales[2 * c], sg1 = g[b].scales[2 * c + 1], su0 = u[b].scales[2 * c], su1 = u[b].scales[2 * c + 1];
+            } else {
+                sg0 = short(2 * (g[b].scales[c] & 0xF) + 1), sg1 = short(2 * (g[b].scales[c] >> 4) + 1);
+                su0 = short(2 * (u[b].scales[c] & 0xF) + 1), su1 = short(2 * (u[b].scales[c] >> 4) + 1);
+            }
+            const __m512i sg = _mm512_inserti64x4(_mm512_set1_epi16(sg0), _mm256_set1_epi16(sg1), 1);
+            const __m512i su = _mm512_inserti64x4(_mm512_set1_epi16(su0), _mm256_set1_epi16(su1), 1);
+            __m512i g0, g1, u0, u1;
+            widen_lanes(_mm512_shuffle_epi8(lut, chunk_codes(g[b].qs + 32 * c)), g0, g1);
+            widen_lanes(_mm512_shuffle_epi8(lut, chunk_codes(u[b].qs + 32 * c)), u0, u1);
+            g0 = _mm512_mullo_epi16(g0, sg);
+            g1 = _mm512_mullo_epi16(g1, sg);
+            u0 = _mm512_mullo_epi16(u0, su);
+            u1 = _mm512_mullo_epi16(u1, su);
+            for (int t = 0; t < NT; ++t) {
+                const __m512i x0 = _mm512_load_si512(xs[t]->q + 256 * b + 64 * c), x1 = _mm512_load_si512(xs[t]->q + 256 * b + 64 * c + 32);
+                ig[t] = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(ig[t], g0, x0), g1, x1);
+                iu[t] = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(iu[t], u0, x0), u1, x1);
+            }
+        }
+        const float dg = half_to_float(g[b].d), du = half_to_float(u[b].d);
+        for (int t = 0; t < NT; ++t) {
+            ag[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ig[t]), _mm512_set1_ps(dg * xs[t]->d[b]), ag[t]);
+            au[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iu[t]), _mm512_set1_ps(du * xs[t]->d[b]), au[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) { og[t] = _mm512_reduce_add_ps(ag[t]); ou[t] = _mm512_reduce_add_ps(au[t]); }
+}
+
+// One down row against NT pairs' 16-bit h. Per chunk, lanes 0-7 sum the first 32-column block (one IQ4_NL / Q8_0
+// block) exactly and lanes 8-15 the second; each half is scaled by its d(row) * d(h).
+template <int NT, bool Q8>
+void dn_p(const std::uint8_t * row, const HAct16 * const * hs, float * out) {
+    __m512 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm512_setzero_ps();
+    for (int c = 0; c < 10; ++c) {
+        __m512i w0, w1;
+        float d0, d1;
+        if constexpr (Q8) {
+            const auto * r = reinterpret_cast<const BlockQ8_0 *>(row);
+            widen_lanes(load_2x256(reinterpret_cast<const std::uint8_t *>(r[2 * c].qs), reinterpret_cast<const std::uint8_t *>(r[2 * c + 1].qs)), w0, w1);
+            d0 = half_to_float(r[2 * c].d), d1 = half_to_float(r[2 * c + 1].d);
+        } else {
+            const auto * r = reinterpret_cast<const RowIQ4L *>(row);
+            widen_lanes(_mm512_shuffle_epi8(lut_iq4_signed(), chunk_codes(r->qs + 32 * c)), w0, w1);
+            d0 = half_to_float(r->d[2 * c]), d1 = half_to_float(r->d[2 * c + 1]);
+        }
+        for (int t = 0; t < NT; ++t) {
+            const __m512i v = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_setzero_si512(), w0, _mm512_load_si512(hs[t]->q + 64 * c)), w1,
+                                                  _mm512_load_si512(hs[t]->q + 64 * c + 32));
+            const __m512 sc = _mm512_insertf32x8(_mm512_set1_ps(d0 * hs[t]->d[2 * c]), _mm256_set1_ps(d1 * hs[t]->d[2 * c + 1]), 1);
+            acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v), sc, acc[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) out[t] = _mm512_reduce_add_ps(acc[t]);
+}
+
 }  // namespace
 
 CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
-    : pool_(config.threads), scratch_(std::make_unique<Scratch>()) {
+    : pool_(config.threads), precise_(config.precise_activations), scratch_(std::make_unique<Scratch>()) {
     if (config.pin_threads) {
         const std::vector<std::uint64_t> cores = core_affinities();
         if (int(cores.size()) >= pool_.size()) {
@@ -506,7 +651,10 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
     std::memset(out, 0, sizeof(float) * std::size_t(n_tokens) * kEmbd);
     if (n_pairs == 0) return;
 
-    for (int t = 0; t < n_tokens; ++t) quantize_x(x + std::size_t(t) * kEmbd, S.x[t]);
+    for (int t = 0; t < n_tokens; ++t) {
+        if (precise_) quantize_x16_lanes(x + std::size_t(t) * kEmbd, S.x16[t]);
+        else quantize_x(x + std::size_t(t) * kEmbd, S.x[t]);
+    }
 
     const int nt = pool_.size();
     // Gate/up: rows of all selected experts, spread evenly over the threads.
@@ -520,9 +668,31 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
             for (int p0 = pair_start[u]; p0 < pair_start[u + 1]; p0 += 4) {
                 const int n = std::min(4, pair_start[u + 1] - p0);
                 const XAct * xs[4];
+                const XAct16 * xs16[4];
                 float og[4], ou[4];
-                for (int i = 0; i < n; ++i) xs[i] = &S.x[pair_token[p0 + i]];
-                if (L.gu == GateUp::Q4L) {
+                for (int i = 0; i < n; ++i) {
+                    xs[i] = &S.x[pair_token[p0 + i]];
+                    xs16[i] = &S.x16[pair_token[p0 + i]];
+                }
+                if (precise_ && L.gu == GateUp::Q4L) {
+                    const auto * g = reinterpret_cast<const BlockQ4L *>(gp);
+                    const auto * uu = reinterpret_cast<const BlockQ4L *>(up);
+                    switch (n) {
+                    case 1: gu_p<1, false>(g, uu, xs16, og, ou); break;
+                    case 2: gu_p<2, false>(g, uu, xs16, og, ou); break;
+                    case 3: gu_p<3, false>(g, uu, xs16, og, ou); break;
+                    default: gu_p<4, false>(g, uu, xs16, og, ou); break;
+                    }
+                } else if (precise_) {
+                    const auto * g = reinterpret_cast<const BlockQ4X *>(gp);
+                    const auto * uu = reinterpret_cast<const BlockQ4X *>(up);
+                    switch (n) {
+                    case 1: gu_p<1, true>(g, uu, xs16, og, ou); break;
+                    case 2: gu_p<2, true>(g, uu, xs16, og, ou); break;
+                    case 3: gu_p<3, true>(g, uu, xs16, og, ou); break;
+                    default: gu_p<4, true>(g, uu, xs16, og, ou); break;
+                    }
+                } else if (L.gu == GateUp::Q4L) {
                     const auto * g = reinterpret_cast<const BlockQ4L *>(gp);
                     const auto * uu = reinterpret_cast<const BlockQ4L *>(up);
                     switch (n) {
@@ -551,7 +721,8 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
         alignas(64) float h[kFF];
         for (int p = th; p < n_pairs; p += nt) {
             for (int j = 0; j < kFF; j += 16) _mm512_store_ps(h + j, swiglu16(_mm512_load_ps(S.g[p] + j), _mm512_load_ps(S.u[p] + j)));
-            quantize_h(h, S.h[p]);
+            if (precise_) quantize_h16_lanes(h, S.h16[p]);
+            else quantize_h(h, S.h[p]);
         }
     });
 
@@ -565,9 +736,27 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
                 for (int p0 = pair_start[u]; p0 < pair_start[u + 1]; p0 += 4) {
                     const int n = std::min(4, pair_start[u + 1] - p0);
                     const HAct * hs[4];
+                    const HAct16 * hs16[4];
                     float d[4];
-                    for (int i = 0; i < n; ++i) hs[i] = &S.h[p0 + i];
-                    if (L.dn == Down::IQ4L) {
+                    for (int i = 0; i < n; ++i) {
+                        hs[i] = &S.h[p0 + i];
+                        hs16[i] = &S.h16[p0 + i];
+                    }
+                    if (precise_ && L.dn == Down::IQ4L) {
+                        switch (n) {
+                        case 1: dn_p<1, false>(row, hs16, d); break;
+                        case 2: dn_p<2, false>(row, hs16, d); break;
+                        case 3: dn_p<3, false>(row, hs16, d); break;
+                        default: dn_p<4, false>(row, hs16, d); break;
+                        }
+                    } else if (precise_) {
+                        switch (n) {
+                        case 1: dn_p<1, true>(row, hs16, d); break;
+                        case 2: dn_p<2, true>(row, hs16, d); break;
+                        case 3: dn_p<3, true>(row, hs16, d); break;
+                        default: dn_p<4, true>(row, hs16, d); break;
+                        }
+                    } else if (L.dn == Down::IQ4L) {
                         const auto * rr = reinterpret_cast<const RowIQ4L *>(row);
                         switch (n) {
                         case 1: dn_iq4l<1>(rr, hs, d); break;
@@ -601,6 +790,8 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
 // tile of 2 row vectors x 6 tokens costs 2 vector loads and 6 broadcast loads per 12 vpdpbusd, and per-row scales
 // stay in their lanes. Each 32-column sub-block is summed exactly in int32 starting from -offset x sum(activations),
 // as run() does, so the gate/up results equal run()'s bit for bit; down differs only in float summation order.
+// With 16-bit activations (precise mode) each vector holds an int16 pair of columns of the 16 rows and vpdpwssd does
+// the multiplication; a row's sum over a 32-column sub-block is exact and is scaled in float.
 //
 // Phase 1 (gate/up): a task is (expert, 32 rows of gate and the same 32 rows of up), dynamically scheduled. It
 // decodes its 64 rows (86 KB from RAM, 160 KB decoded, L2) and runs every token of the expert block by block, so a
@@ -622,6 +813,11 @@ constexpr std::size_t kGuScratch = kGuW + 4 * kGuS + 4 * kGuD + 64 * 4 * kPairCh
 constexpr std::size_t kDnW = 20 * 8 * 2 * 64;      // decoded down weights of 32 rows: [sub][quad][2][64]
 constexpr std::size_t kDnD = 20 * 2 * 16;          // float scales of 32 rows: [sub][2][16]
 constexpr int kDnGroups = CpuExperts::kEmbd / 32;  // 32-row groups of the down output
+// Precise mode: each vector holds 2 int16 weights of 16 rows (a column pair), so tiles are twice as large.
+constexpr std::size_t kGuW16 = 10 * 8 * 16 * 4 * 64;  // [block][sub][pair][rv][64]
+constexpr std::size_t kGuSD = 10 * 8 * 4 * 16;        // float sub-block scale x block scale: [block][sub][rv][16]
+constexpr std::size_t kGuScratch16 = kGuW16 + 4 * kGuSD + 64 * 4 * kPairChunk;
+constexpr std::size_t kDnW16 = 20 * 16 * 2 * 64;      // [sub][pair][2][64]
 
 }  // namespace
 
@@ -636,8 +832,8 @@ struct alignas(64) XActB {
 struct CpuExperts::BatchScratch {
     int cap_tokens = 0;
     std::size_t cap_pairs = 0;
-    Buffer x;              // XActB[cap_tokens]
-    Buffer hq, hd, hoff;   // down inputs by sub-block, then pair: int8 [20][cap_pairs][32], float and int32 [20][cap_pairs]
+    Buffer x;              // XActB (precise: XAct16) [cap_tokens]
+    Buffer hq, hd, hoff;   // down inputs by sub-block, then pair: int8 (int16) [20][cap_pairs][32], float and int32 [20][cap_pairs]
     std::vector<std::unique_ptr<Buffer>> thread;
     std::vector<int> count, pos, start, experts, pair_token;
     std::vector<float> pair_weight;
@@ -645,11 +841,6 @@ struct CpuExperts::BatchScratch {
 };
 
 namespace {
-
-inline __m512i load_2x256(const std::uint8_t * lo, const std::uint8_t * hi) {
-    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(lo))),
-                              _mm256_loadu_si256(reinterpret_cast<const __m256i *>(hi)), 1);
-}
 
 // 32 bytes from each of 16 rows (p + r * stride) -> v[i], whose lane r is bytes 4i..4i+3 of row r. A 16 x 8 dword
 // transpose as two 8 x 8 transposes side by side; rows 0-3 | 4-7 and 8-11 | 12-15 share vectors, so that the last
@@ -873,6 +1064,206 @@ void dn_kernel_n(int n, const std::uint8_t * W, const float * DW, const HView & 
     }
 }
 
+// ---- Precise mode (16-bit activations) ----
+
+// Lane r of v holds 4 int8 weights of row r -> int16 pairs (0, 1) and (2, 3) of each row, the operand layout of
+// vpdpwssd: each byte goes to the high byte of a word, and an arithmetic shift sign-extends it.
+inline void pairs_i16(__m512i v, __m512i & p01, __m512i & p23) {
+    const __m512i s01 = _mm512_broadcast_i32x4(_mm_setr_epi32(0x01800080, 0x05800480, 0x09800880, 0x0D800C80));
+    const __m512i s23 = _mm512_broadcast_i32x4(_mm_setr_epi32(0x03800280, 0x07800680, 0x0B800A80, 0x0F800E80));
+    p01 = _mm512_srai_epi16(_mm512_shuffle_epi8(v, s01), 8);
+    p23 = _mm512_srai_epi16(_mm512_shuffle_epi8(v, s23), 8);
+}
+
+// 16 gate or up rows -> row vector rv of a precise phase-1 tile: signed int16 weights by column pair, and per
+// sub-block the float product of the sub-block scale and the block scale.
+void decode_gu16_p(GateUp fmt, const std::uint8_t * base, std::size_t row_bytes, std::uint8_t * W, float * SD, int rv) {
+    const bool q4l = fmt == GateUp::Q4L;
+    const int bb = q4l ? int(sizeof(BlockQ4L)) : int(sizeof(BlockQ4X)), qo = q4l ? 6 : 10;
+    const __m512i lut = q4l ? lut_q4l_signed() : lut_iq4_signed(), m = _mm512_set1_epi8(0x0F), rows = row_offsets(row_bytes);
+    for (int b = 0; b < 10; ++b) {
+        for (int c = 0; c < 4; ++c) {
+            __m512i v[8];
+            transpose_16x32(base + b * bb + qo + 32 * c, row_bytes, v);
+            // sub-block 2c from the low nibbles, 2c+1 from the high ones; columns 4i..4i+3 are pairs 2i and 2i+1
+            std::uint8_t * lo = W + (((b * 8 + 2 * c) * 16) * 4 + rv) * 64;
+            std::uint8_t * hi = lo + 16 * 4 * 64;
+            for (int i = 0; i < 8; ++i) {
+                __m512i a, b2;
+                pairs_i16(_mm512_shuffle_epi8(lut, _mm512_and_si512(v[i], m)), a, b2);
+                _mm512_store_si512(lo + 512 * i, a);
+                _mm512_store_si512(lo + 512 * i + 256, b2);
+                pairs_i16(_mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16(v[i], 4), m)), a, b2);
+                _mm512_store_si512(hi + 512 * i, a);
+                _mm512_store_si512(hi + 512 * i + 256, b2);
+            }
+        }
+        const __m512i at = _mm512_add_epi32(rows, _mm512_set1_epi32(b * bb));
+        const __m512 d = half16_to_float(_mm512_i32gather_epi32(at, base, 1));
+        float * sd = SD + (b * 32 + rv) * 16;
+        if (q4l) {
+            const __m512i sc = _mm512_i32gather_epi32(_mm512_add_epi32(at, _mm512_set1_epi32(2)), base, 1);
+            for (int s = 0; s < 8; ++s) {
+                const __m512i ls = _mm512_and_si512(_mm512_srlv_epi32(sc, _mm512_set1_epi32(4 * s)), _mm512_set1_epi32(15));
+                _mm512_store_ps(sd + 64 * s, _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_slli_epi32(ls, 1), _mm512_set1_epi32(1))), d));
+            }
+        } else {
+            const __m512i s0 = _mm512_i32gather_epi32(_mm512_add_epi32(at, _mm512_set1_epi32(2)), base, 1);
+            const __m512i s1 = _mm512_i32gather_epi32(_mm512_add_epi32(at, _mm512_set1_epi32(6)), base, 1);
+            for (int s = 0; s < 4; ++s) {
+                _mm512_store_ps(sd + 64 * s, _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_srai_epi32(_mm512_sllv_epi32(s0, _mm512_set1_epi32(24 - 8 * s)), 24)), d));
+                _mm512_store_ps(sd + 64 * (4 + s), _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_srai_epi32(_mm512_sllv_epi32(s1, _mm512_set1_epi32(24 - 8 * s)), 24)), d));
+            }
+        }
+    }
+}
+
+// 16 down rows -> half h of a precise 32-row phase-2 tile.
+void decode_dn16_p(Down fmt, const std::uint8_t * base, std::size_t row_bytes, std::uint8_t * W, float * DW, int h) {
+    const __m512i rows = row_offsets(row_bytes);
+    if (fmt == Down::IQ4L) {
+        const __m512i lut = lut_iq4_signed(), m = _mm512_set1_epi8(0x0F);
+        for (int c = 0; c < 10; ++c) {
+            __m512i v[8];
+            transpose_16x32(base + 40 + 32 * c, row_bytes, v);
+            std::uint8_t * lo = W + (2 * c * 16 * 2 + h) * 64;  // sub-block 2c
+            std::uint8_t * hi = lo + 16 * 2 * 64;               // 2c+1
+            for (int i = 0; i < 8; ++i) {
+                __m512i a, b;
+                pairs_i16(_mm512_shuffle_epi8(lut, _mm512_and_si512(v[i], m)), a, b);
+                _mm512_store_si512(lo + 256 * i, a);
+                _mm512_store_si512(lo + 256 * i + 128, b);
+                pairs_i16(_mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16(v[i], 4), m)), a, b);
+                _mm512_store_si512(hi + 256 * i, a);
+                _mm512_store_si512(hi + 256 * i + 128, b);
+            }
+        }
+        for (int k = 0; k < 10; ++k) {
+            const __m512i d = _mm512_i32gather_epi32(_mm512_add_epi32(rows, _mm512_set1_epi32(4 * k)), base, 1);
+            _mm512_store_ps(DW + (4 * k + h) * 16, half16_to_float(d));
+            _mm512_store_ps(DW + (4 * k + 2 + h) * 16, half16_to_float(_mm512_srli_epi32(d, 16)));
+        }
+    } else {
+        for (int s = 0; s < 20; ++s) {
+            __m512i v[8];
+            transpose_16x32(base + 34 * s + 2, row_bytes, v);
+            std::uint8_t * dst = W + (s * 16 * 2 + h) * 64;
+            for (int i = 0; i < 8; ++i) {
+                __m512i a, b;
+                pairs_i16(v[i], a, b);
+                _mm512_store_si512(dst + 256 * i, a);
+                _mm512_store_si512(dst + 256 * i + 128, b);
+            }
+            _mm512_store_ps(DW + (2 * s + h) * 16,
+                            half16_to_float(_mm512_i32gather_epi32(_mm512_add_epi32(rows, _mm512_set1_epi32(34 * s)), base, 1)));
+        }
+    }
+}
+
+// Precise phase-1 micro-kernel: 2 row vectors x NT tokens over block b, vpdpwssd on column pairs. A row's sum over
+// one 32-column sub-block is exact in int32 (at most 32 x 127 x 32767); it is scaled in float, since a whole block
+// could overflow.
+template <int NT>
+void gu_kernel_p(const std::uint8_t * W, const float * SD, const XAct16 * const * xs, int b, float * const * F) {
+    __m512 f0[NT], f1[NT];
+    for (int t = 0; t < NT; ++t) f0[t] = f1[t] = _mm512_setzero_ps();
+    for (int s = 0; s < 8; ++s) {
+        __m512i acc0[NT], acc1[NT];
+        for (int t = 0; t < NT; ++t) acc0[t] = acc1[t] = _mm512_setzero_si512();
+        const std::uint8_t * ws = W + 4096 * s;
+        const int xo = 128 * b + 16 * s;
+        for (int p = 0; p < 16; ++p) {
+            const __m512i w0 = _mm512_load_si512(ws + 256 * p), w1 = _mm512_load_si512(ws + 256 * p + 64);
+            for (int t = 0; t < NT; ++t) {
+                const __m512i a = bcast32(reinterpret_cast<const std::int32_t *>(xs[t]->q) + xo + p);
+                acc0[t] = _mm512_dpwssd_epi32(acc0[t], w0, a);
+                acc1[t] = _mm512_dpwssd_epi32(acc1[t], w1, a);
+            }
+        }
+        const __m512 sd0 = _mm512_load_ps(SD + 64 * s), sd1 = _mm512_load_ps(SD + 64 * s + 16);
+        for (int t = 0; t < NT; ++t) {
+            f0[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc0[t]), sd0, f0[t]);
+            f1[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc1[t]), sd1, f1[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        const __m512 xd = _mm512_set1_ps(xs[t]->d[b]);
+        _mm512_store_ps(F[t], _mm512_fmadd_ps(f0[t], xd, _mm512_load_ps(F[t])));
+        _mm512_store_ps(F[t] + 16, _mm512_fmadd_ps(f1[t], xd, _mm512_load_ps(F[t] + 16)));
+    }
+}
+
+template <int NT>
+void gu_tile_p(const std::uint8_t * W, const float * SD, const XAct16 * const * xs, int b, float * const * F) {
+    float * F2[NT];
+    for (int t = 0; t < NT; ++t) F2[t] = F[t] + 32;
+    gu_kernel_p<NT>(W, SD, xs, b, F);
+    gu_kernel_p<NT>(W + 128, SD + 32, xs, b, F2);
+}
+
+void gu_tile_p_n(int n, const std::uint8_t * W, const float * SD, const XAct16 * const * xs, int b, float * const * F) {
+    switch (n) {
+    case 1: gu_tile_p<1>(W, SD, xs, b, F); break;
+    case 2: gu_tile_p<2>(W, SD, xs, b, F); break;
+    case 3: gu_tile_p<3>(W, SD, xs, b, F); break;
+    case 4: gu_tile_p<4>(W, SD, xs, b, F); break;
+    case 5: gu_tile_p<5>(W, SD, xs, b, F); break;
+    default: gu_tile_p<6>(W, SD, xs, b, F); break;
+    }
+}
+
+struct HView16 {
+    const std::int16_t * q;
+    const float * d;
+    std::size_t cap;
+};
+
+// Precise phase-2 micro-kernel: as dn_kernel, with vpdpwssd on column pairs.
+template <int NT>
+void dn_kernel_p(const std::uint8_t * W, const float * DW, const HView16 & H, const int * pair, const float * const * in,
+                 float * const * o, const float * pw) {
+    __m512 f0[NT], f1[NT];
+    for (int t = 0; t < NT; ++t) f0[t] = f1[t] = _mm512_setzero_ps();
+    for (int s = 0; s < 20; ++s) {
+        const std::size_t so = std::size_t(s) * H.cap;
+        const std::int32_t * hq = reinterpret_cast<const std::int32_t *>(H.q) + 16 * so;
+        __m512i acc0[NT], acc1[NT];
+        for (int t = 0; t < NT; ++t) acc0[t] = acc1[t] = _mm512_setzero_si512();
+        const std::uint8_t * ws = W + 2048 * s;
+        for (int p = 0; p < 16; ++p) {
+            const __m512i w0 = _mm512_load_si512(ws + 128 * p), w1 = _mm512_load_si512(ws + 128 * p + 64);
+            for (int t = 0; t < NT; ++t) {
+                const __m512i a = bcast32(hq + 16 * pair[t] + p);
+                acc0[t] = _mm512_dpwssd_epi32(acc0[t], w0, a);
+                acc1[t] = _mm512_dpwssd_epi32(acc1[t], w1, a);
+            }
+        }
+        const __m512 dw0 = _mm512_load_ps(DW + 32 * s), dw1 = _mm512_load_ps(DW + 32 * s + 16);
+        for (int t = 0; t < NT; ++t) {
+            const __m512 hd = _mm512_set1_ps(H.d[so + pair[t]]);
+            f0[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc0[t]), _mm512_mul_ps(dw0, hd), f0[t]);
+            f1[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc1[t]), _mm512_mul_ps(dw1, hd), f1[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        const __m512 w = _mm512_set1_ps(pw[t]);
+        _mm512_storeu_ps(o[t], _mm512_fmadd_ps(f0[t], w, _mm512_loadu_ps(in[t])));
+        _mm512_storeu_ps(o[t] + 16, _mm512_fmadd_ps(f1[t], w, _mm512_loadu_ps(in[t] + 16)));
+    }
+}
+
+void dn_kernel_p_n(int n, const std::uint8_t * W, const float * DW, const HView16 & H, const int * pair, const float * const * in,
+                   float * const * o, const float * pw) {
+    switch (n) {
+    case 1: dn_kernel_p<1>(W, DW, H, pair, in, o, pw); break;
+    case 2: dn_kernel_p<2>(W, DW, H, pair, in, o, pw); break;
+    case 3: dn_kernel_p<3>(W, DW, H, pair, in, o, pw); break;
+    case 4: dn_kernel_p<4>(W, DW, H, pair, in, o, pw); break;
+    case 5: dn_kernel_p<5>(W, DW, H, pair, in, o, pw); break;
+    default: dn_kernel_p<6>(W, DW, H, pair, in, o, pw); break;
+    }
+}
+
 // Software prefetch of the weights a thread decodes next, spread over the kernel calls of its current work so that
 // RAM streams while the cores compute (decode itself would otherwise wait for every line, and all threads would
 // alternate between using only RAM and using only the cores).
@@ -912,6 +1303,16 @@ private:
 
 void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::int32_t * ids, const float * weights,
                            const std::uint8_t * on_cpu, float * out) {
+    if (precise_) run_batch_impl<true>(layer, n_tokens, x, ids, weights, on_cpu, out);
+    else run_batch_impl<false>(layer, n_tokens, x, ids, weights, on_cpu, out);
+}
+
+template <bool P>
+void CpuExperts::run_batch_impl(int layer, int n_tokens, const float * x, const std::int32_t * ids, const float * weights,
+                                const std::uint8_t * on_cpu, float * out) {
+    using XA = std::conditional_t<P, XAct16, XActB>;
+    using HQ = std::conditional_t<P, std::int16_t, std::int8_t>;
+    constexpr std::size_t kGuTile = P ? kGuW16 : kGuW, kDnTile = P ? kDnW16 : kDnW;
     if (!has_layer(layer)) throw std::runtime_error("CpuExperts: layer " + std::to_string(layer) + " is not loaded");
     if (n_tokens < 1 || n_tokens > kMaxBatchTokens) throw std::runtime_error("CpuExperts: n_tokens out of range");
     const Layer & L = *layers_[std::size_t(layer)];
@@ -920,10 +1321,10 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
     if (!batch_) batch_ = std::make_unique<BatchScratch>();
     BatchScratch & B = *batch_;
     if (B.thread.empty()) {
-        const std::size_t dn = std::size_t((kDnGroups + nt - 1) / nt) * (kDnW + 4 * kDnD) + kMaxBatchTokens;
+        const std::size_t dn = std::size_t((kDnGroups + nt - 1) / nt) * (kDnTile + 4 * kDnD) + kMaxBatchTokens;
         for (int t = 0; t < nt; ++t) {
             B.thread.push_back(std::make_unique<Buffer>());
-            B.thread.back()->alloc(std::max(kGuScratch, dn));
+            B.thread.back()->alloc(std::max(P ? kGuScratch16 : kGuScratch, dn));
         }
         B.count.resize(kExperts);
         B.pos.resize(kExperts);
@@ -933,10 +1334,10 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
     if (n_tokens > B.cap_tokens) {
         B.cap_tokens = n_tokens;
         B.cap_pairs = std::size_t(n_tokens) * kUsed;
-        B.x.alloc(sizeof(XActB) * std::size_t(n_tokens));
-        B.hq.alloc(20 * 32 * B.cap_pairs);
+        B.x.alloc(sizeof(XA) * std::size_t(n_tokens));
+        B.hq.alloc(20 * 32 * sizeof(HQ) * B.cap_pairs);
         B.hd.alloc(20 * 4 * B.cap_pairs);
-        B.hoff.alloc(20 * 4 * B.cap_pairs);
+        if (!P) B.hoff.alloc(20 * 4 * B.cap_pairs);
         B.pair_token.resize(B.cap_pairs);
         B.pair_weight.resize(B.cap_pairs);
         B.used.resize(std::size_t(n_tokens));
@@ -980,21 +1381,25 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
     }
 
     // Quantize the activations of the tokens that have pairs, exactly as run() does.
-    XActB * xb = reinterpret_cast<XActB *>(B.x.p);
+    XA * xb = reinterpret_cast<XA *>(B.x.p);
     const int off_scale = L.gu == GateUp::Q4L ? -16 : -128;
     pool_.run([&](int th) {
         for (int t = th; t < n_tokens; t += nt) {
             if (!B.used[std::size_t(t)]) continue;
-            XActB & a = xb[t];
-            std::int32_t sums[80];
-            for (int b = 0; b < 10; ++b) a.d[b] = quantize_q8<256>(x + std::size_t(t) * kEmbd + 256 * b, a.q + 256 * b, sums + 8 * b);
-            for (int k = 0; k < 80; ++k) a.off[k] = off_scale * sums[k];
+            XA & a = xb[t];
+            if constexpr (P) {
+                quantize_x16(x + std::size_t(t) * kEmbd, a);
+            } else {
+                std::int32_t sums[80];
+                for (int b = 0; b < 10; ++b) a.d[b] = quantize_q8<256>(x + std::size_t(t) * kEmbd + 256 * b, a.q + 256 * b, sums + 8 * b);
+                for (int k = 0; k < 80; ++k) a.off[k] = off_scale * sums[k];
+            }
         }
     });
 
     // Phase 1: gate/up, SwiGLU and quantization of h.
     const std::size_t cap = B.cap_pairs;
-    std::int8_t * hq = reinterpret_cast<std::int8_t *>(B.hq.p);
+    HQ * hq = reinterpret_cast<HQ *>(B.hq.p);
     float * hd = reinterpret_cast<float *>(B.hd.p);
     std::int32_t * hoff = reinterpret_cast<std::int32_t *>(B.hoff.p);
     const int n_tasks = n_experts * (kFF / 32);
@@ -1008,10 +1413,12 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
     };
     std::atomic<int> next_task{0};
     pool_.run([&](int th) {
+        // int8: W [kGuW] | S int32 [kGuS] | D [kGuD] | F; precise: W [kGuW16] | SD [kGuSD] | F
         std::uint8_t * W = B.thread[std::size_t(th)]->p;
-        std::int32_t * S = reinterpret_cast<std::int32_t *>(W + kGuW);
+        std::int32_t * S = reinterpret_cast<std::int32_t *>(W + kGuTile);
         float * D = reinterpret_cast<float *>(W + kGuW + 4 * kGuS);
-        float * F = D + kGuD;
+        float * SD = reinterpret_cast<float *>(W + kGuTile);
+        float * F = P ? SD + kGuSD : D + kGuD;
         Prefetcher pf;
         int task = next_task.fetch_add(1, std::memory_order_relaxed);
         while (task < n_tasks) {
@@ -1022,7 +1429,9 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
             if (next < n_tasks) pf.start(panel_at(L.gate.p, next), panel, panel_at(L.up.p, next), panel, 4 + 10 * ((pe - pb + kNtGU - 1) / kNtGU));
             for (int rv = 0; rv < 4; ++rv) {
                 pf.step();
-                decode_gu16(L.gu, panel_at(rv < 2 ? L.gate.p : L.up.p, task) + std::size_t(16 * (rv & 1)) * L.gu_row_bytes, L.gu_row_bytes, W, S, D, rv);
+                const std::uint8_t * rows = panel_at(rv < 2 ? L.gate.p : L.up.p, task) + std::size_t(16 * (rv & 1)) * L.gu_row_bytes;
+                if constexpr (P) decode_gu16_p(L.gu, rows, L.gu_row_bytes, W, SD, rv);
+                else decode_gu16(L.gu, rows, L.gu_row_bytes, W, S, D, rv);
             }
             for (int p0 = pb; p0 < pe; p0 += kPairChunk) {
                 const int n = std::min(kPairChunk, pe - p0);
@@ -1030,14 +1439,15 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
                 for (int b = 0; b < 10; ++b)
                     for (int i = 0; i < n; i += kNtGU) {
                         const int m = std::min(kNtGU, n - i);
-                        const XActB * xs[kNtGU];
+                        const XA * xs[kNtGU];
                         float * fs[kNtGU];
                         for (int k = 0; k < m; ++k) {
                             xs[k] = xb + B.pair_token[std::size_t(p0 + i + k)];
                             fs[k] = F + 64 * (i + k);
                         }
                         pf.step();
-                        gu_tile_n(m, W + 16384 * b, S + 512 * b, D + 64 * b, xs, b, fs);
+                        if constexpr (P) gu_tile_p_n(m, W + 32768 * b, SD + 512 * b, xs, b, fs);
+                        else gu_tile_n(m, W + 16384 * b, S + 512 * b, D + 64 * b, xs, b, fs);
                     }
                 // F[i]: gate rows 0-31 then up rows 0-31 of this task
                 for (int i = 0; i < n; ++i) {
@@ -1046,9 +1456,13 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
                     _mm512_store_ps(h, swiglu16(_mm512_load_ps(f), _mm512_load_ps(f + 32)));
                     _mm512_store_ps(h + 16, swiglu16(_mm512_load_ps(f + 16), _mm512_load_ps(f + 48)));
                     const std::size_t at = std::size_t(j) * cap + std::size_t(p0 + i);
-                    std::int32_t sum;
-                    hd[at] = quantize_q8<32>(h, hq + 32 * at, &sum);
-                    hoff[at] = -128 * sum;  // IQ4L and Q8_0 weights are both stored +128
+                    if constexpr (P) {
+                        hd[at] = quantize_q16<32>(h, hq + 32 * at);
+                    } else {
+                        std::int32_t sum;
+                        hd[at] = quantize_q8<32>(h, hq + 32 * at, &sum);
+                        hoff[at] = -128 * sum;  // IQ4L and Q8_0 weights are both stored +128
+                    }
                 }
             }
             if (next < n_tasks) pf.finish();
@@ -1057,14 +1471,17 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
     });
 
     // Phase 2: down. Thread th owns the 32-row groups [g0, g1) of every token's output.
-    const HView H{hq, hd, hoff, cap};
+    const auto H = [&] {
+        if constexpr (P) return HView16{hq, hd, cap};
+        else return HView{hq, hd, hoff, cap};
+    }();
     alignas(64) static const float kZeros[32] = {};
     pool_.run([&](int th) {
         const int g0 = kDnGroups * th / nt, g1 = kDnGroups * (th + 1) / nt, ng = g1 - g0;
         if (ng == 0) return;
         const int r0 = 32 * g0;
         std::uint8_t * W = B.thread[std::size_t(th)]->p;
-        float * DW = reinterpret_cast<float *>(W + kDnW * std::size_t(ng));
+        float * DW = reinterpret_cast<float *>(W + kDnTile * std::size_t(ng));
         std::uint8_t * first = reinterpret_cast<std::uint8_t *>(DW + kDnD * std::size_t(ng));  // no contribution stored yet
         std::memset(first, 1, std::size_t(n_tokens));
         const std::size_t slice = std::size_t(32 * ng) * L.dn_row_bytes;
@@ -1085,7 +1502,9 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
             for (int g = 0; g < ng; ++g)
                 for (int h = 0; h < 2; ++h) {
                     pf.step();
-                    decode_dn16(L.dn, base + std::size_t(32 * g + 16 * h) * L.dn_row_bytes, L.dn_row_bytes, W + kDnW * g, DW + kDnD * g, h);
+                    const std::uint8_t * rows = base + std::size_t(32 * g + 16 * h) * L.dn_row_bytes;
+                    if constexpr (P) decode_dn16_p(L.dn, rows, L.dn_row_bytes, W + kDnTile * g, DW + kDnD * g, h);
+                    else decode_dn16(L.dn, rows, L.dn_row_bytes, W + kDnTile * g, DW + kDnD * g, h);
                 }
             for (int i = pb; i < pe;) {
                 // up to kNtDN pairs, never one token twice (its first contribution must be stored before the next adds)
@@ -1108,13 +1527,14 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
                 if (n0 < n1)
                     for (std::size_t so = 0; so < 20 * cap; so += cap) {
                         const char * q = reinterpret_cast<const char *>(hq + 32 * (so + std::size_t(n0)));
-                        for (int c = 0; c < 32 * (n1 - n0); c += 64) _mm_prefetch(q + c, _MM_HINT_T0);
+                        for (int c = 0; c < int(32 * sizeof(HQ)) * (n1 - n0); c += 64) _mm_prefetch(q + c, _MM_HINT_T0);
                         _mm_prefetch(reinterpret_cast<const char *>(hd + so + std::size_t(n0)), _MM_HINT_T0);
-                        _mm_prefetch(reinterpret_cast<const char *>(hoff + so + std::size_t(n0)), _MM_HINT_T0);
+                        if (!P) _mm_prefetch(reinterpret_cast<const char *>(hoff + so + std::size_t(n0)), _MM_HINT_T0);
                     }
                 for (int g = 0; g < ng; ++g) {
                     for (int k = 0; k < m; ++k) in[k] = first[B.pair_token[std::size_t(i + k)]] ? kZeros : o[k];
-                    dn_kernel_n(m, W + kDnW * g, DW + kDnD * g, H, pair, in, o, B.pair_weight.data() + i);
+                    if constexpr (P) dn_kernel_p_n(m, W + kDnTile * g, DW + kDnD * g, H, pair, in, o, B.pair_weight.data() + i);
+                    else dn_kernel_n(m, W + kDnTile * g, DW + kDnD * g, H, pair, in, o, B.pair_weight.data() + i);
                     for (int k = 0; k < m; ++k) o[k] += 32;
                 }
                 for (int k = 0; k < m; ++k) first[B.pair_token[std::size_t(i + k)]] = 0;
@@ -1126,6 +1546,122 @@ void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::
         for (int t = 0; t < n_tokens; ++t)
             if (first[t]) std::memset(out + std::size_t(t) * kEmbd + r0, 0, sizeof(float) * 32 * std::size_t(ng));
     });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Export: one expert in the GGUF's own encoding, rebuilt bit for bit from the resident copy.
+
+namespace {
+
+// Reverse of k_iq3s_grid: the 3-bit magnitude codes of 4 weights, c0 | c1 << 3 | c2 << 6 | c3 << 9 -> grid index. The
+// 512 grid entries are distinct, so the index is unique.
+const std::int32_t * iq3s_grid_index() {
+    static const std::vector<std::int32_t> table = [] {
+        std::vector<std::int32_t> t(4096, 0);
+        for (int i = 0; i < 512; ++i) {
+            int key = 0;
+            for (int j = 0; j < 4; ++j) key |= int((((k_iq3s_grid[i] >> (8 * j)) & 0xFF) - 1) / 2) << (3 * j);
+            t[std::size_t(key)] = i;
+        }
+        return t;
+    }();
+    return table.data();
+}
+
+// 32 codes (one per byte, weight order) -> 16 bytes, byte j = code j | code j+16 << 4: an IQ4_XS sub-block or IQ4_NL block.
+inline __m128i pack_nibbles(__m256i codes) {
+    return _mm_or_si128(_mm256_castsi256_si128(codes), _mm_slli_epi16(_mm256_extracti128_si256(codes, 1), 4));
+}
+
+// Q4L -> IQ3_S. Per 32 weights: the sign bits are bit 3 of the codes; each group of 4 magnitudes is a grid entry whose
+// index splits into qs (low 8 bits) and one qh bit.
+void export_iq3s_block(const BlockQ4L & s, BlockIQ3_S & d, const std::int32_t * index) {
+    d.d = s.d;
+    std::memcpy(d.scales, s.scales, 4);
+    const __m256i m = _mm256_set1_epi8(0x0F), m7 = _mm256_set1_epi8(7);
+    for (int c = 0; c < 4; ++c) {
+        const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s.qs + 32 * c));
+        for (int half = 0; half < 2; ++half) {
+            const int sub = 2 * c + half;
+            const __m256i codes = _mm256_and_si256(half ? _mm256_srli_epi16(raw, 4) : raw, m);
+            const std::uint32_t sg = std::uint32_t(_mm256_movemask_epi8(_mm256_slli_epi16(codes, 4)));
+            std::memcpy(d.signs + 4 * sub, &sg, 4);
+            const __m256i key = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_and_si256(codes, m7), _mm256_set1_epi16(0x0801)),
+                                                  _mm256_set1_epi32(0x00400001));
+            const __m256i idx = _mm256_i32gather_epi32(index, key, 4);
+            _mm_storel_epi64(reinterpret_cast<__m128i *>(d.qs + 8 * sub), _mm256_cvtepi32_epi8(idx));
+            d.qh[sub] = std::uint8_t(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32(idx, 23))));
+        }
+    }
+}
+
+// Q4X -> IQ4_XS: 6-bit scales back into 4 + 2 bit fields, nibbles back into ggml's order.
+void export_iq4xs_block(const BlockQ4X & s, BlockIQ4_XS & d) {
+    d.d = s.d;
+    std::uint16_t sh = 0;
+    std::uint8_t sl[4] = {};
+    for (int ib = 0; ib < 8; ++ib) {
+        const int ls = s.scales[ib] + 32;
+        sl[ib / 2] = std::uint8_t(sl[ib / 2] | (ls & 0xF) << 4 * (ib % 2));
+        sh = std::uint16_t(sh | (ls >> 4) << 2 * ib);
+    }
+    d.scales_h = sh;
+    std::memcpy(d.scales_l, sl, 4);
+    const __m256i m = _mm256_set1_epi8(0x0F);
+    for (int c = 0; c < 4; ++c) {
+        const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s.qs + 32 * c));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(d.qs + 32 * c), pack_nibbles(_mm256_and_si256(raw, m)));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(d.qs + 32 * c + 16), pack_nibbles(_mm256_and_si256(_mm256_srli_epi16(raw, 4), m)));
+    }
+}
+
+// IQ4L -> 20 IQ4_NL blocks.
+void export_iq4nl_row(const RowIQ4L & s, BlockIQ4_NL * d) {
+    const __m256i m = _mm256_set1_epi8(0x0F);
+    for (int c = 0; c < 10; ++c) {
+        const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s.qs + 32 * c));
+        d[2 * c].d = s.d[2 * c];
+        d[2 * c + 1].d = s.d[2 * c + 1];
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(d[2 * c].qs), pack_nibbles(_mm256_and_si256(raw, m)));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(d[2 * c + 1].qs), pack_nibbles(_mm256_and_si256(_mm256_srli_epi16(raw, 4), m)));
+    }
+}
+
+}  // namespace
+
+CpuExperts::ExportSizes CpuExperts::export_sizes(int layer) const {
+    if (!has_layer(layer)) throw std::runtime_error("CpuExperts: layer " + std::to_string(layer) + " is not loaded");
+    const Layer & L = *layers_[std::size_t(layer)];
+    return {row_bytes(L.gu == GateUp::Q4L ? GgufType::IQ3_S : GgufType::IQ4_XS, kEmbd) * kFF,
+            row_bytes(L.dn == Down::IQ4L ? GgufType::IQ4_NL : GgufType::Q8_0, kFF) * kEmbd};
+}
+
+void CpuExperts::export_expert(int layer, int e, std::uint8_t * gate, std::uint8_t * up, std::uint8_t * down) const {
+    if (!has_layer(layer)) throw std::runtime_error("CpuExperts: layer " + std::to_string(layer) + " is not loaded");
+    if (e < 0 || e >= kExperts) throw std::runtime_error("CpuExperts: expert id out of range");
+    const Layer & L = *layers_[std::size_t(layer)];
+    const std::uint8_t * src[2] = {L.gate.p + std::size_t(e) * L.gu_expert_bytes, L.up.p + std::size_t(e) * L.gu_expert_bytes};
+    std::uint8_t * dst[2] = {gate, up};
+    for (int k = 0; k < 2; ++k) {
+        if (!dst[k]) continue;
+        if (L.gu == GateUp::Q4L) {
+            const std::int32_t * index = iq3s_grid_index();
+            const auto * sb = reinterpret_cast<const BlockQ4L *>(src[k]);
+            auto * db = reinterpret_cast<BlockIQ3_S *>(dst[k]);
+            for (int i = 0; i < kFF * 10; ++i) export_iq3s_block(sb[i], db[i], index);
+        } else {
+            const auto * sb = reinterpret_cast<const BlockQ4X *>(src[k]);
+            auto * db = reinterpret_cast<BlockIQ4_XS *>(dst[k]);
+            for (int i = 0; i < kFF * 10; ++i) export_iq4xs_block(sb[i], db[i]);
+        }
+    }
+    if (!down) return;
+    const std::uint8_t * ds = L.down.p + std::size_t(e) * L.dn_expert_bytes;
+    if (L.dn == Down::IQ4L) {
+        for (int r = 0; r < kEmbd; ++r) export_iq4nl_row(reinterpret_cast<const RowIQ4L *>(ds)[r], reinterpret_cast<BlockIQ4_NL *>(down) + 20 * r);
+    } else {
+        std::memcpy(down, ds, L.dn_expert_bytes);
+    }
 }
 
 }  // namespace ninfer::flashnext

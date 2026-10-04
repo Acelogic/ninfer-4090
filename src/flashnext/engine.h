@@ -18,6 +18,8 @@ namespace ninfer::flashnext {
 struct EngineOptions {
     std::int64_t max_ctx = 32768;         // KV cache length
     int cpu_threads = 16;                 // expert threads
+    bool precise_cpu_experts = true;      // 16-bit activations for the CPU experts (5e-5 error instead of 1.3%)
+    bool pin_cpu_threads = true;          // pin the expert threads to physical cores
     std::int64_t expert_cache_mib = -1;   // VRAM for routed experts; -1: all that is free but the reserve
     std::int64_t vram_reserve_mib = 1536; // left free for the desktop and other programs
     std::string routing_stats;            // per-layer expert counts that choose the cached experts ("" = none)

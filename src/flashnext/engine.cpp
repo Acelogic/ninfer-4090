@@ -220,7 +220,11 @@ struct Engine::Impl {
         load();
         allocate();
         if (!opt.mtp_path.empty()) load_mtp();
-        experts = std::make_unique<CpuExperts>(model, CpuExpertsConfig{opt.cpu_threads, {}});
+        CpuExpertsConfig ec;
+        ec.threads = opt.cpu_threads;
+        ec.precise_activations = opt.precise_cpu_experts;
+        ec.pin_threads = opt.pin_cpu_threads;
+        experts = std::make_unique<CpuExperts>(model, ec);
         counts.assign(std::size_t(cfg.n_layer) * fc::kExperts, 0);
         recent.assign(counts.size(), 0.0);
         if (!opt.routing_stats.empty()) load_routing(opt.routing_stats);
@@ -320,10 +324,7 @@ struct Engine::Impl {
                     workers.emplace_back([&, t] {
                         for (std::size_t j = t; j < n; j += nt) {
                             const Swap & sw = swaps[b0 + j];
-                            const std::string b = "blk." + std::to_string(sw.il) + ".";
-                            fc::pack_expert(cache[std::size_t(sw.il)].lay, model.tensor(b + "ffn_gate_exps.weight"),
-                                            model.tensor(b + "ffn_up_exps.weight"), model.tensor(b + "ffn_down_exps.weight"), sw.in,
-                                            swap_staging->get() + j * slot_max);
+                            pack_slot(sw.il, sw.in, swap_staging->get() + j * slot_max);
                         }
                     });
                 for (auto & w : workers) w.join();
@@ -593,6 +594,17 @@ struct Engine::Impl {
         snaps_valid = false;
     }
 
+    // Slot image of expert e of layer il, rebuilt from the CPU's resident copy (bit-exact, and it never
+    // touches the memory-mapped GGUF, whose pages may have been evicted to disk).
+    void pack_slot(int il, int e, std::uint8_t * dst) {
+        const LayerCache & C = cache[std::size_t(il)];
+        const CpuExperts::ExportSizes sz = experts->export_sizes(il);
+        thread_local std::vector<std::uint8_t> tmp;
+        tmp.resize(2 * sz.gate_up + sz.down);
+        experts->export_expert(il, e, tmp.data(), tmp.data() + sz.gate_up, tmp.data() + 2 * sz.gate_up);
+        fc::pack_expert_rows(C.lay, tmp.data(), tmp.data() + sz.gate_up, tmp.data() + 2 * sz.gate_up, dst);
+    }
+
     void release_experts() {
         for (int il = 0; il < cfg.n_layer; ++il) {
             const std::string b = "blk." + std::to_string(il) + ".";
@@ -621,15 +633,10 @@ struct Engine::Impl {
             check(cudaHostAlloc(reinterpret_cast<void **>(&images[std::size_t(il)]), bytes, cudaHostAllocMapped | cudaHostAllocPortable),
                   "expert images");
             check(cudaHostGetDevicePointer(reinterpret_cast<void **>(&images_d[std::size_t(il)]), images[std::size_t(il)], 0), "expert images");
-            const std::string b = "blk." + std::to_string(il) + ".";
-            const GgufTensor & g = model.tensor(b + "ffn_gate_exps.weight");
-            const GgufTensor & u = model.tensor(b + "ffn_up_exps.weight");
-            const GgufTensor & d = model.tensor(b + "ffn_down_exps.weight");
             std::vector<std::thread> workers;
             for (int t = 0; t < 16; ++t)
                 workers.emplace_back([&, t] {
-                    for (int e = t; e < fc::kExperts; e += 16)
-                        fc::pack_expert(C.lay, g, u, d, e, images[std::size_t(il)] + std::size_t(e) * C.lay.slot_bytes);
+                    for (int e = t; e < fc::kExperts; e += 16) pack_slot(il, e, images[std::size_t(il)] + std::size_t(e) * C.lay.slot_bytes);
                 });
             for (auto & w : workers) w.join();
         }
@@ -675,16 +682,12 @@ struct Engine::Impl {
             std::vector<int> & list = chosen[std::size_t(il)];
             std::sort(list.begin(), list.end());
             if (!list.empty()) {
-                const std::string b = "blk." + std::to_string(il) + ".";
-                const GgufTensor & g = model.tensor(b + "ffn_gate_exps.weight");
-                const GgufTensor & u = model.tensor(b + "ffn_up_exps.weight");
-                const GgufTensor & d = model.tensor(b + "ffn_down_exps.weight");
                 const int nt = std::max(1, std::min(16, int(list.size())));
                 std::vector<std::thread> pool;
                 for (int t = 0; t < nt; ++t)
                     pool.emplace_back([&, t] {
                         for (std::size_t j = std::size_t(t); j < list.size(); j += std::size_t(nt))
-                            fc::pack_expert(C.lay, g, u, d, list[j], staging->get() + j * C.lay.slot_bytes);
+                            pack_slot(il, list[j], staging->get() + j * C.lay.slot_bytes);
                     });
                 for (auto & th : pool) th.join();
                 C.pool = fc::DeviceBuffer(list.size() * C.lay.slot_bytes);

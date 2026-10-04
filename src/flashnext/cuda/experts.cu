@@ -200,22 +200,26 @@ ExpertLayout expert_layout(GgufType gate_up, GgufType down) {
 
 void pack_expert(const ExpertLayout & l, const GgufTensor & gate, const GgufTensor & up, const GgufTensor & down, int e, std::uint8_t * dst) {
     if (gate.type != l.gate_type || up.type != l.gate_type || down.type != l.down_type) throw std::runtime_error("pack_expert: type mismatch");
-    if (e < 0 || e >= gate.shape[2]) throw std::runtime_error("pack_expert: expert out of range");
+    if (e < 0 || e >= gate.shape[2] || e >= up.shape[2] || e >= down.shape[2]) throw std::runtime_error("pack_expert: expert out of range");
+    const std::size_t gbytes = kExpertFF * l.gate_row, dbytes = std::size_t(kEmbd) * row_bytes(down.type, kExpertFF);
+    pack_expert_rows(l, gate.data + std::size_t(e) * gbytes, up.data + std::size_t(e) * gbytes, down.data + std::size_t(e) * dbytes, dst);
+}
+
+void pack_expert_rows(const ExpertLayout & l, const std::uint8_t * gate, const std::uint8_t * up, const std::uint8_t * down, std::uint8_t * dst) {
     std::memset(dst, 0, l.slot_bytes);
     const std::size_t gbytes = kExpertFF * l.gate_row;
-    std::memcpy(dst, gate.data + std::size_t(e) * gbytes, gbytes);
-    std::memcpy(dst + l.up_off, up.data + std::size_t(e) * gbytes, gbytes);
-    const std::size_t drow = row_bytes(down.type, kExpertFF);
-    const std::uint8_t * src = down.data + std::size_t(e) * kEmbd * drow;
+    std::memcpy(dst, gate, gbytes);
+    std::memcpy(dst + l.up_off, up, gbytes);
+    const std::size_t drow = row_bytes(l.down_type, kExpertFF);
     auto * scales = reinterpret_cast<std::uint16_t *>(dst + l.scale_off);
     for (int r = 0; r < kEmbd; ++r) {
         for (int b = 0; b < kExpertFF / 32; ++b) {
             if (l.down_type == GgufType::IQ4_NL) {
-                const auto & blk = reinterpret_cast<const BlockIQ4_NL *>(src + std::size_t(r) * drow)[b];
+                const auto & blk = reinterpret_cast<const BlockIQ4_NL *>(down + std::size_t(r) * drow)[b];
                 std::memcpy(dst + l.down_off + std::size_t(r) * (kExpertFF / 2) + 16 * b, blk.qs, 16);
                 scales[r * (kExpertFF / 32) + b] = blk.d;
             } else {
-                const auto & blk = reinterpret_cast<const BlockQ8_0 *>(src + std::size_t(r) * drow)[b];
+                const auto & blk = reinterpret_cast<const BlockQ8_0 *>(down + std::size_t(r) * drow)[b];
                 std::memcpy(dst + l.down_off + std::size_t(r) * kExpertFF + 32 * b, blk.qs, 32);
                 scales[r * (kExpertFF / 32) + b] = blk.d;
             }

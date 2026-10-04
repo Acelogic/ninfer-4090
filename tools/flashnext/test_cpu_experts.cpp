@@ -6,9 +6,12 @@
 //             and the double-precision reference
 //   speed:    decode-shaped calls over several layers, projected to 48 layers; with --batch, prefill
 //             chunks of the given sizes, all pairs on the CPU and with a GPU expert cache
+//   All of the above for 8-bit and for 16-bit (precise) activations.
+//   export:   export_expert reproduces the GGUF bytes of every expert of every loaded layer; its speed
 // Usage: test_cpu_experts <shards...> [--layers 0,2,4,...] [--threads 16] [--tokens 40] [--batch 64,256,1024,4096]
-//        [--no-pin]
+//        [--no-pin] [--mode int8|precise|both] [--no-export]
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -18,6 +21,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "flashnext/cpu_experts.h"
@@ -115,30 +119,72 @@ static void run_chunked(CpuExperts & ex, int il, int n, const float * x, const s
     }
 }
 
-int main(int argc, char ** argv) {
-    setvbuf(stdout, nullptr, _IONBF, 0);
-    std::vector<std::string> shards;
+struct Options {
     std::vector<int> layers = {0, 2, 4};
     std::vector<int> batch_sizes;
     int threads = 16, tokens = 40;
     bool pin = true;
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--layers" || a == "--batch") {
-            std::vector<int> & list = a == "--layers" ? layers : batch_sizes;
-            list.clear();
-            std::stringstream ss(argv[++i]);
-            for (std::string v; std::getline(ss, v, ',');) list.push_back(std::stoi(v));
-        } else if (a == "--threads") threads = std::stoi(argv[++i]);
-        else if (a == "--tokens") tokens = std::stoi(argv[++i]);
-        else if (a == "--no-pin") pin = false;
-        else shards.push_back(a);
+};
+
+// export_expert: every expert of every loaded layer must reproduce the GGUF bytes; then its speed on 1 and on
+// `threads` threads, in GGUF bytes written.
+static int test_export(const GgufModel & m, const CpuExperts & ex, const Options & o) {
+    int failures = 0;
+    double bytes = 0, single = 0;
+    for (int il : o.layers) {
+        const CpuExperts::ExportSizes sz = ex.export_sizes(il);
+        const std::string p = "blk." + std::to_string(il) + ".";
+        const GgufTensor & tg = m.tensor(p + "ffn_gate_exps.weight");
+        const GgufTensor & tu = m.tensor(p + "ffn_up_exps.weight");
+        const GgufTensor & td = m.tensor(p + "ffn_down_exps.weight");
+        std::vector<std::uint8_t> g(sz.gate_up), u(sz.gate_up), d(sz.down);
+        int bad = 0;
+        for (int e = 0; e < 512; ++e) {
+            const auto a = clk::now();
+            ex.export_expert(il, e, g.data(), u.data(), d.data());
+            single += std::chrono::duration<double>(clk::now() - a).count();
+            bytes += 2.0 * double(sz.gate_up) + double(sz.down);
+            bad += std::memcmp(g.data(), tg.data + std::size_t(e) * sz.gate_up, sz.gate_up) != 0 ||
+                   std::memcmp(u.data(), tu.data + std::size_t(e) * sz.gate_up, sz.gate_up) != 0 ||
+                   std::memcmp(d.data(), td.data + std::size_t(e) * sz.down, sz.down) != 0;
+        }
+        failures += bad != 0;
+        printf("layer %2d export_expert %s/%s: %d of 512 experts differ from the GGUF bytes  %s\n", il, type_name(tg.type), type_name(td.type), bad,
+               bad ? "FAIL" : "ok");
     }
-    GgufModel m(shards);
+    std::atomic<int> next{0};
+    const int jobs = int(o.layers.size()) * 512;
+    const auto a = clk::now();
+    std::vector<std::thread> pool;
+    for (int t = 0; t < o.threads; ++t)
+        pool.emplace_back([&] {
+            std::vector<std::uint8_t> g, u, d;
+            for (int k = next++; k < jobs; k = next++) {
+                const int il = o.layers[std::size_t(k / 512)];
+                const CpuExperts::ExportSizes sz = ex.export_sizes(il);
+                g.resize(sz.gate_up), u.resize(sz.gate_up), d.resize(sz.down);
+                ex.export_expert(il, k % 512, g.data(), u.data(), d.data());
+            }
+        });
+    for (auto & t : pool) t.join();
+    const double multi = std::chrono::duration<double>(clk::now() - a).count();
+    printf("export_expert: %.2f GB/s on 1 thread, %.1f GB/s on %d threads (%.2f MB per expert on average)\n", bytes / single / 1e9,
+           bytes / multi / 1e9, o.threads, bytes / jobs / 1e6);
+    return failures;
+}
+
+static int test_mode(const GgufModel & m, const Options & o, bool precise, bool do_export) {
+    const std::vector<int> & layers = o.layers;
+    const std::vector<int> & batch_sizes = o.batch_sizes;
+    const int tokens = o.tokens;
     auto t0 = clk::now();
-    CpuExperts ex(m, {threads, layers, pin});
-    printf("loaded %zu layers in %.1f s, %.2f GiB resident\n", layers.size(),
+    CpuExperts ex(m, {o.threads, layers, o.pin, precise});
+    printf("== %s activations: loaded %zu layers in %.1f s, %.2f GiB resident\n", precise ? "16-bit (precise)" : "8-bit", layers.size(),
            std::chrono::duration<double>(clk::now() - t0).count(), ex.resident_bytes() / 1073741824.0);
+    // 8-bit activations give about 1.3% against exact math, 16-bit about 5e-5. run_batch's gate/up equal run()'s bit for
+    // bit with 8-bit activations; with 16-bit ones they differ by float rounding, which flips a few of h's 32767-step
+    // roundings, so the two agree to about 1e-5 rather than 1e-7.
+    const double exact_max = precise ? 1e-3 : 0.03, same_max = precise ? 2e-5 : 1e-5;
 
     std::mt19937 rng(5);
     std::normal_distribution<float> nd(0, 1);
@@ -183,9 +229,9 @@ int main(int argc, char ** argv) {
             }
             same &= std::sqrt(dn / dd) < 1e-5;
         }
-        const bool ok = rel < 0.03 && same;
+        const bool ok = rel < exact_max && same;
         failures += !ok;
-        printf("layer %2d %-14s rel. error vs exact %.3f%%, batched matches single: %s  %s\n", il, ex.format_name(il), 100 * rel,
+        printf("layer %2d %-14s rel. error vs exact %.4f%%, batched matches single: %s  %s\n", il, ex.format_name(il), 100 * rel,
                same ? "yes" : "NO", ok ? "ok" : "FAIL");
     }
 
@@ -243,10 +289,10 @@ int main(int argc, char ** argv) {
             }
             exact = std::max(exact, std::sqrt(num / den));
         }
-        const bool ok = worst < 1e-5 && worst_all < 1e-5 && zero && exact < 0.03;
+        const bool ok = worst < same_max && worst_all < same_max && zero && exact < exact_max;
         failures += !ok;
         printf("layer %2d run_batch vs run(): max rel. diff %.1e (300 tokens, part on CPU), %.1e (1 and 40 tokens, all); idle tokens zero: %s; "
-               "rel. error vs exact %.3f%%  %s\n",
+               "rel. error vs exact %.4f%%  %s\n",
                il, worst, worst_all, zero ? "yes" : "NO", 100 * exact, ok ? "ok" : "FAIL");
     }
 
@@ -278,6 +324,8 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (do_export) failures += test_export(m, ex, o);
+
     // prefill speed: chunks of each size on every layer, (a) all pairs on the CPU, (b) the cached 27% of experts on the GPU
     if (!batch_sizes.empty()) {
         const int max_t = *std::max_element(batch_sizes.begin(), batch_sizes.end());
@@ -287,7 +335,7 @@ int main(int argc, char ** argv) {
         for (auto & v : xb) v = nd(rng);
         constexpr double kMacsPerPair = 3.0 * 2560 * 640;  // gate, up, down
         printf("prefill, %zu layers, projected to 48:\n", layers.size());
-        printf("  tokens  pairs     CPU pairs  experts  ms/layer   GB/s  int8 TOPS  tokens/s\n");
+        printf("  tokens  pairs     CPU pairs  experts  ms/layer   GB/s  %s TOPS  tokens/s\n", precise ? "int16" : " int8");
         for (int T : batch_sizes) {
             for (int gpu : {0, 1}) {
                 double bytes = 0, pairs = 0, experts = 0;
@@ -318,6 +366,33 @@ int main(int argc, char ** argv) {
             }
         }
     }
+    return failures;
+}
+
+int main(int argc, char ** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    std::vector<std::string> shards;
+    Options o;
+    std::string mode = "both";
+    bool do_export = true;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--layers" || a == "--batch") {
+            std::vector<int> & list = a == "--layers" ? o.layers : o.batch_sizes;
+            list.clear();
+            std::stringstream ss(argv[++i]);
+            for (std::string v; std::getline(ss, v, ',');) list.push_back(std::stoi(v));
+        } else if (a == "--threads") o.threads = std::stoi(argv[++i]);
+        else if (a == "--tokens") o.tokens = std::stoi(argv[++i]);
+        else if (a == "--no-pin") o.pin = false;
+        else if (a == "--mode") mode = argv[++i];
+        else if (a == "--no-export") do_export = false;
+        else shards.push_back(a);
+    }
+    GgufModel m(shards);
+    int failures = 0;
+    if (mode != "precise") failures += test_mode(m, o, false, do_export);
+    if (mode != "int8") failures += test_mode(m, o, true, do_export && mode == "precise");
     printf(failures ? "FAILED\n" : "ALL OK\n");
     return failures ? 1 : 0;
 }

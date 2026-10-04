@@ -10,10 +10,12 @@
 // to the CPU. Tokens that share an expert share one pass over its weights.
 //
 // run() serves decode (up to 16 tokens, bound by RAM bandwidth). run_batch() serves prefill chunks:
-// with hundreds of tokens per expert the work is bound by int8 throughput, so it decodes each group
+// with hundreds of tokens per expert the work is bound by integer throughput, so it decodes each group
 // of 16 weight rows once into an L1/L2 tile and runs a register-blocked VNNI kernel over all of the
 // expert's tokens. Both quantize activations the same way and give the same results up to float
-// summation order. Neither is reentrant: one call at a time per CpuExperts.
+// summation order (8-bit activations; with 16-bit ones up to about 1e-5, see test_cpu_experts).
+// Neither is reentrant: one call at a time per CpuExperts. export_expert() rebuilds an expert's
+// original GGUF bytes from the resident copy.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +34,11 @@ struct CpuExpertsConfig {
     // run_batch). Left to the scheduler, 16 busy threads often share SMT pairs while other cores idle: run_batch() on
     // 4096-token chunks measured 20% slower; decode (run) speed is unaffected.
     bool pin_threads = true;
+    // 16-bit instead of 8-bit activations (x per 256, h per 32, as before), multiplied as int16 x int16 with exact int32
+    // sums per block: the error against exact math drops from about 1.2% to 5e-5. Decode speed is unchanged (within
+    // 1%), as is run_batch where RAM bounds it (up to about 1024 tokens with a GPU cache); compute-bound chunks are
+    // slower, 4096 tokens 1.4x (GPU cache) to 1.6x (all on the CPU).
+    bool precise_activations = true;
 };
 
 class CpuExperts {
@@ -54,10 +61,22 @@ public:
 
     // Same contract as run(), for 1..kMaxBatchTokens tokens (prefill). Every expert with at least
     // one pair is read from RAM once per call. Scratch is allocated on the first call and grows to
-    // the largest n_tokens seen: about 11 KB per token, plus 240 KB per pool thread.
+    // the largest n_tokens seen: about 11 KB per token (19 KB with precise activations), plus 240 KB
+    // (410 KB) per pool thread.
     void run_batch(int layer, int n_tokens, const float * x, const std::int32_t * ids, const float * weights,
                    const std::uint8_t * on_cpu, float * out);
 
+    // Expert e of `layer` in the GGUF's own encoding, rebuilt bit for bit from the resident copy (every repack is
+    // lossless): gate and up as kFF rows of row_bytes(type, kEmbd), down as kEmbd rows of row_bytes(type, kFF), i.e.
+    // exactly the expert's slice of the GGUF tensors. A null pointer skips that matrix. Thread-safe; it only reads the
+    // resident weights, so it may also run while run() or run_batch() runs.
+    void export_expert(int layer, int e, std::uint8_t * gate, std::uint8_t * up, std::uint8_t * down) const;
+    struct ExportSizes {
+        std::size_t gate_up, down;  // bytes export_expert writes to gate (and to up), and to down
+    };
+    ExportSizes export_sizes(int layer) const;
+
+    bool precise_activations() const { return precise_; }
     bool has_layer(int layer) const;
     std::size_t resident_bytes() const { return resident_bytes_; }
     // Bytes of weights one expert of this layer streams per call (gate + up + down).
@@ -67,8 +86,13 @@ public:
     struct Layer;
 
 private:
+    template <bool Precise>
+    void run_batch_impl(int layer, int n_tokens, const float * x, const std::int32_t * ids, const float * weights,
+                        const std::uint8_t * on_cpu, float * out);
+
     std::vector<std::unique_ptr<Layer>> layers_;
     SpinPool pool_;
+    bool precise_ = false;
     std::size_t resident_bytes_ = 0;
     std::uint64_t caller_affinity_ = 0;  // logical processor for the calling thread during run_batch (0 = not pinned)
     struct Scratch;
