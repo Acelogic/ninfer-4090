@@ -101,9 +101,15 @@ void swiglu(const float * g, const float * u, float * h, int n, cudaStream_t s);
 void ffn_combine(const float * moe, const float * shared, const float * shared_gate, float * out, int T, cudaStream_t s);
 // slots[i] = map[ids[i]] for the T * 10 selected experts (map: the layer's expert -> cache slot, -1 if not cached)
 void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, int T, cudaStream_t s);
-// out[t] = sum_k gpu_pairs[t*10+k] + cpu[t] + shared[t] * sigmoid(shared_gate_logit[t])
-void moe_combine(const float * gpu_pairs, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,
-                 cudaStream_t s);
+// Assigns the T * 10 selected experts: slots[i] = the VRAM cache slot (or -1); of the rest, the first
+// zc_permille / 1000 of them (rounded) are read by the GPU straight from host memory (host_slots[i] =
+// expert id, else -1) and the others go to the CPU (on_cpu[i] = 1).
+void moe_plan(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, std::int32_t * host_slots, std::uint8_t * on_cpu,
+              int T, int zc_permille, cudaStream_t s);
+// out[t] = sum_k gpu_pairs[t*10+k] (+ host_pairs[t*10+k]) + cpu[t] + shared[t] * sigmoid(shared_gate_logit[t]);
+// host_pairs may be null
+void moe_combine(const float * gpu_pairs, const float * host_pairs, const float * cpu, const float * shared, const float * shared_gate,
+                 float * out, int T, cudaStream_t s);
 
 // ---- GPU <-> CPU hand-off of the routed experts, through mapped host memory ----
 // The GPU writes a layer's selections and FFN input, then raises req; the CPU computes the experts
@@ -116,12 +122,13 @@ struct alignas(64) ExpertLink {
     std::int64_t pad1[7];
     std::int32_t ids[kMaxTokens * kUsed];
     float weights[kMaxTokens * kUsed];
+    std::uint8_t on_cpu[kMaxTokens * kUsed];  // the pairs the CPU computes (the GPU takes the rest)
     float x[kMaxTokens * kEmbd];
     float out[kMaxTokens * kEmbd];
 };
 // link: device address of the mapped ExpertLink; seq: device address of the step's sequence number
-void link_signal(const std::int32_t * ids, const float * weights, const float * x, int T, ExpertLink * link, const std::int64_t * seq,
-                 cudaStream_t s);
+void link_signal(const std::int32_t * ids, const float * weights, const std::uint8_t * on_cpu, const float * x, int T, ExpertLink * link,
+                 const std::int64_t * seq, cudaStream_t s);
 // Waits for link->done == *seq, then copies link->out to out [T][2560]. After about a second
 // without an answer it gives up, writes zeros and sets *error (Windows resets a GPU after 2 s).
 void link_wait(ExpertLink * link, const std::int64_t * seq, float * out, int T, int * error, cudaStream_t s);

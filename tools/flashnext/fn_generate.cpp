@@ -3,6 +3,7 @@
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
+//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
@@ -143,6 +144,8 @@ static int run(int argc, char ** argv) {
         else if (a == "--no-graphs") opt.cuda_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--test-snapshot") test_snapshot = true;
+        else if (a == "--no-host-images") opt.host_expert_images = false;
+        else if (a == "--gpu-miss-permille") opt.gpu_miss_permille = std::stoi(next());
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -310,9 +313,12 @@ static int run(int argc, char ** argv) {
         const EngineStats & st = engine.stats();
         const double cpu_ms = st.cpu_experts_ms - after_prompt.cpu_experts_ms, eng_ms = st.step_ms - after_prompt.step_ms;
         const std::int64_t hits = st.expert_hits - after_prompt.expert_hits, pairs = st.expert_pairs - after_prompt.expert_pairs;
-        std::printf("decode: %zu tokens, %.2f ms/token (%.2f tok/s); CPU experts %.1f%% of engine time; VRAM expert hits %.1f%%\n",
+        const std::int64_t host = st.expert_host_reads - after_prompt.expert_host_reads;
+        std::printf("decode: %zu tokens, %.2f ms/token (%.2f tok/s); CPU experts %.1f%% of engine time; experts: %.1f%% VRAM, %.1f%% GPU from "
+                    "host memory, %.1f%% CPU\n",
                     step_times.size(), 1e3 * total / double(step_times.size()), double(step_times.size()) / total, 100.0 * cpu_ms / eng_ms,
-                    100.0 * double(hits) / double(std::max<std::int64_t>(1, pairs)));
+                    100.0 * double(hits) / double(std::max<std::int64_t>(1, pairs)), 100.0 * double(host) / double(std::max<std::int64_t>(1, pairs)),
+                    100.0 * double(pairs - hits - host) / double(std::max<std::int64_t>(1, pairs)));
     }
     if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
 

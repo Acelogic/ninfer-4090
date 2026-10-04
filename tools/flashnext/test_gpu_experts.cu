@@ -5,6 +5,7 @@
 // Usage: test_gpu_experts <shards...> [--layers 0,2,4,30] [--reps 200]
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <random>
 #include <set>
@@ -150,6 +151,31 @@ int main(int argc, char ** argv) {
         printf("layer %2d %s/%s slot %.2f MiB: rel. error vs exact %.2e, CPU pairs zero: %s; 10 experts %.1f us (%.0f GB/s)  %s\n", il,
                type_name(tg.type), type_name(td.type), lay.slot_bytes / 1048576.0, worst, zeros_ok ? "yes" : "NO", us, bytes / (us * 1e3),
                ok ? "ok" : "FAIL");
+
+        // the same experts read straight from pinned host memory over PCIe (zero-copy), 1 to 3 at a time
+        std::uint8_t * hpool = nullptr;
+        fc::check(cudaHostAlloc(reinterpret_cast<void **>(&hpool), host.size(), cudaHostAllocMapped), "host pool");
+        std::memcpy(hpool, host.data(), host.size());
+        std::uint8_t * dpool = nullptr;
+        fc::check(cudaHostGetDevicePointer(reinterpret_cast<void **>(&dpool), hpool, 0), "host pool");
+        for (int nexp : {1, 2, 3}) {
+            std::vector<std::int32_t> zc(10, -1);
+            for (int k = 0; k < nexp; ++k) zc[k] = hit[k];
+            fc::check(cudaMemcpy(dslots.get(), zc.data(), 40, cudaMemcpyHostToDevice), "slots");
+            const int zreps = 50;
+            cudaEventRecord(e0, s);
+            for (int r = 0; r < zreps; ++r) {
+                // a different set of experts each time, so nothing is served from L2
+                fc::experts_gpu(lay, dpool, dslots.as<std::int32_t>(), dw.as<float>(), dx.as<float>(), dh.as<float>(), dy.as<float>(), 1, s);
+            }
+            cudaEventRecord(e1, s);
+            fc::check(cudaEventSynchronize(e1), "sync");
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double zus = 1e3 * ms / zreps;
+            printf("         zero-copy from host memory, %d expert(s): %.1f us (%.1f GB/s)\n", nexp, zus,
+                   nexp * (lay.scale_off + 2560.0 * 20 * 2) / (zus * 1e3));
+        }
+        cudaFreeHost(hpool);
     }
     printf(failures ? "FAILED\n" : "ALL OK\n");
     return failures ? 1 : 0;

@@ -456,10 +456,12 @@ __device__ __forceinline__ std::uint64_t global_ns() {
 }
 
 __global__ void __launch_bounds__(256) k_link_signal(const std::int32_t * __restrict__ ids, const float * __restrict__ w,
-                                                     const float * __restrict__ x, int T, ExpertLink * link, const std::int64_t * seq) {
+                                                     const std::uint8_t * __restrict__ on_cpu, const float * __restrict__ x, int T,
+                                                     ExpertLink * link, const std::int64_t * seq) {
     for (int i = threadIdx.x; i < T * kUsed; i += blockDim.x) {
         link->ids[i] = ids[i];
         link->weights[i] = w[i];
+        link->on_cpu[i] = on_cpu[i];
     }
     for (int i = threadIdx.x; i < T * kEmbd; i += blockDim.x) link->x[i] = x[i];
     __threadfence_system();
@@ -495,14 +497,33 @@ __global__ void k_moe_slots(const std::int32_t * __restrict__ ids, const std::in
     if (i < n) slots[i] = map[ids[i]];
 }
 
-__global__ void k_moe_combine(const float * __restrict__ pairs, const float * __restrict__ cpu, const float * __restrict__ shared,
-                              const float * __restrict__ sg, float * __restrict__ out, int n) {
+__global__ void k_moe_plan(const std::int32_t * __restrict__ ids, const std::int32_t * __restrict__ map, std::int32_t * __restrict__ slots,
+                           std::int32_t * __restrict__ host_slots, std::uint8_t * __restrict__ on_cpu, int n, int zc_permille) {
+    if (threadIdx.x != 0) return;
+    int misses = 0;
+    for (int i = 0; i < n; ++i) misses += map[ids[i]] < 0;
+    const int to_gpu = (misses * zc_permille + 500) / 1000;
+    for (int i = 0, m = 0; i < n; ++i) {
+        const int slot = map[ids[i]];
+        slots[i] = slot;
+        const bool miss = slot < 0, zc = miss && m < to_gpu;
+        m += miss;
+        host_slots[i] = zc ? ids[i] : -1;
+        on_cpu[i] = miss && !zc;
+    }
+}
+
+__global__ void k_moe_combine(const float * __restrict__ pairs, const float * __restrict__ hpairs, const float * __restrict__ cpu,
+                              const float * __restrict__ shared, const float * __restrict__ sg, float * __restrict__ out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int t = i / kEmbd, r = i % kEmbd;
     float m = pairs[std::size_t(t * kUsed) * kEmbd + r];
 #pragma unroll
     for (int k = 1; k < kUsed; ++k) m = m + pairs[std::size_t(t * kUsed + k) * kEmbd + r];
+    if (hpairs)
+#pragma unroll
+        for (int k = 0; k < kUsed; ++k) m = m + hpairs[std::size_t(t * kUsed + k) * kEmbd + r];
     out[i] = (m + cpu[i]) + shared[i] * sigmoidf_(sg[t]);
 }
 
@@ -590,9 +611,9 @@ void store_rows(const float * src, float * dst, const std::int64_t * pos0, int r
     launched("store_rows");
 }
 
-void link_signal(const std::int32_t * ids, const float * weights, const float * x, int T, ExpertLink * link, const std::int64_t * seq,
-                 cudaStream_t s) {
-    k_link_signal<<<1, 256, 0, s>>>(ids, weights, x, T, link, seq);
+void link_signal(const std::int32_t * ids, const float * weights, const std::uint8_t * on_cpu, const float * x, int T, ExpertLink * link,
+                 const std::int64_t * seq, cudaStream_t s) {
+    k_link_signal<<<1, 256, 0, s>>>(ids, weights, on_cpu, x, T, link, seq);
     launched("link_signal");
 }
 void link_wait(ExpertLink * link, const std::int64_t * seq, float * out, int T, int * error, cudaStream_t s) {
@@ -625,9 +646,14 @@ void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t 
     k_moe_slots<<<blocks(std::size_t(T) * kUsed, 256), 256, 0, s>>>(ids, map, slots, T * kUsed);
     launched("moe_slots");
 }
-void moe_combine(const float * gpu_pairs, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,
-                 cudaStream_t s) {
-    k_moe_combine<<<blocks(std::size_t(T) * kEmbd, 256), 256, 0, s>>>(gpu_pairs, cpu, shared, shared_gate, out, T * kEmbd);
+void moe_plan(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, std::int32_t * host_slots, std::uint8_t * on_cpu,
+              int T, int zc_permille, cudaStream_t s) {
+    k_moe_plan<<<1, 32, 0, s>>>(ids, map, slots, host_slots, on_cpu, T * kUsed, zc_permille);
+    launched("moe_plan");
+}
+void moe_combine(const float * gpu_pairs, const float * host_pairs, const float * cpu, const float * shared, const float * shared_gate,
+                 float * out, int T, cudaStream_t s) {
+    k_moe_combine<<<blocks(std::size_t(T) * kEmbd, 256), 256, 0, s>>>(gpu_pairs, host_pairs, cpu, shared, shared_gate, out, T * kEmbd);
     launched("moe_combine");
 }
 

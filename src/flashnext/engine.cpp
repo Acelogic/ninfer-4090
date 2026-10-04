@@ -13,6 +13,14 @@
 
 #include <cuda_runtime.h>
 #include <immintrin.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include "flashnext/cpu_experts.h"
 #include "flashnext/cuda/experts.h"
@@ -57,6 +65,28 @@ public:
 private:
     T * p_ = nullptr;
 };
+
+std::uint64_t free_ram_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof(m);
+    return GlobalMemoryStatusEx(&m) ? m.ullAvailPhys : 0;
+#else
+    return std::uint64_t(sysconf(_SC_AVPHYS_PAGES)) * std::uint64_t(sysconf(_SC_PAGESIZE));
+#endif
+}
+
+// Drops part of the memory-mapped GGUF from the process's working set. The pages stay in the OS
+// file cache as standby memory (available to anyone) and are read back if touched again.
+void release_mapped(const void * p, std::size_t n) {
+#ifdef _WIN32
+    VirtualUnlock(const_cast<void *>(p), n);  // on pages that are not locked, this only trims them
+#else
+    const std::uintptr_t page = std::uintptr_t(sysconf(_SC_PAGESIZE));
+    const std::uintptr_t a = (std::uintptr_t(p) + page - 1) & ~(page - 1), b = (std::uintptr_t(p) + n) & ~(page - 1);
+    if (b > a) madvise(reinterpret_cast<void *>(a), b - a, MADV_DONTNEED);
+#endif
+}
 
 void require(bool ok, const char * what) {
     if (!ok) throw std::runtime_error(std::string("engine: model does not match the compiled shapes: ") + what);
@@ -117,6 +147,11 @@ struct Engine::Impl {
         std::vector<std::int32_t> map;
     };
     std::vector<LayerCache> cache;
+    // pinned images of every expert in the GPU layout, [layer][expert]; device addresses for zero-copy
+    std::vector<std::uint8_t *> images, images_d;
+    fc::DeviceBuffer host_slots, ypairs_host, plan_oncpu;
+    cudaStream_t stream2 = nullptr;
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     std::vector<std::int64_t> counts;  // routing counts [layer][expert]
     // Routing of recent tokens, decayed with a half-life of kRecentHalfLife tokens: a prompt predicts
     // the experts its continuation will use far better than counts gathered on other text.
@@ -143,6 +178,9 @@ struct Engine::Impl {
         validate();
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
         check(cudaEventCreateWithFlags(&ev_router, cudaEventDisableTiming), "event");
+        check(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking), "stream");
+        check(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming), "event");
+        check(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "event");
         fc::init_kernels();
         load();
         allocate();
@@ -151,6 +189,11 @@ struct Engine::Impl {
         recent.assign(counts.size(), 0.0);
         if (!opt.routing_stats.empty()) load_routing(opt.routing_stats);
         fill_cache();
+        release_experts();  // CpuExperts and the VRAM cache have their own copies now
+        if (opt.host_expert_images) {
+            build_images();
+            release_experts();
+        }
         reset();
     }
 
@@ -230,27 +273,31 @@ struct Engine::Impl {
         check(cudaStreamSynchronize(stream), "adapt");
         std::size_t slot_max = 0;
         for (const LayerCache & C : cache) slot_max = std::max(slot_max, C.lay.slot_bytes);
-        if (!swap_staging) swap_staging = std::make_unique<Pinned<std::uint8_t>>(slot_max * kSwapBatch);
+        if (!swap_staging && images.empty()) swap_staging = std::make_unique<Pinned<std::uint8_t>>(slot_max * kSwapBatch);
         for (std::size_t b0 = 0; b0 < swaps.size(); b0 += kSwapBatch) {
             const std::size_t n = std::min<std::size_t>(kSwapBatch, swaps.size() - b0);
-            std::vector<std::thread> workers;
-            const std::size_t nt = std::min<std::size_t>(16, n);
-            for (std::size_t t = 0; t < nt; ++t)
-                workers.emplace_back([&, t] {
-                    for (std::size_t j = t; j < n; j += nt) {
-                        const Swap & sw = swaps[b0 + j];
-                        const std::string b = "blk." + std::to_string(sw.il) + ".";
-                        fc::pack_expert(cache[std::size_t(sw.il)].lay, model.tensor(b + "ffn_gate_exps.weight"),
-                                        model.tensor(b + "ffn_up_exps.weight"), model.tensor(b + "ffn_down_exps.weight"), sw.in,
-                                        swap_staging->get() + j * slot_max);
-                    }
-                });
-            for (auto & w : workers) w.join();
+            if (images.empty()) {
+                std::vector<std::thread> workers;
+                const std::size_t nt = std::min<std::size_t>(16, n);
+                for (std::size_t t = 0; t < nt; ++t)
+                    workers.emplace_back([&, t] {
+                        for (std::size_t j = t; j < n; j += nt) {
+                            const Swap & sw = swaps[b0 + j];
+                            const std::string b = "blk." + std::to_string(sw.il) + ".";
+                            fc::pack_expert(cache[std::size_t(sw.il)].lay, model.tensor(b + "ffn_gate_exps.weight"),
+                                            model.tensor(b + "ffn_up_exps.weight"), model.tensor(b + "ffn_down_exps.weight"), sw.in,
+                                            swap_staging->get() + j * slot_max);
+                        }
+                    });
+                for (auto & w : workers) w.join();
+            }
             for (std::size_t j = 0; j < n; ++j) {
                 const Swap & sw = swaps[b0 + j];
                 LayerCache & C = cache[std::size_t(sw.il)];
-                check(cudaMemcpyAsync(C.pool.as<std::uint8_t>() + std::size_t(sw.slot) * C.lay.slot_bytes, swap_staging->get() + j * slot_max,
-                                      C.lay.slot_bytes, cudaMemcpyHostToDevice, stream),
+                const std::uint8_t * src = images.empty() ? swap_staging->get() + j * slot_max
+                                                          : images[std::size_t(sw.il)] + std::size_t(sw.in) * C.lay.slot_bytes;
+                check(cudaMemcpyAsync(C.pool.as<std::uint8_t>() + std::size_t(sw.slot) * C.lay.slot_bytes, src, C.lay.slot_bytes,
+                                      cudaMemcpyHostToDevice, stream),
                       "expert swap");
             }
             check(cudaStreamSynchronize(stream), "expert swap");
@@ -268,6 +315,48 @@ struct Engine::Impl {
                 check(cudaMemcpy(C.dmap.get(), C.map.data(), C.dmap.bytes(), cudaMemcpyHostToDevice), "expert map");
             }
         stats.cache_swaps += std::int64_t(swaps.size());
+    }
+
+    void release_experts() {
+        for (int il = 0; il < cfg.n_layer; ++il) {
+            const std::string b = "blk." + std::to_string(il) + ".";
+            for (const char * n : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+                const GgufTensor & t = model.tensor(b + n);
+                release_mapped(t.data, t.bytes);
+            }
+        }
+    }
+
+    // Packs every expert into pinned host memory in the GPU layout, if the RAM is there.
+    void build_images() {
+        std::uint64_t need = 0;
+        for (const LayerCache & C : cache) need += std::uint64_t(C.lay.slot_bytes) * fc::kExperts;
+        const std::uint64_t margin = std::uint64_t(16) << 30;
+        if (free_ram_bytes() < need + margin) {
+            std::fprintf(stderr, "engine: %.1f GiB of free RAM is not enough for the pinned expert images (%.1f GiB); misses stay on the CPU\n",
+                         free_ram_bytes() / 1073741824.0, need / 1073741824.0);
+            return;
+        }
+        images.assign(cache.size(), nullptr);
+        images_d.assign(cache.size(), nullptr);
+        for (int il = 0; il < cfg.n_layer; ++il) {
+            LayerCache & C = cache[std::size_t(il)];
+            const std::size_t bytes = C.lay.slot_bytes * fc::kExperts;
+            check(cudaHostAlloc(reinterpret_cast<void **>(&images[std::size_t(il)]), bytes, cudaHostAllocMapped | cudaHostAllocPortable),
+                  "expert images");
+            check(cudaHostGetDevicePointer(reinterpret_cast<void **>(&images_d[std::size_t(il)]), images[std::size_t(il)], 0), "expert images");
+            const std::string b = "blk." + std::to_string(il) + ".";
+            const GgufTensor & g = model.tensor(b + "ffn_gate_exps.weight");
+            const GgufTensor & u = model.tensor(b + "ffn_up_exps.weight");
+            const GgufTensor & d = model.tensor(b + "ffn_down_exps.weight");
+            std::vector<std::thread> workers;
+            for (int t = 0; t < 16; ++t)
+                workers.emplace_back([&, t] {
+                    for (int e = t; e < fc::kExperts; e += 16)
+                        fc::pack_expert(C.lay, g, u, d, e, images[std::size_t(il)] + std::size_t(e) * C.lay.slot_bytes);
+                });
+            for (auto & w : workers) w.join();
+        }
     }
 
     // Fills the free VRAM with the experts of highest routing count per byte.
@@ -336,6 +425,11 @@ struct Engine::Impl {
         for (cudaGraphExec_t g : graphs)
             if (g) cudaGraphExecDestroy(g);
         if (link_h) cudaFreeHost(link_h);
+        for (std::uint8_t * p : images)
+            if (p) cudaFreeHost(p);
+        if (ev_fork) cudaEventDestroy(ev_fork);
+        if (ev_join) cudaEventDestroy(ev_join);
+        if (stream2) cudaStreamDestroy(stream2);
         if (ev_router) cudaEventDestroy(ev_router);
         if (stream) cudaStreamDestroy(stream);
     }
@@ -495,8 +589,12 @@ struct Engine::Impl {
         check(cudaHostAlloc(reinterpret_cast<void **>(&link_h), link_bytes, cudaHostAllocMapped | cudaHostAllocPortable), "expert link");
         std::memset(link_h, 0, link_bytes);
         check(cudaHostGetDevicePointer(reinterpret_cast<void **>(&link_d), link_h, 0), "expert link");
-        eh = buf(std::size_t(fc::kUsed) * fc::kExpertFF);
+        eh = fc::DeviceBuffer((T + fc::kMaxTokens) * fc::kUsed * fc::kExpertFF * f);  // the decode tail is for the host-memory branch
         ypairs = buf(std::size_t(fc::kUsed) * fc::kEmbd);
+        // zero-copy reads of cache misses happen in decode steps only (kMaxTokens)
+        host_slots = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed * sizeof(std::int32_t));
+        plan_oncpu = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed);
+        ypairs_host = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed * fc::kEmbd * f);
         ple_hist = fc::DeviceBuffer(std::size_t(fc::kPleHist) * fc::kHcd * f);
     }
 
@@ -686,16 +784,28 @@ struct Engine::Impl {
         gemv(L.router, mixed, rlogits, T);
         fc::router_topk(rlogits.as<float>(), ids.as<std::int32_t>(), wts.as<float>(), T, stream);
         const std::int64_t * dseq = d_step.as<std::int64_t>() + 1;
-        fc::link_signal(ids.as<std::int32_t>(), wts.as<float>(), mixed.as<float>(), T, link_d + il, dseq, stream);
         LayerCache & C = cache[std::size_t(il)];
-        fc::moe_slots(ids.as<std::int32_t>(), C.dmap.as<std::int32_t>(), slots.as<std::int32_t>(), T, stream);
+        const bool zc = !images.empty() && opt.gpu_miss_permille > 0;
+        fc::moe_plan(ids.as<std::int32_t>(), C.dmap.as<std::int32_t>(), slots.as<std::int32_t>(), host_slots.as<std::int32_t>(),
+                     plan_oncpu.as<std::uint8_t>(), T, zc ? opt.gpu_miss_permille : 0, stream);
+        fc::link_signal(ids.as<std::int32_t>(), wts.as<float>(), plan_oncpu.as<std::uint8_t>(), mixed.as<float>(), T, link_d + il, dseq, stream);
+        if (zc) {
+            // misses read from host memory run beside the cached experts: PCIe and VRAM bandwidth add up
+            check(cudaEventRecord(ev_fork, stream), "fork");
+            check(cudaStreamWaitEvent(stream2, ev_fork, 0), "fork");
+            fc::experts_gpu(C.lay, images_d[std::size_t(il)], host_slots.as<std::int32_t>(), wts.as<float>(), mixed.as<float>(),
+                            eh.as<float>() + std::size_t(fc::kMaxTokens) * fc::kUsed * fc::kExpertFF, ypairs_host.as<float>(), T, stream2);
+            check(cudaEventRecord(ev_join, stream2), "join");
+        }
         fc::experts_gpu(C.lay, C.pool.as<std::uint8_t>(), slots.as<std::int32_t>(), wts.as<float>(), mixed.as<float>(), eh.as<float>(),
                         ypairs.as<float>(), T, stream);
         linear_multi({{&L.sh_gate, &sh_g}, {&L.sh_up, &sh_u}, {&L.sh_gate_inp, &sg}}, mixed, T);
         fc::swiglu(sh_g.as<float>(), sh_u.as<float>(), sh_h.as<float>(), T * fc::kFfShared, stream);
         gemv(L.sh_down, sh_h, sd, T);
         fc::link_wait(link_d + il, dseq, moe.as<float>(), T, d_error.as<int>(), stream);
-        fc::moe_combine(ypairs.as<float>(), moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
+        if (zc) check(cudaStreamWaitEvent(stream, ev_join, 0), "join");
+        fc::moe_combine(ypairs.as<float>(), zc ? ypairs_host.as<float>() : nullptr, moe.as<float>(), sd.as<float>(), sg.as<float>(),
+                        out.as<float>(), T, stream);
     }
 
     // CPU side of a graph-mode step: for every layer, wait for the GPU's selections, compute the
@@ -714,17 +824,20 @@ struct Engine::Impl {
                 }
                 std::atomic_thread_fence(std::memory_order_acquire);
                 const LayerCache & C = cache[std::size_t(il)];
-                std::size_t misses = 0;
+                std::size_t on_cpu = 0, hits = 0;
                 for (std::size_t i = 0; i < ke; ++i) {
                     const std::int32_t e = Lk.ids[i];
                     if (e < 0 || e >= fc::kExperts) throw std::runtime_error("engine: router returned an invalid expert");
                     observe(il, e);
-                    h_oncpu->get()[i] = C.map[std::size_t(e)] < 0;
-                    misses += h_oncpu->get()[i];
+                    // the GPU's plan decides which misses it reads from host memory itself
+                    h_oncpu->get()[i] = Lk.on_cpu[i] != 0;
+                    on_cpu += h_oncpu->get()[i];
+                    hits += C.map[std::size_t(e)] >= 0;
                 }
                 stats.expert_pairs += std::int64_t(ke);
-                stats.expert_hits += std::int64_t(ke - misses);
-                if (misses) {
+                stats.expert_hits += std::int64_t(hits);
+                stats.expert_host_reads += std::int64_t(ke - hits - on_cpu);
+                if (on_cpu) {
                     const auto c0 = clk::now();
                     experts->run(il, T, Lk.x, Lk.ids, Lk.weights, h_oncpu->get(), Lk.out);
                     stats.cpu_experts_ms += std::chrono::duration<double, std::milli>(clk::now() - c0).count();
@@ -792,7 +905,7 @@ struct Engine::Impl {
         } else {
             check(cudaMemsetAsync(moe.get(), 0, xe, stream), "moe");
         }
-        fc::moe_combine(ypairs.as<float>(), moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
+        fc::moe_combine(ypairs.as<float>(), nullptr, moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
     }
 
     // Host work before a step: token history, embeddings, PLE rows, and the step record.

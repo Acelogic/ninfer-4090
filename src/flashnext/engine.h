@@ -23,6 +23,12 @@ struct EngineOptions {
     std::string routing_stats;            // per-layer expert counts that choose the cached experts ("" = none)
     bool cuda_graphs = true;              // replay each step as one CUDA graph (off: launch kernels one by one)
     int prefill_chunk = 512;              // prompt tokens per batched pass (above 4 tokens)
+    // A pinned copy of every expert in the GPU's layout (about 55 GB of RAM, only if free): cache swaps
+    // copy from it, and the GPU can read a share of each step's cache misses from it over PCIe. Off by
+    // default: those PCIe reads come out of the same DRAM bandwidth the CPU experts need (measured: a
+    // 30% share made decode 2.7x slower), and pinning 55 GB more puts the machine under memory pressure.
+    bool host_expert_images = false;
+    int gpu_miss_permille = 0;            // share of each step's cache misses the GPU reads from host memory
 };
 
 // Named intermediate activations, row-major [n_tokens][width], with the same names and layout as
@@ -35,6 +41,7 @@ struct EngineStats {
     double step_ms = 0;         // wall time inside forward()
     double cpu_experts_ms = 0;  // of which the CPU expert calls
     std::int64_t expert_pairs = 0, expert_hits = 0;  // selected experts, and those computed from the VRAM cache
+    std::int64_t expert_host_reads = 0;              // misses the GPU computed from pinned host memory
     std::int64_t cached_experts = 0;
     double cache_gib = 0;
     std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed
