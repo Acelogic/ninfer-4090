@@ -120,7 +120,7 @@ int main(int argc, char ** argv) {
 static int run(int argc, char ** argv) {
     std::string model_path, tokens_arg, tokens_file, json_path, dump_dir;
     int n_gen = 16;
-    bool compare_ref = false;
+    bool compare_ref = false, test_snapshot = false;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -142,6 +142,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--routing-stats") opt.routing_stats = next();
         else if (a == "--no-graphs") opt.cuda_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
+        else if (a == "--test-snapshot") test_snapshot = true;
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -254,6 +255,33 @@ static int run(int argc, char ** argv) {
                     maxd, ta[0].id, tb[0].id, ta[0].id == tb[0].id ? "same" : "DIFFERENT");
         for (int j = 0; j < 5; ++j) std::printf(" %d %.3f/%.3f", ta[std::size_t(j)].id, ta[std::size_t(j)].logprob, tb[std::size_t(j)].logprob);
         std::printf("\n");
+    }
+
+    if (test_snapshot) {
+        // snapshot after the prompt, continue greedily, return to the snapshot, continue again
+        auto t_snap = std::chrono::steady_clock::now();
+        const EngineSnapshot snap = engine.snapshot();
+        const double snap_ms = 1e3 * seconds_since(t_snap);
+        auto greedy = [&](std::vector<float> lg) {
+            std::vector<std::int32_t> ids;
+            std::vector<float> last;
+            for (int i = 0; i < 8; ++i) {
+                const std::int32_t id = top_k(lg.data(), std::size_t(engine.n_vocab()), 1)[0].id;
+                ids.push_back(id);
+                lg = engine.forward({id});
+            }
+            return std::make_pair(ids, lg);
+        };
+        const auto first = greedy(logits);
+        t_snap = std::chrono::steady_clock::now();
+        engine.restore(snap);
+        const double restore_ms = 1e3 * seconds_since(t_snap);
+        const auto second = greedy(logits);
+        const bool same = first.first == second.first && first.second == second.second;
+        std::printf("snapshot %.1f MiB in %.1f ms, restore in %.1f ms; continuation after restore identical: %s\n",
+                    snap.state.size() / 1048576.0, snap_ms, restore_ms, same ? "yes" : "NO");
+        engine.restore(snap);
+        if (!same) return 1;
     }
 
     std::vector<std::int32_t> generated;

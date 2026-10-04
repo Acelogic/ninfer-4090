@@ -105,6 +105,8 @@ struct Engine::Impl {
     fc::DeviceBuffer d_pos;
     std::unique_ptr<fc::Gemm> gemm;
 
+    // the token at every position whose keys and values are in the caches; the first n_past are the
+    // current sequence, later ones are left over from a sequence that was abandoned by restore()
     std::vector<std::int32_t> history;
     std::int64_t n_past = 0;
 
@@ -509,6 +511,49 @@ struct Engine::Impl {
         n_past = 0;
     }
 
+    // recurrent state buffers, in snapshot order
+    std::vector<fc::DeviceBuffer *> state_buffers() {
+        std::vector<fc::DeviceBuffer *> v;
+        for (Layer & L : layers)
+            if (L.recurrent) {
+                v.push_back(&L.conv_state);
+                v.push_back(&L.S);
+            }
+        v.push_back(&ple_hist);
+        return v;
+    }
+
+    EngineSnapshot snapshot() {
+        check(cudaStreamSynchronize(stream), "snapshot");
+        EngineSnapshot snap;
+        snap.tokens.assign(history.begin(), history.begin() + n_past);
+        std::size_t bytes = 0;
+        for (fc::DeviceBuffer * b : state_buffers()) bytes += b->bytes();
+        snap.state.resize(bytes);
+        std::size_t off = 0;
+        for (fc::DeviceBuffer * b : state_buffers()) {
+            check(cudaMemcpy(snap.state.data() + off, b->get(), b->bytes(), cudaMemcpyDeviceToHost), "snapshot");
+            off += b->bytes();
+        }
+        return snap;
+    }
+
+    void restore(const EngineSnapshot & snap) {
+        const std::size_t n = snap.tokens.size();
+        if (n > history.size() || !std::equal(snap.tokens.begin(), snap.tokens.end(), history.begin()))
+            throw std::runtime_error("engine: the caches no longer hold this snapshot's tokens");
+        std::size_t bytes = 0;
+        for (fc::DeviceBuffer * b : state_buffers()) bytes += b->bytes();
+        if (snap.state.size() != bytes) throw std::runtime_error("engine: snapshot from a different model");
+        check(cudaStreamSynchronize(stream), "restore");
+        std::size_t off = 0;
+        for (fc::DeviceBuffer * b : state_buffers()) {
+            check(cudaMemcpy(b->get(), snap.state.data() + off, b->bytes(), cudaMemcpyHostToDevice), "restore");
+            off += b->bytes();
+        }
+        n_past = std::int64_t(n);
+    }
+
     // ---------------------------------------------------------------------------------------------
 
     void emit(const char * name, int il, const void * dev, std::int64_t pos, int T, std::int64_t width) {
@@ -759,7 +804,8 @@ struct Engine::Impl {
         if (pos0 + T > fc::kAttnMaxCells) throw std::runtime_error("engine: contexts beyond 2051 tokens need QSA (not implemented yet)");
         for (int t = 0; t < T; ++t)
             if (tokens[t] < 0 || tokens[t] >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
-        for (int t = 0; t < T; ++t) history.push_back(tokens[t]);
+        if (history.size() < std::size_t(pos0 + T)) history.resize(std::size_t(pos0 + T));
+        for (int t = 0; t < T; ++t) history[std::size_t(pos0 + t)] = tokens[t];
         const std::size_t rb = row_bytes(tok_embd->type, fc::kEmbd);
         for (int t = 0; t < T; ++t)
             dequantize_row(tok_embd->type, tok_embd->data + std::size_t(tokens[t]) * rb, h_x->get() + std::size_t(t) * fc::kEmbd, fc::kEmbd);
@@ -894,6 +940,11 @@ std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, boo
 
 void Engine::reset() { impl_->reset(); }
 std::int64_t Engine::n_past() const { return impl_->n_past; }
+std::vector<std::int32_t> Engine::tokens() const {
+    return std::vector<std::int32_t>(impl_->history.begin(), impl_->history.begin() + impl_->n_past);
+}
+EngineSnapshot Engine::snapshot() const { return impl_->snapshot(); }
+void Engine::restore(const EngineSnapshot & snapshot) { impl_->restore(snapshot); }
 int Engine::n_vocab() const { return impl_->cfg.n_vocab; }
 void Engine::set_activation_hook(EngineHook hook) { impl_->hook = std::move(hook); }
 const EngineStats & Engine::stats() const { return impl_->stats; }
