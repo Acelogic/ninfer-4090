@@ -9,4 +9,6 @@ set "CXX=cl /nologo /O2 /Ob3 /std:c++20 /EHsc /arch:AVX512 /W3 /I"%SRC%\src" /Fo
 set "CORE="%SRC%\src\flashnext\gguf.cpp" "%SRC%\src\flashnext\quants.cpp""
 %CXX% /I"%F%\source\ggml\include" %CORE% "%SRC%\tools\flashnext\check_formats.cpp" /Fe:"%OUT%\check_formats.exe" /link /LIBPATH:"%F%\build\ggml\src" ggml-base.lib
 if errorlevel 1 exit /b 1
+%CXX% %CORE% "%SRC%\src\flashnext\cpu_experts.cpp" "%SRC%\tools\flashnext\test_cpu_experts.cpp" /Fe:"%OUT%\test_cpu_experts.exe"
+if errorlevel 1 exit /b 1
 echo BUILD OK

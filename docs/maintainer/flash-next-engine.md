@@ -46,7 +46,9 @@ Measured on this machine (`bench/flashnext/cpu_moe_bench`):
 |---|---:|
 | RAM read bandwidth, 1 to 16 threads | 55 to 62 GB/s |
 | CPU expert decode with ggml-cpu's kernels and our thread pool | 36.8 GB/s, 31.5 tok/s for the experts alone |
-| Same with our Q4L gate/up kernel (below) | 49.9 GB/s, **37.9 tok/s** for the experts alone |
+| Same with our Q4L gate/up kernel (below) | 49.9 GB/s, 37.9 tok/s for the experts alone |
+| `CpuExperts`, all our kernels, 8 representative layers, 1 token | 52.6 GB/s, **40.0 tok/s** for the experts alone |
+| `CpuExperts`, 3 tokens sharing their experts (MTP verification) | **99 tok/s** equivalent |
 | Reference: the llama.cpp fork end to end, CPU experts, no MTP | 18.6 tok/s |
 | Reference: the llama.cpp fork end to end, 68-slot GPU expert cache, MTP 2 | 43.7 tok/s decode, 240 to 280 tok/s prefill |
 
@@ -112,7 +114,14 @@ experts, the Q6_K head, the host expert engine, and the decode/prefill orchestra
 
 ## 4. Milestones
 
-1. **CPU expert kernels.** Done: 37.9 tok/s for the experts alone, up from 31.5.
+1. **CPU expert kernels.** Done (`src/flashnext/cpu_experts.*`, `tools/flashnext/test_cpu_experts`):
+   - Formats: Q4L (from IQ3_S), Q4X (from IQ4_XS) and IQ4L (from IQ4_NL) are lossless relayouts; Q8_0
+     is used as is.
+   - Tokens that share an expert share one pass over its weights.
+   - Accuracy: 1.1 to 1.4% relative error of the FFN output against exact math (8-bit activations,
+     as in llama.cpp).
+   - Speed: 40.0 tok/s for the experts alone, up from 31.5 with ggml's kernels.
+   - Possible later: a higher-precision activation mode (int16 activations) at some speed cost.
 2. **Reference forward pass.** Plain C++ FP32 implementation of one forward step from the GGUF,
    checked against the llama.cpp oracle (same greedy tokens, close logits). It becomes the oracle for
    every GPU kernel.
