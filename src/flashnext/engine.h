@@ -45,6 +45,7 @@ struct EngineStats {
     std::int64_t cached_experts = 0;
     double cache_gib = 0;
     std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed
+    double cache_swap_ms = 0;      // time spent replacing them
 };
 
 // The recurrent state after a sequence of tokens: DeltaNet recurrent and conv states, the PLE conv

@@ -180,8 +180,9 @@ static int run(int argc, char ** argv) {
     std::vector<float> logits = engine.forward(prompt);
     const double t_prefill = seconds_since(t0);
     engine.set_activation_hook(nullptr);
-    std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s; %lld cached experts swapped for this prompt\n", prompt.size(), t_prefill,
-                double(prompt.size()) / t_prefill, capture ? " with intermediates captured" : "", (long long) engine.stats().cache_swaps);
+    std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s; %lld cached experts swapped (%.2f s); CPU experts %.2f s\n", prompt.size(),
+                t_prefill, double(prompt.size()) / t_prefill, capture ? " with intermediates captured" : "", (long long) engine.stats().cache_swaps,
+                engine.stats().cache_swap_ms / 1e3, engine.stats().cpu_experts_ms / 1e3);
 
     if (!dump_dir.empty()) {
         fs::create_directories(dump_dir);

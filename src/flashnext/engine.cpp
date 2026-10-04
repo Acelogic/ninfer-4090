@@ -276,6 +276,7 @@ struct Engine::Impl {
             }
         }
         if (swaps.empty()) return;
+        const auto t_adapt = clk::now();
         check(cudaStreamSynchronize(stream), "adapt");
         std::size_t slot_max = 0;
         for (const LayerCache & C : cache) slot_max = std::max(slot_max, C.lay.slot_bytes);
@@ -321,6 +322,7 @@ struct Engine::Impl {
                 check(cudaMemcpy(C.dmap.get(), C.map.data(), C.dmap.bytes(), cudaMemcpyHostToDevice), "expert map");
             }
         stats.cache_swaps += std::int64_t(swaps.size());
+        stats.cache_swap_ms += std::chrono::duration<double, std::milli>(clk::now() - t_adapt).count();
     }
 
     void release_experts() {
@@ -1052,6 +1054,8 @@ std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, boo
         if (all_logits) all.insert(all.end(), lg.begin(), lg.end());
         else if (i + T == n) last = std::move(lg);
         ++impl_->stats.steps;
+        // a prompt chunk's routing predicts the rest of the prompt: re-rank the cache between chunks
+        if (T > cuda::kMaxTokens && i + T < n) impl_->adapt_cache(1 << 30);
     }
     impl_->stats.tokens += std::int64_t(n);
     // re-rank the cached experts after a prompt (its routing predicts the continuation) and from
