@@ -288,8 +288,13 @@ CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
         const GgufTensor & tg = model.tensor(p + "ffn_gate_exps.weight");
         const GgufTensor & tu = model.tensor(p + "ffn_up_exps.weight");
         const GgufTensor & td = model.tensor(p + "ffn_down_exps.weight");
-        if (tg.shape != std::vector<std::int64_t>{kEmbd, kFF, kExperts} || td.shape != std::vector<std::int64_t>{kFF, kEmbd, kExperts})
+        if (tg.shape != std::vector<std::int64_t>{kEmbd, kFF, kExperts} || tu.shape != tg.shape || tu.type != tg.type ||
+            td.shape != std::vector<std::int64_t>{kFF, kEmbd, kExperts})
             throw std::runtime_error("unexpected expert shapes in layer " + std::to_string(il));
+        // The repack below reads exactly these sizes; the reader already bounds them to the file.
+        if (tg.bytes != row_bytes(tg.type, kEmbd) * kFF * kExperts || tu.bytes != tg.bytes ||
+            td.bytes != row_bytes(td.type, kFF) * std::size_t(kEmbd) * kExperts)
+            throw std::runtime_error("unexpected expert tensor sizes in layer " + std::to_string(il));
         auto L = std::make_unique<Layer>();
         if (tg.type == GgufType::IQ3_S && tu.type == GgufType::IQ3_S) {
             L->gu = GateUp::Q4L;

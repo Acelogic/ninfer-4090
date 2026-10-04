@@ -1,5 +1,6 @@
 #include "flashnext/gguf.h"
 
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
@@ -60,7 +61,7 @@ std::size_t block_bytes(GgufType type) {
 
 std::size_t row_bytes(GgufType type, std::int64_t elems) {
     const std::int64_t be = block_elems(type);
-    if (elems % be != 0) throw std::runtime_error("row length is not a whole number of blocks");
+    if (elems <= 0 || elems % be != 0) throw std::runtime_error("row length is not a whole number of blocks");
     return std::size_t(elems / be) * block_bytes(type);
 }
 
@@ -126,6 +127,12 @@ private:
 
 namespace {
 
+// The file is untrusted input: every size and offset below is checked without wrap-around.
+std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, const std::string & what) {
+    if (a != 0 && b > UINT64_MAX / a) throw std::runtime_error("GGUF size overflow in " + what);
+    return a * b;
+}
+
 enum : std::uint32_t {
     T_UINT8 = 0, T_INT8 = 1, T_UINT16 = 2, T_INT16 = 3, T_UINT32 = 4, T_INT32 = 5, T_FLOAT32 = 6,
     T_BOOL = 7, T_STRING = 8, T_ARRAY = 9, T_UINT64 = 10, T_INT64 = 11, T_FLOAT64 = 12,
@@ -176,6 +183,7 @@ GgufValue read_value(Cursor & c, std::uint32_t type) {
     if (type != T_ARRAY) return read_scalar(c, type);
     const auto elem = c.read<std::uint32_t>();
     const auto n = c.read<std::uint64_t>();
+    if (n > std::uint64_t(c.end - c.p)) throw std::runtime_error("GGUF array longer than the file");  // >= 1 byte each
     switch (elem) {
     case T_STRING: {
         std::vector<std::string> v;
@@ -229,7 +237,11 @@ GgufModel::GgufModel(const std::vector<std::string> & paths) {
             std::string key = c.str();
             const auto type = c.read<std::uint32_t>();
             GgufValue value = read_value(c, type);
-            if (key == "general.alignment") alignment = std::get<std::uint64_t>(value);
+            if (key == "general.alignment") {
+                const auto * a = std::get_if<std::uint64_t>(&value);
+                if (!a || *a == 0 || (*a & (*a - 1)) != 0 || *a > 4096) throw std::runtime_error(path + ": invalid general.alignment");
+                alignment = *a;
+            }
             kv_.emplace(std::move(key), std::move(value));  // the first shard's value wins
         }
         struct Pending { GgufTensor t; std::uint64_t offset; };
@@ -238,17 +250,27 @@ GgufModel::GgufModel(const std::vector<std::string> & paths) {
             Pending pt;
             pt.t.name = c.str();
             const auto n_dims = c.read<std::uint32_t>();
-            for (std::uint32_t d = 0; d < n_dims; ++d) pt.t.shape.push_back(std::int64_t(c.read<std::uint64_t>()));
+            if (n_dims < 1 || n_dims > 4) throw std::runtime_error(path + ": tensor " + pt.t.name + " has " + std::to_string(n_dims) + " dimensions");
+            for (std::uint32_t d = 0; d < n_dims; ++d) {
+                const auto dim = c.read<std::uint64_t>();
+                if (dim == 0 || dim > (std::uint64_t(1) << 40)) throw std::runtime_error(path + ": tensor " + pt.t.name + " has an invalid dimension");
+                pt.t.shape.push_back(std::int64_t(dim));
+            }
             pt.t.type = GgufType(c.read<std::uint32_t>());
+            (void) block_bytes(pt.t.type);  // rejects types this runtime cannot read
             pt.offset = c.read<std::uint64_t>();
             pending.push_back(std::move(pt));
         }
         const std::size_t header = std::size_t(c.p - f.data());
         const std::size_t data_start = (header + alignment - 1) / alignment * alignment;
+        if (data_start > f.size()) throw std::runtime_error(path + ": data section starts past the end of the file");
+        const std::uint64_t data_size = f.size() - data_start;
         for (auto & pt : pending) {
-            const std::int64_t row = pt.t.shape.empty() ? 1 : pt.t.shape[0];
-            pt.t.bytes = row_bytes(pt.t.type, row) * std::size_t(pt.t.elements() / row);
-            if (data_start + pt.offset + pt.t.bytes > f.size()) throw std::runtime_error(pt.t.name + " extends past the end of " + path);
+            std::uint64_t rows = 1;
+            for (std::size_t d = 1; d < pt.t.shape.size(); ++d) rows = checked_mul(rows, std::uint64_t(pt.t.shape[d]), pt.t.name);
+            const std::uint64_t bytes = checked_mul(row_bytes(pt.t.type, pt.t.shape[0]), rows, pt.t.name);
+            if (pt.offset > data_size || bytes > data_size - pt.offset) throw std::runtime_error(pt.t.name + " extends past the end of " + path);
+            pt.t.bytes = std::size_t(bytes);
             pt.t.data = f.data() + data_start + pt.offset;
             tensors_.emplace(pt.t.name, std::move(pt.t));
         }
