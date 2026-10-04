@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next in NInfer Extreme
 
-Status: design and first measurements, 2026-10-03.
+Status: the engine runs end to end (decode and prompts up to 2,051 tokens), 2026-10-04.
 
 This document plans a Flash-Next runtime tailored to one machine: an RTX 4090 that also drives the
 desktop (about 22.5 GiB usable), a Ryzen 9 7950X (16 cores, AVX-512 with VNNI), and 192 GiB of
@@ -52,82 +52,77 @@ Measured on this machine (`bench/flashnext/cpu_moe_bench`):
 | Reference: the llama.cpp fork end to end, CPU experts, no MTP | 18.6 tok/s |
 | Reference: the llama.cpp fork end to end, 68-slot GPU expert cache, MTP 2 | 43.7 tok/s decode, 240 to 280 tok/s prefill |
 
-## 3. Design
+## 3. The engine as built
+
+Code: `src/flashnext/` (`engine.{h,cpp}`, `cpu_experts.*`, `reference.*`, `gguf.*`, `quants.*`) and
+`src/flashnext/cuda/` (`gemv`, `gemm`, `ops`, `experts`). Tools: `tools/flashnext/` (`fn_generate`,
+`ref_generate`, and a test per kernel family). Build: `build-gpu.ps1` (nvcc 13.3, sm_89) and
+`build-cpu.cmd`.
 
 ### 3.1 Placement
 
-- **VRAM:** dense weights (converted losslessly: Q8_0 maps exactly to NInfer `q8_g32_fp16`); output
-  head; KV for the 12 attention layers plus indexer keys; DeltaNet and conv states; activations; and
-  an **expert cache** that takes the rest (about 10 to 11 GiB, about 4,500 experts, 18% of all).
-- **RAM:** all routed experts (gate/up repacked to Q4L, down IQ4_NL as shipped), the PLE table.
+- **VRAM:** every dense weight in its GGUF format (Q8_0 split losslessly into an int8 code plane and
+  an fp16 scale plane for aligned loads; F32, BF16 and the Q6_K head as shipped), the attention KV
+  cache (fp16) and indexer keys, DeltaNet and conv states, activations, and an **expert cache** in
+  all remaining VRAM but a reserve for the desktop (default 1.5 GiB): about 15 GiB, 6,700 experts
+  (27%), in the GGUF's own block formats so that it holds as many experts as possible.
+- **RAM:** every routed expert in `CpuExperts`' lossless repack (Q4L, Q4X, IQ4L, Q8_0), and the PLE
+  table, read in place from the memory-mapped GGUF.
 
-### 3.2 CPU expert kernels (done: measured)
+### 3.2 Numerics
 
-IQ3_S stores each weight as a lattice index; decoding it was the bottleneck (34 GB/s). Every IQ3_S
-weight is +/-{1,3,...,15} times a 4-bit block scale times a per-256 fp16 scale, so it repacks
-**losslessly** into **Q4L**: a 4-bit code per weight decoded by one byte shuffle per 64 weights
-(`_mm512_shuffle_epi8`), multiplied with `_mm512_maddubs_epi16`, scaled and accumulated with
-`_mm512_dpwssd_epi32` (VNNI). Q4L costs 22% more bytes than IQ3_S but runs at RAM speed (51.6 GB/s
-measured, against 34.4). Accuracy against a float reference matches ggml's IQ3_S kernel exactly.
+FP32 activations everywhere on the GPU; weights are dequantized exactly. The only rounding beyond
+FP32 is the CPU experts' 8-bit activations (as in llama.cpp): about 1.1 to 1.4% relative error per
+expert output. Checked against the FP32 reference (`reference.cpp`, itself checked against llama.cpp
+component by component): every GPU intermediate agrees to about 1e-7 until the first CPU expert
+contributes. Greedy continuations match the llama.cpp oracle on all test prompts, except at
+near-ties where they follow the FP32 reference.
 
-### 3.3 Decode step
+### 3.3 Decode step (1 to 4 tokens)
 
-Per layer, on one CUDA stream driven by a host thread:
+One CUDA graph per token count replays the whole step: positions live in device memory, and the
+CPU's share of the experts goes through mapped host memory. Per layer the GPU computes the mixer,
+attention or DeltaNet, and the router; it writes the selections and the FFN input to the layer's
+`ExpertLink` and raises a flag; the host thread computes the experts that are not cached and raises
+another flag; meanwhile the GPU computes the cached experts and the shared expert, then a one-block
+kernel waits for the CPU's answer. GEMVs that read the same input are fused (`gemv_multi`).
 
-1. GPU: hyper-connection mix, token mixer (DeltaNet or attention), combine, FFN mix, router logits,
-   softmax top-10. Copy the 10 expert ids and weights plus the 2560-wide FFN input to pinned memory.
-2. GPU, concurrently: shared expert and every selected expert resident in the VRAM cache.
-3. CPU, concurrently: the selected experts not in the cache, with the Q4L/IQ4_NL kernels on 16
-   threads; write the weighted sum to pinned memory.
-4. GPU: add the CPU part, combine.
+### 3.4 Expert cache
 
-Steps 1 to 4 per layer are captured as CUDA graphs so that one token costs about 49 graph launches.
-Expected cost per token: GPU dense 4.5 ms + CPU misses (26 ms x miss rate) + about 1.5 ms of
-GPU-CPU hand-offs. A 50 to 70% cache hit rate gives about 50 to 70 tok/s before MTP.
+Filled at load from routing counts (saved between runs), ranked by count per byte. After every
+prompt, and every 256 decoded tokens, it is re-ranked from the routing of recent tokens (half-life
+2,048 tokens) plus the long-run counts, and only clearly better experts are swapped in. A prompt's
+routing predicts its continuation well: on a 2,000-token code prompt, decode hits rose from 19%
+(cache calibrated on other text) to 50%.
 
-**Expert cache policy:** frequency-weighted with decay, filled from routing statistics; refreshed
-between requests and slowly during decode, never on the critical path.
+### 3.5 Prompts
 
-**MTP:** verifying k drafts processes k+1 tokens per layer; the CPU computes each needed expert once
-for all tokens that chose it, so tokens that share experts share the RAM traffic.
+Chunks of up to 512 tokens: dense layers as exact FP32 GEMMs (each matrix dequantized into a scratch
+buffer, cuBLAS SGEMM without TF32), the DeltaNet recurrence over the whole chunk, and the experts
+split between the GPU cache and the CPU. Batched expert kernels (GPU and CPU) and batched attention
+are in progress; until then prompts run at about 75 tok/s.
 
-### 3.4 Prefill
+## 4. Measurements (RTX 4090 + Ryzen 9 7950X, decode, short context)
 
-A chunk of C tokens selects nearly every expert in every layer. Instead of computing experts on the
-CPU, stream each layer's experts to the GPU (1.11 GiB in the original IQ3_S/IQ4_NL form; about 44 ms
-over PCIe 4.0 x16) into a double buffer, and run grouped GEMMs on the GPU. With C = 4096 to 8192 this
-gives an estimated 2,000 to 4,000 tok/s, against 240 to 280 tok/s today.
+| Configuration | Decode |
+|---|---:|
+| llama.cpp fork, CPU experts, no MTP | 18.6 tok/s |
+| llama.cpp fork, 68-slot GPU expert cache, MTP 2 | 43.7 tok/s |
+| This engine, every expert on the CPU | 19.0 tok/s |
+| This engine, 15 GiB expert cache (69% hits), kernels launched one by one | 40.1 tok/s |
+| This engine, 15 GiB expert cache (69% hits), one CUDA graph per step | **56.0 tok/s** |
 
-### 3.5 Long context
+Profile of one decode token at about 66% cache hits (Nsight Systems): about 9.3 ms waiting for the
+CPU's experts and about 10 ms of GPU kernels (5.1 ms dense GEMVs at about 850 GB/s, 1.9 ms cached
+experts, 0.6 ms output head, about 2 ms of small kernels).
 
-llama.cpp evaluates QSA as dense attention with a mask (its source has "TODO: enable sparse
-attention"), so its decode falls from 44 to 28 tok/s at 200K. A true sparse kernel gathers only the
-selected 2,051 KV rows, so decode cost stays flat with context length.
+## 5. Next
 
-### 3.6 Reuse from NInfer
-
-`gated_delta_net` (state 128, Hqk 16, Hv 48, L2-normalised q/k: an exact fit), `causal_conv1d_silu`,
-`gdn_gating`, `rmsnorm`, `rope`, `softmax_attention`, `sigmoid_mul`, `embedding`, `argmax`,
-`sampling`, `linear` (`q8_g32_fp16`), and the Qwen text frontend. New: hyper-connection kernels, the
-sigmoid-gated DeltaNet norm, QSA, PLE, the MoE router with CPU split, GPU kernels for Q4L/IQ3_S/IQ4_NL
-experts, the Q6_K head, the host expert engine, and the decode/prefill orchestration.
-
-## 4. Milestones
-
-1. **CPU expert kernels.** Done (`src/flashnext/cpu_experts.*`, `tools/flashnext/test_cpu_experts`):
-   - Formats: Q4L (from IQ3_S), Q4X (from IQ4_XS) and IQ4L (from IQ4_NL) are lossless relayouts; Q8_0
-     is used as is.
-   - Tokens that share an expert share one pass over its weights.
-   - Accuracy: 1.1 to 1.4% relative error of the FFN output against exact math (8-bit activations,
-     as in llama.cpp).
-   - Speed: 40.0 tok/s for the experts alone, up from 31.5 with ggml's kernels.
-   - Possible later: a higher-precision activation mode (int16 activations) at some speed cost.
-2. **Reference forward pass.** Plain C++ FP32 implementation of one forward step from the GGUF,
-   checked against the llama.cpp oracle (same greedy tokens, close logits). It becomes the oracle for
-   every GPU kernel.
-3. **GPU engine, correct.** Dense path on the GPU through NInfer ops, experts on the CPU; layer by
-   layer agreement with the reference; greedy CLI.
-4. **Decode speed.** Expert cache with measured routing statistics, overlap, CUDA graphs, MTP.
-5. **Prefill and long context.** Streamed expert GEMMs, sparse QSA.
-6. **Serving and quality.** HTTP server with the Qwen frontend and tools; weight quality choice
-   (for example higher-precision experts within the RAM budget); Pi profile; evaluation.
+1. Long context: QSA selection and gathered attention on the GPU (beyond 2,051 tokens).
+2. Prompt speed: batched GPU expert GEMMs over the cache, a batched CPU expert mode, batched
+   attention. Target: thousands of tokens per second.
+3. Split each layer's cache misses between the CPU (RAM, about 52 GB/s) and the GPU reading the same
+   bytes over PCIe (about 22 GB/s): about a third less waiting.
+4. 16-bit activations for the CPU experts (quality), MTP (10 to 20% at today's miss cost).
+5. Serving through NInfer's OpenAI/Anthropic server and Qwen frontend; Pi profile; evaluation;
+   higher-precision expert quantizations within the RAM budget.
