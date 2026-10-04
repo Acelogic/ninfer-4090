@@ -1083,6 +1083,7 @@ struct ReferenceModel::Impl {
                 rope(kb, b * r);
             }
         }
+        if (full > 0) emit("indexer_blocks", il, full, dim, st.idx_blocks.data());  // every complete block, [block][dim]
 
         const std::int64_t width = std::int64_t(cfg.idx_top_k) + r - 1;
         bool any = false;
@@ -1090,6 +1091,7 @@ struct ReferenceModel::Impl {
         if (!any) return;
 
         std::vector<float> qi = matmul(L.idx_q, x, T);  // [T][nih * dim]
+        emit("indexer_q_proj", il, T, std::int64_t(nih) * dim, qi.data());
         parallel_for(pool, T, [&](std::int64_t t, int) {
             const std::int64_t pos = n_past + t;
             float * qt = qi.data() + t * nih * dim;

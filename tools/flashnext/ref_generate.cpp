@@ -1,7 +1,7 @@
 // Greedy generation with the FP32 reference forward pass of Qwen3.8-Flash-Next.
 //
 // Usage: ref_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32]
-//                     [--threads N] [--chunk N] [--json out.json] [--dump dir] [--force dir]
+//                     [--threads N] [--chunk N] [--json out.json] [--dump dir [--dump-filter regex]] [--force dir]
 //                     [--emulate-llamacpp cuda|cpu] [--self-test] [--consistency]
 //
 // Prints the generated ids, the top-5 logits (and log-probabilities) at every step, and timings.
@@ -95,7 +95,7 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::string model_path, tokens_arg, tokens_file, json_path, dump_dir, force_dir;
+    std::string model_path, tokens_arg, tokens_file, json_path, dump_dir, force_dir, dump_filter;
     int n_gen = 32;
     ReferenceOptions opt;
     bool self_test = false, consistency = false;
@@ -114,6 +114,7 @@ int main(int argc, char ** argv) {
         else if (a == "--json") json_path = next();
         else if (a == "--dump") dump_dir = next();
         else if (a == "--force") force_dir = next();
+        else if (a == "--dump-filter") dump_filter = next();
         else if (a == "--emulate-llamacpp") {
             const std::string v = next();
             if (v == "cuda") opt.emulate = ReferenceOptions::Emulate::llamacpp_cuda;
@@ -129,7 +130,7 @@ int main(int argc, char ** argv) {
     }
     if (model_path.empty()) {
         std::fprintf(stderr, "usage: ref_generate -m <gguf shard 1> (--tokens 1,2,3 | --tokens-file f) [-n 32] [--threads N]\n"
-                             "                    [--chunk N] [--json out.json] [--dump dir] [--force dir]\n"
+                             "                    [--chunk N] [--json out.json] [--dump dir [--dump-filter regex]] [--force dir]\n"
                              "                    [--emulate-llamacpp cuda|cpu] [--self-test] [--consistency]\n");
         return 2;
     }
@@ -188,6 +189,7 @@ int main(int argc, char ** argv) {
             std::string base = name + (layer >= 0 ? "-" + std::to_string(layer) : "");
             const int k = seen[base]++;
             if (k > 0) base += "#" + std::to_string(k);
+            if (!dump_filter.empty() && !std::regex_match(base, std::regex(dump_filter))) return;
             const std::string file = dump_dir + "/" + base + ".bin";
             std::ofstream f(file, std::ios::binary);
             const std::int32_t ne[4] = {std::int32_t(width), std::int32_t(n_tokens), 1, 1};

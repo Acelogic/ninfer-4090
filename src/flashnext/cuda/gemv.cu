@@ -369,7 +369,7 @@ void gemv(const GpuWeight & w, const float * x, float * y, int tokens, cudaStrea
 }
 
 void gemv_multi(const GemvTarget * targets, int count, const float * x, int tokens, cudaStream_t stream) {
-    if (count < 1 || count > kMaxMulti) throw std::runtime_error("gemv_multi: 1 to 4 matrices");
+    if (count < 1 || count > kMaxMulti) throw std::runtime_error("gemv_multi: too many matrices");
     MultiArgs a{};
     a.count = count;
     int blocks = 0;

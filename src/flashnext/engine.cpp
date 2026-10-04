@@ -27,6 +27,7 @@
 #include "flashnext/cuda/gemm.h"
 #include "flashnext/cuda/gemv.h"
 #include "flashnext/cuda/ops.h"
+#include "flashnext/cuda/qsa.h"
 #include "flashnext/quants.h"
 #include "flashnext/reference.h"
 
@@ -108,14 +109,14 @@ struct Engine::Impl {
         bool recurrent = false, ple = false;
         fc::DeviceWeight hc_attn_down, hc_attn_up, hc_attn_inject, hc_ffn_down, hc_ffn_up, hc_ffn_inject;
         fc::DeviceBuffer hc_attn_norm, hc_ffn_norm;
-        fc::DeviceWeight wq, wk, wv, wo, idx_k;  // attention
-        fc::DeviceBuffer q_norm, k_norm;
+        fc::DeviceWeight wq, wk, wv, wo, idx_k, idx_q;  // attention, QSA indexer
+        fc::DeviceBuffer q_norm, k_norm, idx_q_norm, idx_k_norm;
         fc::DeviceWeight wqkv, wgate, ssm_beta, ssm_alpha, ssm_out;  // Gated DeltaNet
         fc::DeviceBuffer conv1d, dt, a, ssm_norm;
         fc::DeviceWeight ple_key, ple_value;  // PLE
         fc::DeviceBuffer ple_nk, ple_nq, ple_nc, ple_conv;
         fc::DeviceWeight router, sh_gate, sh_up, sh_down, sh_gate_inp;  // FFN
-        fc::DeviceBuffer conv_state, S, k_cache, v_cache, idx_raw;      // state
+        fc::DeviceBuffer conv_state, S, k_cache, v_cache, idx_raw, blocks;  // state
     };
     std::vector<Layer> layers;
     fc::DeviceWeight output, out_hc_down, out_hc_up;
@@ -131,8 +132,7 @@ struct Engine::Impl {
     std::unique_ptr<Pinned<float>> h_x, h_ple, h_mixed, h_moe, h_w;
     std::unique_ptr<Pinned<std::int32_t>> h_ids;
     std::unique_ptr<Pinned<std::uint8_t>> h_oncpu;
-    std::unique_ptr<Pinned<std::int64_t>> h_pos;  // prefill: the position of every 4-query group
-    fc::DeviceBuffer d_pos;
+    fc::DeviceBuffer qi, cells, n_cells, sel_work;  // QSA indexer queries and selections
     std::unique_ptr<fc::Gemm> gemm;
 
     // the token at every position whose keys and values are in the caches; the first n_past are the
@@ -182,6 +182,7 @@ struct Engine::Impl {
         check(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming), "event");
         check(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "event");
         fc::init_kernels();
+        fc::qsa_init();
         load();
         allocate();
         experts = std::make_unique<CpuExperts>(model, CpuExpertsConfig{opt.cpu_threads, {}});
@@ -442,7 +443,7 @@ struct Engine::Impl {
                     cfg.ssm_conv == fc::kDnConv,
                 "Gated DeltaNet");
         require(cfg.n_expert == fc::kExperts && cfg.n_expert_used == fc::kUsed && cfg.n_ff_shexp == fc::kFfShared, "MoE");
-        require(cfg.idx_head_dim == fc::kIdxDim, "indexer");
+        require(cfg.idx_head_dim == fc::kIdxDim && cfg.idx_n_head == fc::kQsaHeads && cfg.idx_top_k == fc::kQsaTopK, "indexer");
         require(cfg.ple_layer < 0 || (cfg.ple_n_heads == fc::kPleHeads && cfg.ple_head_dim == fc::kPleHeadDim &&
                                       cfg.ple_conv_kernel == fc::kPleKernel && cfg.ple_ngram == fc::kPleDilation),
                 "PLE");
@@ -502,10 +503,15 @@ struct Engine::Impl {
                 L.q_norm = V(b + "attn_q_norm.weight", fc::kHeadDim);
                 L.k_norm = V(b + "attn_k_norm.weight", fc::kHeadDim);
                 L.idx_k = W(b + "indexer.k_proj.weight", E, fc::kIdxDim);
+                L.idx_q = W(b + "indexer.q_proj.weight", E, fc::kQsaHeads * fc::kQsaDim);
+                L.idx_q_norm = V(b + "indexer.q_norm.weight", fc::kQsaDim);
+                L.idx_k_norm = V(b + "indexer.k_norm.weight", fc::kQsaDim);
+                require(cfg.compress_ratio[std::size_t(il)] == fc::kQsaRatio, "QSA compress ratio");
                 const std::size_t kv = std::size_t(opt.max_ctx) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
                 L.k_cache = fc::DeviceBuffer(kv);
                 L.v_cache = fc::DeviceBuffer(kv);
                 L.idx_raw = fc::DeviceBuffer(std::size_t(opt.max_ctx) * fc::kIdxDim * sizeof(float));
+                L.blocks = fc::DeviceBuffer(std::size_t(opt.max_ctx / fc::kQsaRatio + 1) * fc::kQsaDim * sizeof(float));
             }
             if (il == cfg.ple_layer) {
                 L.ple = true;
@@ -538,8 +544,10 @@ struct Engine::Impl {
         h_w = std::make_unique<Pinned<float>>(T * fc::kUsed);
         h_ids = std::make_unique<Pinned<std::int32_t>>(T * fc::kUsed);
         h_oncpu = std::make_unique<Pinned<std::uint8_t>>(T * fc::kUsed);
-        h_pos = std::make_unique<Pinned<std::int64_t>>(T / 4 + 1);
-        d_pos = fc::DeviceBuffer((T / 4 + 1) * sizeof(std::int64_t));
+        qi = fc::DeviceBuffer(T * fc::kQsaHeads * fc::kQsaDim * f);
+        cells = fc::DeviceBuffer(T * fc::kQsaWidth * sizeof(std::int32_t));
+        n_cells = fc::DeviceBuffer(T * sizeof(std::int32_t));
+        sel_work = fc::DeviceBuffer(fc::qsa_select_work_bytes(int(T), opt.max_ctx));
         // the largest dense matrix multiplied in batches: the attention query projection
         gemm = std::make_unique<fc::Gemm>(std::size_t(2) * fc::kHeads * fc::kHeadDim * fc::kEmbd, stream);
         auto buf = [&](std::size_t floats) { return fc::DeviceBuffer(T * floats * f); };
@@ -580,7 +588,7 @@ struct Engine::Impl {
         ple_norm = buf(fc::kHcd);
         ple_gates = buf(fc::kHc);
         logits = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * cfg.n_vocab * f);
-        attn_work = fc::DeviceBuffer(fc::attn_work_floats(fc::kMaxTokens) * f);
+        attn_work = fc::DeviceBuffer(fc::attn_sparse_work_floats(int(T)) * f);
         slots = fc::DeviceBuffer(T * fc::kUsed * sizeof(std::int32_t));
         d_step = zeros(2 * sizeof(std::int64_t));
         d_error = zeros(sizeof(int));
@@ -601,7 +609,7 @@ struct Engine::Impl {
     void reset() {
         check(cudaStreamSynchronize(stream), "sync");
         for (Layer & L : layers) {
-            for (fc::DeviceBuffer * b : {&L.conv_state, &L.S, &L.k_cache, &L.v_cache, &L.idx_raw})
+            for (fc::DeviceBuffer * b : {&L.conv_state, &L.S, &L.k_cache, &L.v_cache, &L.idx_raw, &L.blocks})
                 if (b->get()) check(cudaMemset(b->get(), 0, b->bytes()), "memset");
         }
         check(cudaMemset(ple_hist.get(), 0, ple_hist.bytes()), "memset");
@@ -755,26 +763,23 @@ struct Engine::Impl {
     }
 
     void attention(Layer & L, int il, int T) {
-        linear_multi({{&L.wq, &qfull}, {&L.wk, &k}, {&L.wv, &v}, {&L.idx_k, &kraw}}, mixed, T);
+        const std::int64_t * pos = d_step.as<std::int64_t>();
+        linear_multi({{&L.wq, &qfull}, {&L.wk, &k}, {&L.wv, &v}, {&L.idx_k, &kraw}, {&L.idx_q, &qi}}, mixed, T);
         emit("Qcur_full", il, qfull.get(), n_past, T, 2 * fc::kHeads * fc::kHeadDim);
         fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
-                      q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), d_step.as<std::int64_t>(), T,
-                      cfg.rms_eps, stream);
+                      q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), pos, T, cfg.rms_eps, stream);
         emit("Qcur", il, q.get(), n_past, T, fc::kHeads * fc::kHeadDim);
         emit("indexer_k_raw", il, kraw.get(), n_past, T, fc::kIdxDim);
-        fc::store_rows(kraw.as<float>(), L.idx_raw.as<float>(), d_step.as<std::int64_t>(), fc::kIdxDim, T, stream);
-        if (T <= fc::kMaxTokens) {
-            fc::attn_decode(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), d_step.as<std::int64_t>(), T,
-                            cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
-        } else {
-            // the whole chunk's keys are in the cache; each group of 4 queries masks the later ones
-            const std::size_t hw = std::size_t(fc::kHeads) * fc::kHeadDim;
-            for (int t0 = 0, g = 0; t0 < T; t0 += fc::kMaxTokens, ++g) {
-                const int n = std::min(fc::kMaxTokens, T - t0);
-                fc::attn_decode(q.as<float>() + t0 * hw, qgate.as<float>() + t0 * hw, L.k_cache.as<half>(), L.v_cache.as<half>(),
-                                d_pos.as<std::int64_t>() + g, n, cfg.kq_scale, attn_work.as<float>(), att.as<float>() + t0 * hw, stream);
-            }
-        }
+        // QSA: block keys and selections are kept from the first token on, so that past 2051 tokens
+        // each query attends to its own 2051 cells; below that the selection is every earlier cell
+        fc::store_rows(kraw.as<float>(), L.idx_raw.as<float>(), pos, fc::kIdxDim, T, stream);
+        fc::qsa_update_blocks(L.idx_raw.as<float>(), L.idx_k_norm.as<float>(), rope_freq.as<double>(), L.blocks.as<float>(), pos, T,
+                              cfg.rms_eps, stream);
+        fc::qsa_query(qi.as<float>(), L.idx_q_norm.as<float>(), rope_freq.as<double>(), pos, T, cfg.rms_eps, stream);
+        fc::qsa_select(qi.as<float>(), L.blocks.as<float>(), pos, T, opt.max_ctx, sel_work.get(), cells.as<std::int32_t>(),
+                       n_cells.as<std::int32_t>(), stream);
+        fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
+                        n_cells.as<std::int32_t>(), T, cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
         emit("attn_gated", il, att.get(), n_past, T, fc::kHeads * fc::kHeadDim);
         linear(L.wo, att, out, T);
     }
@@ -912,9 +917,6 @@ struct Engine::Impl {
     void prepare(const std::int32_t * tokens, int T) {
         const std::int64_t pos0 = n_past;
         if (pos0 + T > opt.max_ctx) throw std::runtime_error("engine: context full (max_ctx " + std::to_string(opt.max_ctx) + ")");
-        // QSA selects a subset of cells only beyond top_k + ratio - 1 tokens; until the sparse path
-        // exists, refuse rather than attend densely and give different results.
-        if (pos0 + T > fc::kAttnMaxCells) throw std::runtime_error("engine: contexts beyond 2051 tokens need QSA (not implemented yet)");
         for (int t = 0; t < T; ++t)
             if (tokens[t] < 0 || tokens[t] >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
         if (history.size() < std::size_t(pos0 + T)) history.resize(std::size_t(pos0 + T));
@@ -925,7 +927,6 @@ struct Engine::Impl {
         if (ple_table) ple_host(T);
         h_step.get()[0] = pos0;
         h_step.get()[1] = ++seq;
-        for (int g = 0; g * fc::kMaxTokens < T; ++g) h_pos->get()[g] = pos0 + std::int64_t(g) * fc::kMaxTokens;
     }
 
     // Every GPU operation of a step, in order; host-free in graph mode, so it can be captured.
@@ -933,9 +934,6 @@ struct Engine::Impl {
     void enqueue(int T, int head_rows) {
         const std::int64_t pos0 = n_past;
         check(cudaMemcpyAsync(d_step.get(), h_step.get(), 2 * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "step");
-        if (T > fc::kMaxTokens)
-            check(cudaMemcpyAsync(d_pos.get(), h_pos->get(), std::size_t((T + 3) / 4) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream),
-                  "positions");
         check(cudaMemcpyAsync(x.get(), h_x->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "embed");
         emit("model.input_embed", -1, x.get(), pos0, T, fc::kEmbd);
         fc::hc_expand(x.as<float>(), res.as<float>(), T, stream);

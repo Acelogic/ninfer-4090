@@ -43,7 +43,7 @@ void gemv(const GpuWeight & w, const float * x, float * y, int tokens, cudaStrea
 
 // Up to kMaxMulti matrices that read the same input, in one launch: a decode step has many small
 // products, and each separate kernel pays its own ramp-up and tail. Same results as gemv(), bit for bit.
-constexpr int kMaxMulti = 4;
+constexpr int kMaxMulti = 5;
 struct GemvTarget {
     const GpuWeight * w = nullptr;
     float * y = nullptr;
