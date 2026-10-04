@@ -24,6 +24,7 @@
 
 #include "flashnext/cpu_experts.h"
 #include "flashnext/cuda/experts.h"
+#include "flashnext/cuda/experts_batch.h"
 #include "flashnext/cuda/gemm.h"
 #include "flashnext/cuda/gemv.h"
 #include "flashnext/cuda/ops.h"
@@ -133,6 +134,8 @@ struct Engine::Impl {
     std::unique_ptr<Pinned<std::int32_t>> h_ids;
     std::unique_ptr<Pinned<std::uint8_t>> h_oncpu;
     fc::DeviceBuffer qi, cells, n_cells, sel_work;  // QSA indexer queries and selections
+    // raw indexer keys are needed only until their block of 4 is complete: a ring of a step's worth
+    std::int64_t raw_ring() const { return std::max<std::int64_t>(fc::kMaxTokens, opt.prefill_chunk) + 2 * fc::kQsaRatio; }
     std::unique_ptr<fc::Gemm> gemm;
 
     // the token at every position whose keys and values are in the caches; the first n_past are the
@@ -161,7 +164,8 @@ struct Engine::Impl {
     std::int64_t tokens_since_adapt = 0;
     std::unique_ptr<Pinned<std::uint8_t>> swap_staging;
     static constexpr int kSwapBatch = 64;
-    fc::DeviceBuffer slots, eh, ypairs;
+    fc::DeviceBuffer slots, eh, ypairs;   // decode steps: one row per (token, expert) pair
+    fc::DeviceBuffer gpu_sum, batch_ws;   // prompt chunks: the cached experts' sum per token, and the batch kernels' workspace
 
     // step state read by the kernels: {pos0, seq}, uploaded at the start of every step
     fc::DeviceBuffer d_step, d_error;
@@ -183,6 +187,7 @@ struct Engine::Impl {
         check(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "event");
         fc::init_kernels();
         fc::qsa_init();
+        fc::experts_batch_init();
         load();
         allocate();
         experts = std::make_unique<CpuExperts>(model, CpuExpertsConfig{opt.cpu_threads, {}});
@@ -510,7 +515,7 @@ struct Engine::Impl {
                 const std::size_t kv = std::size_t(opt.max_ctx) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
                 L.k_cache = fc::DeviceBuffer(kv);
                 L.v_cache = fc::DeviceBuffer(kv);
-                L.idx_raw = fc::DeviceBuffer(std::size_t(opt.max_ctx) * fc::kIdxDim * sizeof(float));
+                L.idx_raw = fc::DeviceBuffer(std::size_t(raw_ring()) * fc::kIdxDim * sizeof(float));
                 L.blocks = fc::DeviceBuffer(std::size_t(opt.max_ctx / fc::kQsaRatio + 1) * fc::kQsaDim * sizeof(float));
             }
             if (il == cfg.ple_layer) {
@@ -597,8 +602,13 @@ struct Engine::Impl {
         check(cudaHostAlloc(reinterpret_cast<void **>(&link_h), link_bytes, cudaHostAllocMapped | cudaHostAllocPortable), "expert link");
         std::memset(link_h, 0, link_bytes);
         check(cudaHostGetDevicePointer(reinterpret_cast<void **>(&link_d), link_h, 0), "expert link");
-        eh = fc::DeviceBuffer((T + fc::kMaxTokens) * fc::kUsed * fc::kExpertFF * f);  // the decode tail is for the host-memory branch
-        ypairs = buf(std::size_t(fc::kUsed) * fc::kEmbd);
+        // per-pair rows are for decode steps only (the second half of eh is the host-memory branch's)
+        eh = fc::DeviceBuffer(std::size_t(2 * fc::kMaxTokens) * fc::kUsed * fc::kExpertFF * f);
+        ypairs = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed * fc::kEmbd * f);
+        if (cap > fc::kMaxTokens) {
+            gpu_sum = buf(fc::kEmbd);
+            batch_ws = fc::DeviceBuffer(fc::experts_batch_workspace_bytes(cap));
+        }
         // zero-copy reads of cache misses happen in decode steps only (kMaxTokens)
         host_slots = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed * sizeof(std::int32_t));
         plan_oncpu = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed);
@@ -620,11 +630,14 @@ struct Engine::Impl {
     // recurrent state buffers, in snapshot order
     std::vector<fc::DeviceBuffer *> state_buffers() {
         std::vector<fc::DeviceBuffer *> v;
-        for (Layer & L : layers)
+        for (Layer & L : layers) {
             if (L.recurrent) {
                 v.push_back(&L.conv_state);
                 v.push_back(&L.S);
+            } else {
+                v.push_back(&L.idx_raw);  // the ring holds the raw keys of the incomplete QSA block
             }
+        }
         v.push_back(&ple_hist);
         return v;
     }
@@ -772,9 +785,9 @@ struct Engine::Impl {
         emit("indexer_k_raw", il, kraw.get(), n_past, T, fc::kIdxDim);
         // QSA: block keys and selections are kept from the first token on, so that past 2051 tokens
         // each query attends to its own 2051 cells; below that the selection is every earlier cell
-        fc::store_rows(kraw.as<float>(), L.idx_raw.as<float>(), pos, fc::kIdxDim, T, stream);
-        fc::qsa_update_blocks(L.idx_raw.as<float>(), L.idx_k_norm.as<float>(), rope_freq.as<double>(), L.blocks.as<float>(), pos, T,
-                              cfg.rms_eps, stream);
+        fc::store_rows(kraw.as<float>(), L.idx_raw.as<float>(), pos, fc::kIdxDim, T, raw_ring(), stream);
+        fc::qsa_update_blocks(L.idx_raw.as<float>(), raw_ring(), L.idx_k_norm.as<float>(), rope_freq.as<double>(), L.blocks.as<float>(), pos,
+                              T, cfg.rms_eps, stream);
         fc::qsa_query(qi.as<float>(), L.idx_q_norm.as<float>(), rope_freq.as<double>(), pos, T, cfg.rms_eps, stream);
         fc::qsa_select(qi.as<float>(), L.blocks.as<float>(), pos, T, opt.max_ctx, sel_work.get(), cells.as<std::int32_t>(),
                        n_cells.as<std::int32_t>(), stream);
@@ -874,8 +887,13 @@ struct Engine::Impl {
         // and the shared expert
         LayerCache & C = cache[std::size_t(il)];
         fc::moe_slots(ids.as<std::int32_t>(), C.dmap.as<std::int32_t>(), slots.as<std::int32_t>(), T, stream);
-        fc::experts_gpu(C.lay, C.pool.as<std::uint8_t>(), slots.as<std::int32_t>(), wts.as<float>(), mixed.as<float>(), eh.as<float>(),
-                        ypairs.as<float>(), T, stream);
+        const bool batched = T > fc::kMaxTokens;  // prompt chunk: grouped GEMMs per cached expert
+        if (batched)
+            fc::experts_gpu_batch(C.lay, C.pool.as<std::uint8_t>(), T, mixed.as<float>(), slots.as<std::int32_t>(), wts.as<float>(),
+                                  gpu_sum.as<float>(), batch_ws.get(), stream);
+        else
+            fc::experts_gpu(C.lay, C.pool.as<std::uint8_t>(), slots.as<std::int32_t>(), wts.as<float>(), mixed.as<float>(), eh.as<float>(),
+                            ypairs.as<float>(), T, stream);
         linear(L.sh_gate, mixed, sh_g, T);
         linear(L.sh_up, mixed, sh_u, T);
         fc::swiglu(sh_g.as<float>(), sh_u.as<float>(), sh_h.as<float>(), T * fc::kFfShared, stream);
@@ -910,7 +928,8 @@ struct Engine::Impl {
         } else {
             check(cudaMemsetAsync(moe.get(), 0, xe, stream), "moe");
         }
-        fc::moe_combine(ypairs.as<float>(), nullptr, moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
+        if (batched) fc::moe_combine_sum(gpu_sum.as<float>(), moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
+        else fc::moe_combine(ypairs.as<float>(), nullptr, moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
     }
 
     // Host work before a step: token history, embeddings, PLE rows, and the step record.

@@ -67,17 +67,18 @@ __device__ float norm_rope_128(float x, const float * __restrict__ w, const doub
 // grid T/4 + 1: candidate block pos0/4 + blockIdx.x, updated only if this step completes it
 __global__ void __launch_bounds__(kQsaDim) k_qsa_blocks(const float * __restrict__ raw, const float * __restrict__ k_norm,
                                                         const double * __restrict__ inv_freq, float * __restrict__ blocks,
-                                                        const std::int64_t * __restrict__ pos0p, int T, float eps) {
+                                                        const std::int64_t * __restrict__ pos0p, int T, float eps, std::int64_t raw_rows) {
     __shared__ float xs[kQsaDim];
     __shared__ float scale_s;
     const std::int64_t pos0 = *pos0p;
     const std::int64_t b = pos0 / kQsaRatio + blockIdx.x, last = b * kQsaRatio + kQsaRatio - 1;
     if (last < pos0 || last >= pos0 + T) return;
     const int d = threadIdx.x;
-    const float * r = raw + std::size_t(b) * kQsaRatio * kQsaDim + d;
-    float acc = r[0];
+    // raw keys may live in a ring of raw_rows rows (position p at row p % raw_rows)
+    auto row = [&](int i) { return raw[std::size_t((b * kQsaRatio + i) % raw_rows) * kQsaDim + d]; };
+    float acc = row(0);
 #pragma unroll
-    for (int i = 1; i < kQsaRatio; ++i) acc = __fadd_rn(acc, r[i * kQsaDim]);
+    for (int i = 1; i < kQsaRatio; ++i) acc = __fadd_rn(acc, row(i));
     const float pooled = __fmul_rn(acc, 1.0f / float(kQsaRatio));
     blocks[std::size_t(b) * kQsaDim + d] = norm_rope_128(pooled, k_norm, inv_freq, b * kQsaRatio, eps, xs, &scale_s);
 }
@@ -469,8 +470,14 @@ __global__ void __launch_bounds__(kHeadDim) k_attn_sparse_combine(const float * 
 
 void qsa_update_blocks(const float * idx_raw, const float * k_norm, const double * rope_inv_freq, float * blocks,
                        const std::int64_t * pos0, int T, float eps, cudaStream_t s) {
+    qsa_update_blocks(idx_raw, std::int64_t(1) << 62, k_norm, rope_inv_freq, blocks, pos0, T, eps, s);
+}
+
+void qsa_update_blocks(const float * idx_raw, std::int64_t raw_rows, const float * k_norm, const double * rope_inv_freq, float * blocks,
+                       const std::int64_t * pos0, int T, float eps, cudaStream_t s) {
     if (T < 1) throw std::runtime_error("qsa_update_blocks: T must be positive");
-    k_qsa_blocks<<<T / kQsaRatio + 1, kQsaDim, 0, s>>>(idx_raw, k_norm, rope_inv_freq, blocks, pos0, T, eps);
+    if (raw_rows < T + kQsaRatio - 1) throw std::runtime_error("qsa_update_blocks: the raw-key ring is too small");
+    k_qsa_blocks<<<T / kQsaRatio + 1, kQsaDim, 0, s>>>(idx_raw, k_norm, rope_inv_freq, blocks, pos0, T, eps, raw_rows);
     launched("qsa_update_blocks");
 }
 

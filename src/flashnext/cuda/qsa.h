@@ -31,6 +31,10 @@ constexpr int kQsaRot = 64;                           // NEOX rotation of the fi
 // hold rows pos0 .. pos0+T-1. rope_inv_freq: [32] doubles, base^(-2i/64), in device memory.
 void qsa_update_blocks(const float * idx_raw, const float * k_norm, const double * rope_inv_freq, float * blocks,
                        const std::int64_t * pos0, int T, float eps, cudaStream_t s);
+// The same with idx_raw as a ring of raw_rows rows (position p at row p % raw_rows): a block needs its
+// raw keys only until it is complete, so raw_rows >= T + 3 suffices instead of the whole context.
+void qsa_update_blocks(const float * idx_raw, std::int64_t raw_rows, const float * k_norm, const double * rope_inv_freq, float * blocks,
+                       const std::int64_t * pos0, int T, float eps, cudaStream_t s);
 
 // 2. Indexer queries, in place: q [T][4][128] (the indexer.q_proj output) -> per-head RMSNorm with
 // q_norm [128], then rotation at position pos0 + t.

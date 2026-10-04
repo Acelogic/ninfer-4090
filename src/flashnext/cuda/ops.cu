@@ -444,9 +444,9 @@ __global__ void k_ffn_combine(const float * __restrict__ moe, const float * __re
 }
 
 __global__ void k_store_rows(const float * __restrict__ src, float * __restrict__ dst, const std::int64_t * __restrict__ pos0p, int row,
-                             int n) {
+                             int n, std::int64_t ring) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[std::size_t(*pos0p) * row + i] = src[i];
+    if (i < n) dst[std::size_t((*pos0p + i / row) % ring) * row + i % row] = src[i];
 }
 
 __device__ __forceinline__ std::uint64_t global_ns() {
@@ -511,6 +511,12 @@ __global__ void k_moe_plan(const std::int32_t * __restrict__ ids, const std::int
         host_slots[i] = zc ? ids[i] : -1;
         on_cpu[i] = miss && !zc;
     }
+}
+
+__global__ void k_moe_combine_sum(const float * __restrict__ gpu, const float * __restrict__ cpu, const float * __restrict__ shared,
+                                  const float * __restrict__ sg, float * __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (gpu[i] + cpu[i]) + shared[i] * sigmoidf_(sg[i / kEmbd]);
 }
 
 __global__ void k_moe_combine(const float * __restrict__ pairs, const float * __restrict__ hpairs, const float * __restrict__ cpu,
@@ -606,8 +612,8 @@ void attn_decode(const float * q, const float * gate, const half * k_cache, cons
     launched("attn_combine");
 }
 
-void store_rows(const float * src, float * dst, const std::int64_t * pos0, int row, int T, cudaStream_t s) {
-    k_store_rows<<<blocks(std::size_t(T) * row, 256), 256, 0, s>>>(src, dst, pos0, row, T * row);
+void store_rows(const float * src, float * dst, const std::int64_t * pos0, int row, int T, std::int64_t ring, cudaStream_t s) {
+    k_store_rows<<<blocks(std::size_t(T) * row, 256), 256, 0, s>>>(src, dst, pos0, row, T * row, ring);
     launched("store_rows");
 }
 
@@ -650,6 +656,11 @@ void moe_plan(const std::int32_t * ids, const std::int32_t * map, std::int32_t *
               int T, int zc_permille, cudaStream_t s) {
     k_moe_plan<<<1, 32, 0, s>>>(ids, map, slots, host_slots, on_cpu, T * kUsed, zc_permille);
     launched("moe_plan");
+}
+void moe_combine_sum(const float * gpu, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,
+                     cudaStream_t s) {
+    k_moe_combine_sum<<<blocks(std::size_t(T) * kEmbd, 256), 256, 0, s>>>(gpu, cpu, shared, shared_gate, out, T * kEmbd);
+    launched("moe_combine_sum");
 }
 void moe_combine(const float * gpu_pairs, const float * host_pairs, const float * cpu, const float * shared, const float * shared_gate,
                  float * out, int T, cudaStream_t s) {

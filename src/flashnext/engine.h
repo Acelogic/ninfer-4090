@@ -47,8 +47,8 @@ struct EngineStats {
     std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed
 };
 
-// The recurrent state after a sequence of tokens: DeltaNet recurrent and conv states and the PLE conv
-// history, plus the tokens themselves. Attention keys and values (and indexer keys) stay in the
+// The recurrent state after a sequence of tokens: DeltaNet recurrent and conv states, the PLE conv
+// history and the raw indexer keys of the incomplete QSA blocks, plus the tokens themselves. Attention keys and values (and indexer keys) stay in the
 // engine's caches, by position, so a snapshot is valid while those positions still hold its tokens.
 struct EngineSnapshot {
     std::vector<std::int32_t> tokens;
@@ -71,7 +71,7 @@ public:
     // The n_past() tokens processed so far.
     std::vector<std::int32_t> tokens() const;
 
-    // About 113 MiB of state; a few milliseconds.
+    // About 116 MiB of state; a few milliseconds.
     EngineSnapshot snapshot() const;
     // Returns to a snapshot taken earlier. Valid when the caches still hold the snapshot's tokens at
     // their positions, i.e. nothing different was processed at those positions since (checked; throws
