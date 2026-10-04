@@ -94,7 +94,9 @@ cmake --build build -j
 ```
 
 The build produces `ninfer.exe` (CLI), `ninfer-serve.exe` (server) and `ninfer-perplexity.exe` in
-`build\apps`. Build details are in [WINDOWS_PORT.md](WINDOWS_PORT.md).
+`build\apps`. Build details are in [WINDOWS_PORT.md](WINDOWS_PORT.md). Add
+`-DNINFER_WITH_FLASHNEXT=ON` to also serve Qwen3.8-Flash-Next GGUF models (an AVX-512 CPU is
+required); see [docs/serving.md](docs/serving.md#flash-next-gguf-models).
 
 ## Documentation
 

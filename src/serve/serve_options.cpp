@@ -72,7 +72,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer|model.gguf> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--turn-checkpoints N (retired)] [--log-stats-interval-ms N] "
@@ -92,6 +92,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
+           "[--flashnext-expert-cache-mib N] [--flashnext-expert-threads N] "
+           "[--flashnext-routing-stats FILE] [--flashnext-host-expert-images] "
+           "[--flashnext-mtp FILE [--flashnext-draft K]] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -141,7 +144,20 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       A .gguf model is a Qwen3.8-Flash-Next GGUF (shard 1 of a split model; builds "
+           "with "
+           "NINFER_WITH_FLASHNEXT). It serves one request at a time, reuses prompt prefixes "
+           "through "
+           "--host-state-slots recurrent-state snapshots, and takes these options:\n"
+           "       --flashnext-expert-cache-mib bounds the VRAM cache of routed experts (default: "
+           "all "
+           "free VRAM but a reserve); --flashnext-expert-threads sets the CPU expert threads; "
+           "--flashnext-routing-stats FILE keeps expert routing counts across runs (read at start, "
+           "written back when idle); --flashnext-host-expert-images keeps a pinned host copy "
+           "of "
+           "every expert (tens of GB of RAM); --flashnext-mtp FILE loads the MTP head GGUF for "
+           "speculative decoding with --flashnext-draft K drafts per step (1..3, default 2)\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -210,6 +226,35 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.deprecated_turn_checkpoints_given = true;
         } else if (arg == "--auto-save-evicted") {
             options.auto_save_evicted = true;
+        } else if (arg == "--flashnext-expert-cache-mib") {
+            options.flashnext.expert_cache_mib = parse_nonnegative_int(
+                require_value("--flashnext-expert-cache-mib"), "flashnext-expert-cache-mib");
+        } else if (arg == "--flashnext-expert-threads") {
+            const int threads = parse_nonnegative_int(require_value("--flashnext-expert-threads"),
+                                                      "flashnext-expert-threads");
+            if (threads == 0 || threads > 256) {
+                throw std::invalid_argument("--flashnext-expert-threads must be in [1,256]");
+            }
+            options.flashnext.expert_threads = static_cast<std::uint32_t>(threads);
+        } else if (arg == "--flashnext-routing-stats") {
+            options.flashnext.routing_stats = require_value("--flashnext-routing-stats");
+            if (options.flashnext.routing_stats.empty()) {
+                throw std::invalid_argument("--flashnext-routing-stats must not be empty");
+            }
+        } else if (arg == "--flashnext-host-expert-images") {
+            options.flashnext.host_expert_images = true;
+        } else if (arg == "--flashnext-mtp") {
+            options.flashnext.mtp_path = require_value("--flashnext-mtp");
+            if (options.flashnext.mtp_path.empty()) {
+                throw std::invalid_argument("--flashnext-mtp must not be empty");
+            }
+        } else if (arg == "--flashnext-draft") {
+            const int drafts =
+                parse_nonnegative_int(require_value("--flashnext-draft"), "flashnext-draft");
+            if (drafts < 1 || drafts > 3) {
+                throw std::invalid_argument("--flashnext-draft must be in [1,3]");
+            }
+            options.flashnext.draft_tokens = static_cast<std::uint32_t>(drafts);
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

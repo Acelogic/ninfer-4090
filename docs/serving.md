@@ -1,6 +1,7 @@
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
+`build/apps/ninfer-serve` loads one v3 `.ninfer` artifact, or a Qwen3.8-Flash-Next GGUF in builds
+with Flash-Next (see [Flash-Next GGUF models](#flash-next-gguf-models)), and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
 ## Start the server
@@ -49,6 +50,58 @@ with `--vision`; each accelerates generated-text decode after multimodal prefill
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
+
+## Flash-Next GGUF models
+
+Builds configured with `-DNINFER_WITH_FLASHNEXT=ON` (an AVX-512 CPU and cuBLAS; on Windows the cuBLAS
+DLLs are copied next to the executables) also serve Qwen3.8-Flash-Next GGUF models, architecture
+`qwen4exp`, on the Flash-Next engine: the dense layers run on the GPU, the routed experts on the CPU
+behind a VRAM expert cache. Pass any shard of a split model; the others are found next to it.
+
+```bash
+./build/apps/ninfer-serve Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+  --port 8080 --model-id flash-next --max-context 65536 \
+  --flashnext-routing-stats flash-next.routing \
+  --flashnext-mtp mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --flashnext-draft 2
+```
+
+The endpoints, streaming, reasoning and tool-call parsing are the same as for an artifact. The
+frontend renders the GGUF's embedded chat template (or `--chat-template`) and tokenizes with a
+tokenizer generated from the GGUF's tokenizer metadata; generation stops at `<|im_end|>` and
+`<|endoftext|>`. Sampling runs on the host with the semantics and RNG keys of the GPU sampler and the
+Qwen3.6-35B-A3B presets.
+
+With `--flashnext-mtp`, each decode step feeds the last token together with K tokens drafted by the
+model's MTP head and verifies them in one pass: the token sampled from each row is committed, and a
+draft is accepted while it equals that token, so the output follows the same distribution and RNG
+keys as decoding without drafts. Penalties count the tokens accepted earlier in the step. The MTP
+head takes about 3 GB of VRAM from the expert cache; responses report `draft_n` and
+`draft_n_accepted`.
+
+The engine holds one sequence, so requests run one at a time behind the usual FIFO
+(`--max-pending-requests`, `--pending-timeout-ms`). A prompt that extends the previous request's
+sequence executes only its new suffix. Up to `--host-state-slots` host snapshots of the recurrent
+state (about 113 MiB each) are kept at prompt ends and at the frontend's rewrite checkpoint, long
+anchors and shared tool prefix, so a rewritten turn restarts from the deepest snapshot that the new
+prompt begins with. Attention keys and values stay in the engine by position: a snapshot stays usable
+until another prompt overwrites its positions, so alternating between conversations reuses only
+their common prefix. `--no-prefix-reuse` disables both kinds of reuse.
+
+`--max-context` sizes the engine's attention caches (about 10 KB of VRAM per token, taken from the
+expert cache). Options for these models:
+
+| Option | Meaning | Default |
+|---|---|---:|
+| `--flashnext-expert-cache-mib N` | VRAM for the routed-expert cache | all free VRAM but a reserve |
+| `--flashnext-expert-threads N` | CPU threads for experts that miss the cache | engine default (16) |
+| `--flashnext-routing-stats FILE` | expert routing counts that choose the cached experts; read at start when present, written back whenever the request queue drains and at shutdown | none |
+| `--flashnext-host-expert-images` | keep a pinned host copy of every expert (tens of GB of RAM, only when free) | off |
+| `--flashnext-mtp FILE` | the MTP head GGUF; enables speculative decoding | off |
+| `--flashnext-draft K` | MTP drafts per decode step, `1..3` | `2` with `--flashnext-mtp` |
+
+They are rejected for `.ninfer` artifacts. Flash-Next does not support `--max-concurrency` above 1,
+`--spec` (it uses `--flashnext-mtp`), `--vision`, `--kv-dtype` other than `bf16`,
+`--auto-save-evicted`, `/slots` save and restore, or `ninfer-perplexity` scoring.
 
 ## Endpoints
 

@@ -1,5 +1,6 @@
 add_library(ninfer_runtime_support STATIC
   engine/admission_policy.cpp
+  engine/host_sampler.cpp
   engine/context_cache/context_cost.cpp
   engine/context_cache/context_cost_defaults.cpp
   engine/kv_capacity.cpp
@@ -24,4 +25,11 @@ target_link_libraries(ninfer_engine PRIVATE
   ninfer_ops
   ninfer_text
   ninfer_media_decode)
+if(NINFER_WITH_FLASHNEXT)
+  target_sources(ninfer_engine PRIVATE
+    engine/flashnext_core.cpp
+    engine/flashnext_frontend.cpp)
+  target_compile_definitions(ninfer_engine PRIVATE NINFER_WITH_FLASHNEXT=1)
+  target_link_libraries(ninfer_engine PRIVATE ninfer_flashnext ninfer::json)
+endif()
 add_library(ninfer::engine ALIAS ninfer_engine)

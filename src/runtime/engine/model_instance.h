@@ -12,6 +12,15 @@ namespace ninfer::runtime {
 
 [[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
 
+// The execution backend a model path selects: a .ninfer artifact runs on the Qwen3.5 Program, a
+// .gguf (any shard of a split model) on the Flash-Next engine, which checks the GGUF architecture.
+enum class ModelBackend : std::uint8_t {
+    Qwen3_5,
+    FlashNext,
+};
+
+[[nodiscard]] ModelBackend select_model_backend(const EngineOptions& options);
+
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
 

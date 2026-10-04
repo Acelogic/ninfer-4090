@@ -27,6 +27,9 @@ All figures were measured on one RTX 4090 that also drives the Windows desktop.
 | `qwen3.8-27b-huihui` | Huihui abliterated Qwen3.8 27B | MTP 5 + n-gram | 229K, vision | Same weights format as `qwen3.8-27b`, with BF16 prefill |
 | `bonsai2-27b` | Ternary Bonsai 2 27B (Prism ML) | MTP 2 + n-gram | 262K, vision | ~247 tok/s mean (~180 on prose); 145 tok/s after a 90K-token prompt |
 | `bonsai2-27b-heretic` | Bonsai 2 27B with the Heretic abliteration | MTP 2 + n-gram | 262K, vision | Same as `bonsai2-27b` |
+| `flash-next` | Qwen3.8-Flash-Next (UD-IQ4_XS GGUF), experts on the CPU | MTP 2 | 64K, no vision | ~30–36 tok/s sampled chat; 2.6K-token prompt prefilled at ~350 tok/s; a follow-up turn reuses the conversation (TTFT ~0.6 s) |
+
+**Flash-Next** needs a `ninfer-serve.exe` built with `-DNINFER_WITH_FLASHNEXT=ON` and the GGUF shards (plus the shared-Q8_0 MTP head) in `models\`. A profile may instead point `exe` and `file` at other locations (absolute paths, `%USERPROFILE%` expands). Its expert routing statistics persist in `flash-next-routing.bin` next to the launcher.
 
 **Lossless speculation.** Speculative decoding never changes what the model would have written. Drafts are verified by the full model, so speed comes without quality loss.
 

@@ -18,6 +18,8 @@ project(ninfer LANGUAGES C CXX CUDA)
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_WITH_FLASHNEXT
+  "Serve Qwen3.8-Flash-Next GGUF models (needs an AVX-512 CPU and cuBLAS)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

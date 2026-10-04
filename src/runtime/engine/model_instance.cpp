@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -85,6 +86,29 @@ std::size_t runtime_budget_after_weights(std::size_t free_before_weights,
 }
 
 } // namespace
+
+ModelBackend select_model_backend(const EngineOptions& options) {
+    if (options.artifact_path.empty()) {
+        throw std::invalid_argument("Engine artifact_path must not be empty");
+    }
+    const std::filesystem::path extension = options.artifact_path.extension();
+    if (extension == ".gguf") {
+#if NINFER_WITH_FLASHNEXT
+        return ModelBackend::FlashNext;
+#else
+        throw std::invalid_argument(
+            "this build serves no GGUF models; configure with NINFER_WITH_FLASHNEXT=ON to serve "
+            "Flash-Next");
+#endif
+    }
+    if (extension != ".ninfer") {
+        throw std::invalid_argument("NInfer accepts .ninfer artifacts and Flash-Next .gguf models");
+    }
+    if (options.flashnext != FlashNextOptions{}) {
+        throw std::invalid_argument("Flash-Next options apply only to Flash-Next GGUF models");
+    }
+    return ModelBackend::Qwen3_5;
+}
 
 EngineOptions normalize_engine_options(EngineOptions options) {
     switch (options.purpose) {

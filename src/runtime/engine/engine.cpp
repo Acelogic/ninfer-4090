@@ -7,6 +7,9 @@
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#if NINFER_WITH_FLASHNEXT
+#    include "runtime/engine/flashnext_core.h"
+#endif
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/slot_spill_guard.h"
 
@@ -19,6 +22,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -173,16 +177,35 @@ class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
+#if NINFER_WITH_FLASHNEXT
+    using FlashNextCore = runtime::FlashNextCore;
+    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
+                              std::unique_ptr<ScoringCore>, std::unique_ptr<FlashNextCore>>;
+#else
     using Core =
         std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>>;
+#endif
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        if (runtime::select_model_backend(options) == runtime::ModelBackend::FlashNext) {
+#if NINFER_WITH_FLASHNEXT
+            auto flashnext = std::make_unique<FlashNextCore>(options, device);
+            frontend.emplace(flashnext->frontend());
+            capacity          = flashnext->capacity();
+            load              = flashnext->load_summary();
+            sampling_defaults = flashnext->sampling_defaults();
+            core              = std::move(flashnext);
+#endif
+            return;
+        }
         auto constructed  = runtime::construct_model(options, device);
         active            = std::move(constructed.instance);
         load              = std::move(constructed.load);
+        frontend.emplace(active->frontend);
+        capacity          = active->capacity;
         sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         if (options.purpose == EnginePurpose::CausalScoring) {
@@ -249,6 +272,9 @@ public:
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
+    // The model's frontend and request capacity, whichever backend executes it.
+    std::optional<models::qwen3_5::Frontend> frontend;
+    std::uint32_t capacity = 0;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
@@ -337,11 +363,11 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->active->frontend.prepare(std::move(input), control);
+    auto prepared      = impl_->frontend->prepare(std::move(input), control);
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
         info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    if (info.prompt_tokens > impl_->active->capacity) {
+    if (info.prompt_tokens > impl_->capacity) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }
     const PromptPreparationStats preparation = prepared.preparation_stats();
@@ -354,14 +380,13 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (token_ids.size() > impl_->active->capacity) {
+    if (token_ids.size() > impl_->capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(token_ids.size(), impl_->active->capacity));
+                           context_capacity_error(token_ids.size(), impl_->capacity));
     }
-    auto prepared =
-        impl_->active->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    auto prepared = impl_->frontend->prepare_tokens(std::move(token_ids), allow_prefix_identity);
     PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > impl_->active->capacity) {
+    if (info.prompt_tokens > impl_->capacity) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
     }
     const PromptPreparationStats preparation = prepared.preparation_stats();
@@ -371,7 +396,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.tokenize_text(text);
+    return impl_->frontend->tokenize_text(text);
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
@@ -407,7 +432,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.count_tokens(std::move(input), control);
+    return impl_->frontend->count_tokens(std::move(input), control);
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -519,7 +544,7 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.media_cache_summary();
+    return impl_->frontend->media_cache_summary();
 }
 
 bool Engine::healthy() const {

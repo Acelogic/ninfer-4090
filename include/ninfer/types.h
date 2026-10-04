@@ -187,6 +187,29 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+// Execution choices of the Flash-Next engine, which serves Qwen3.8-Flash-Next GGUF models
+// (architecture qwen4exp) in builds with NINFER_WITH_FLASHNEXT. A .ninfer artifact rejects
+// non-default values.
+struct FlashNextOptions {
+    // VRAM for the cache of routed experts; negative uses all free VRAM but the engine's reserve.
+    std::int64_t expert_cache_mib = -1;
+    // CPU threads computing routed experts that miss the cache; zero keeps the engine default.
+    std::uint32_t expert_threads = 0;
+    // Expert routing counts that choose the cached experts: read at load when the file exists and
+    // written back whenever the request queue drains and at shutdown. Empty keeps none.
+    std::filesystem::path routing_stats;
+    // A pinned host copy of every expert (tens of GB of RAM, taken only when free) that cache swaps
+    // copy from.
+    bool host_expert_images = false;
+    // The model's MTP head (a separate GGUF) for speculative decoding; empty disables it.
+    std::filesystem::path mtp_path;
+    // Tokens the MTP head drafts per decode step, 1..3; zero selects 2 when mtp_path is set.
+    std::uint32_t draft_tokens = 0;
+
+    [[nodiscard]] friend bool operator==(const FlashNextOptions&,
+                                         const FlashNextOptions&) = default;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -221,6 +244,7 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    FlashNextOptions flashnext;
     StartupObserver startup_observer;
 };
 

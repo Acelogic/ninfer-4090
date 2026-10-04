@@ -181,6 +181,26 @@ int main() {
     failures += check(context_cost.context_cost_presets == "local-costs.json",
                       "--context-cost-presets did not preserve its path");
 
+    failures += check(defaults.flashnext == ninfer::FlashNextOptions{},
+                      "Flash-Next options are not at their defaults");
+    const ServeOptions flashnext =
+        parse({"ninfer-serve", "model.gguf", "--flashnext-expert-cache-mib", "4096",
+               "--flashnext-expert-threads", "12", "--flashnext-routing-stats", "routing.bin",
+               "--flashnext-host-expert-images", "--flashnext-mtp", "mtp.gguf", "--flashnext-draft",
+               "3"});
+    failures += check(
+        flashnext.flashnext.expert_cache_mib == 4096 && flashnext.flashnext.expert_threads == 12 &&
+            flashnext.flashnext.routing_stats == "routing.bin" &&
+            flashnext.flashnext.host_expert_images && flashnext.flashnext.mtp_path == "mtp.gguf" &&
+            flashnext.flashnext.draft_tokens == 3,
+        "Flash-Next options were not applied");
+    bool wide_draft_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.gguf", "--flashnext-mtp", "mtp.gguf",
+                     "--flashnext-draft", "4"});
+    } catch (const std::invalid_argument&) { wide_draft_rejected = true; }
+    failures += check(wide_draft_rejected, "a Flash-Next draft wider than 3 was accepted");
+
     const ServeOptions thinking_budget =
         parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "37"});
     failures += check(thinking_budget.default_thinking_budget == 37,
