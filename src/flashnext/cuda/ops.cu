@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "flashnext/cuda/device.h"
+#include "flashnext/cuda/experts.h"
 
 namespace ninfer::flashnext::cuda {
 
@@ -235,11 +236,11 @@ __global__ void __launch_bounds__(kHeadDim) k_attn_prep(const float * __restrict
                                                         const float * __restrict__ v, const float * __restrict__ q_norm,
                                                         const float * __restrict__ k_norm, const double * __restrict__ inv_freq,
                                                         float * __restrict__ q, float * __restrict__ gate, half * __restrict__ k_cache,
-                                                        half * __restrict__ v_cache, std::int64_t pos0, float eps) {
+                                                        half * __restrict__ v_cache, const std::int64_t * __restrict__ pos0p, float eps) {
     __shared__ float ys[kHeadDim];
     __shared__ float sh[32];
     const int t = blockIdx.x, hh = blockIdx.y, d = threadIdx.x;
-    const std::int64_t pos = pos0 + t;
+    const std::int64_t pos = *pos0p + t;
     const bool is_q = hh < kHeads;
     const int hk = hh - kHeads;
     const float x = is_q ? q_full[(std::size_t(t) * kHeads + hh) * 2 * kHeadDim + d] : k[(std::size_t(t) * kKvHeads + hk) * kHeadDim + d];
@@ -277,15 +278,16 @@ constexpr int kAttnStride = kHeadDim + 2;      // per (chunk, kv head, query): m
 // Partial attention over one chunk of cells for one kv head and its 12 x T queries.
 template <int T>
 __global__ void __launch_bounds__(kAttnChunk) k_attn_partial(const float * __restrict__ q, const half * __restrict__ k_cache,
-                                                             const half * __restrict__ v_cache, std::int64_t pos0, float scale,
-                                                             float * __restrict__ work) {
+                                                             const half * __restrict__ v_cache, const std::int64_t * __restrict__ pos0p,
+                                                             float scale, float * __restrict__ work) {
     constexpr int Q = kGroup * T;
     extern __shared__ float smem[];
     float * qs = smem;                   // [Q][256]
     float * sc = smem + Q * kHeadDim;    // [256 cells][Q]
     const int ch = blockIdx.x, hk = blockIdx.y, tid = threadIdx.x;
     const int lane = tid & 31, warp = tid >> 5;
-    const std::int64_t n_kv = pos0 + T;
+    const std::int64_t pos0 = *pos0p, n_kv = pos0 + T;
+    if (std::int64_t(ch) * kAttnChunk >= n_kv) return;
     for (int i = tid; i < Q * kHeadDim; i += kAttnChunk) {
         const int qi = i / kHeadDim, tt = qi / kGroup, g = qi % kGroup;
         qs[i] = q[(std::size_t(tt) * kHeads + hk * kGroup + g) * kHeadDim + i % kHeadDim];
@@ -356,9 +358,10 @@ __global__ void __launch_bounds__(kAttnChunk) k_attn_partial(const float * __res
     for (int i = 0; i < Q; ++i) wbase[i * kAttnStride + 2 + tid] = o[i];
 }
 
-__global__ void __launch_bounds__(kHeadDim) k_attn_combine(const float * __restrict__ work, const float * __restrict__ gate, int n_chunks,
-                                                           int T, float * __restrict__ out) {
+__global__ void __launch_bounds__(kHeadDim) k_attn_combine(const float * __restrict__ work, const float * __restrict__ gate,
+                                                           const std::int64_t * __restrict__ pos0p, int T, float * __restrict__ out) {
     const int tt = blockIdx.x / kHeads, h = blockIdx.x % kHeads, d = threadIdx.x;
+    const int n_chunks = int((*pos0p + T + kAttnChunk - 1) / kAttnChunk);
     const int hk = h / kGroup, Q = kGroup * T, qi = tt * kGroup + h % kGroup;
     float M = -INFINITY;
     for (int ch = 0; ch < n_chunks; ++ch) M = fmaxf(M, work[((std::size_t(ch) * kKvHeads + hk) * Q + qi) * kAttnStride]);
@@ -440,6 +443,69 @@ __global__ void k_ffn_combine(const float * __restrict__ moe, const float * __re
     if (i < n) out[i] = moe[i] + shared[i] * sigmoidf_(sg[i / kEmbd]);
 }
 
+__global__ void k_store_rows(const float * __restrict__ src, float * __restrict__ dst, const std::int64_t * __restrict__ pos0p, int row,
+                             int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[std::size_t(*pos0p) * row + i] = src[i];
+}
+
+__device__ __forceinline__ std::uint64_t global_ns() {
+    std::uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+__global__ void __launch_bounds__(256) k_link_signal(const std::int32_t * __restrict__ ids, const float * __restrict__ w,
+                                                     const float * __restrict__ x, int T, ExpertLink * link, const std::int64_t * seq) {
+    for (int i = threadIdx.x; i < T * kUsed; i += blockDim.x) {
+        link->ids[i] = ids[i];
+        link->weights[i] = w[i];
+    }
+    for (int i = threadIdx.x; i < T * kEmbd; i += blockDim.x) link->x[i] = x[i];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *reinterpret_cast<volatile std::int64_t *>(&link->req) = *seq;
+}
+
+__global__ void __launch_bounds__(256) k_link_wait(ExpertLink * link, const std::int64_t * seq, float * __restrict__ out, int T,
+                                                   int * error) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        const std::int64_t want = *seq;
+        const std::uint64_t t0 = global_ns();
+        ok = 1;
+        while (*reinterpret_cast<volatile std::int64_t *>(&link->done) != want) {
+            if (global_ns() - t0 > 1000000000ull) {
+                ok = 0;
+                atomicExch(error, 1);
+                break;
+            }
+            __nanosleep(200);
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    const volatile float * src = link->out;
+    for (int i = threadIdx.x; i < T * kEmbd; i += blockDim.x) out[i] = ok ? src[i] : 0.0f;
+}
+
+__global__ void k_moe_slots(const std::int32_t * __restrict__ ids, const std::int32_t * __restrict__ map, std::int32_t * __restrict__ slots,
+                            int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) slots[i] = map[ids[i]];
+}
+
+__global__ void k_moe_combine(const float * __restrict__ pairs, const float * __restrict__ cpu, const float * __restrict__ shared,
+                              const float * __restrict__ sg, float * __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int t = i / kEmbd, r = i % kEmbd;
+    float m = pairs[std::size_t(t * kUsed) * kEmbd + r];
+#pragma unroll
+    for (int k = 1; k < kUsed; ++k) m = m + pairs[std::size_t(t * kUsed + k) * kEmbd + r];
+    out[i] = (m + cpu[i]) + shared[i] * sigmoidf_(sg[t]);
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -488,42 +554,58 @@ void dn_recurrence(const float * conv_out, const float * z, const float * beta, 
 }
 
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
-               const double * rope_inv_freq, float * q, float * gate, half * k_cache, half * v_cache, std::int64_t pos0, int T,
+               const double * rope_inv_freq, float * q, float * gate, half * k_cache, half * v_cache, const std::int64_t * pos0, int T,
                float eps, cudaStream_t s) {
     k_attn_prep<<<dim3(T, kHeads + kKvHeads), kHeadDim, 0, s>>>(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, k_cache, v_cache,
                                                                  pos0, eps);
     launched("attn_prep");
 }
 
-std::size_t attn_work_floats(std::int64_t max_ctx, int T) {
-    return std::size_t((max_ctx + kAttnChunk - 1) / kAttnChunk) * kKvHeads * kGroup * T * kAttnStride;
-}
+std::size_t attn_work_floats(int T) { return std::size_t(kAttnMaxChunks) * kKvHeads * kGroup * T * kAttnStride; }
+
+template <int T> constexpr int attn_smem() { return 2 * kGroup * T * kHeadDim * int(sizeof(float)); }
 
 template <int T>
-static void attn_launch(const float * q, const half * k_cache, const half * v_cache, std::int64_t pos0, float scale, float * work,
-                        int n_chunks, cudaStream_t s) {
-    const int smem = 2 * kGroup * T * kHeadDim * int(sizeof(float));
-    static bool configured = false;
-    if (!configured) {
-        check(cudaFuncSetAttribute(k_attn_partial<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "attn smem");
-        configured = true;
-    }
-    k_attn_partial<T><<<dim3(n_chunks, kKvHeads), kAttnChunk, smem, s>>>(q, k_cache, v_cache, pos0, scale, work);
+static void attn_launch(const float * q, const half * k_cache, const half * v_cache, const std::int64_t * pos0, float scale, float * work,
+                        cudaStream_t s) {
+    k_attn_partial<T><<<dim3(kAttnMaxChunks, kKvHeads), kAttnChunk, attn_smem<T>(), s>>>(q, k_cache, v_cache, pos0, scale, work);
 }
 
-void attn_decode(const float * q, const float * gate, const half * k_cache, const half * v_cache, std::int64_t pos0, int T,
+void attn_decode(const float * q, const float * gate, const half * k_cache, const half * v_cache, const std::int64_t * pos0, int T,
                  float scale, float * work, float * out, cudaStream_t s) {
-    const int n_chunks = int((pos0 + T + kAttnChunk - 1) / kAttnChunk);
     switch (T) {
-    case 1: attn_launch<1>(q, k_cache, v_cache, pos0, scale, work, n_chunks, s); break;
-    case 2: attn_launch<2>(q, k_cache, v_cache, pos0, scale, work, n_chunks, s); break;
-    case 3: attn_launch<3>(q, k_cache, v_cache, pos0, scale, work, n_chunks, s); break;
-    case 4: attn_launch<4>(q, k_cache, v_cache, pos0, scale, work, n_chunks, s); break;
+    case 1: attn_launch<1>(q, k_cache, v_cache, pos0, scale, work, s); break;
+    case 2: attn_launch<2>(q, k_cache, v_cache, pos0, scale, work, s); break;
+    case 3: attn_launch<3>(q, k_cache, v_cache, pos0, scale, work, s); break;
+    case 4: attn_launch<4>(q, k_cache, v_cache, pos0, scale, work, s); break;
     default: throw std::runtime_error("attn_decode: T must be 1..4");
     }
     launched("attn_partial");
-    k_attn_combine<<<T * kHeads, kHeadDim, 0, s>>>(work, gate, n_chunks, T, out);
+    k_attn_combine<<<T * kHeads, kHeadDim, 0, s>>>(work, gate, pos0, T, out);
     launched("attn_combine");
+}
+
+void store_rows(const float * src, float * dst, const std::int64_t * pos0, int row, int T, cudaStream_t s) {
+    k_store_rows<<<blocks(std::size_t(T) * row, 256), 256, 0, s>>>(src, dst, pos0, row, T * row);
+    launched("store_rows");
+}
+
+void link_signal(const std::int32_t * ids, const float * weights, const float * x, int T, ExpertLink * link, const std::int64_t * seq,
+                 cudaStream_t s) {
+    k_link_signal<<<1, 256, 0, s>>>(ids, weights, x, T, link, seq);
+    launched("link_signal");
+}
+void link_wait(ExpertLink * link, const std::int64_t * seq, float * out, int T, int * error, cudaStream_t s) {
+    k_link_wait<<<1, 256, 0, s>>>(link, seq, out, T, error);
+    launched("link_wait");
+}
+
+void init_kernels() {
+    check(cudaFuncSetAttribute(k_attn_partial<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, attn_smem<1>()), "attn smem");
+    check(cudaFuncSetAttribute(k_attn_partial<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, attn_smem<2>()), "attn smem");
+    check(cudaFuncSetAttribute(k_attn_partial<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, attn_smem<3>()), "attn smem");
+    check(cudaFuncSetAttribute(k_attn_partial<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, attn_smem<4>()), "attn smem");
+    experts_init();
 }
 
 void router_topk(const float * logits, std::int32_t * ids, float * weights, int T, cudaStream_t s) {
@@ -537,6 +619,16 @@ void swiglu(const float * g, const float * u, float * h, int n, cudaStream_t s) 
 void ffn_combine(const float * moe, const float * shared, const float * shared_gate, float * out, int T, cudaStream_t s) {
     k_ffn_combine<<<blocks(std::size_t(T) * kEmbd, 256), 256, 0, s>>>(moe, shared, shared_gate, out, T * kEmbd);
     launched("ffn_combine");
+}
+
+void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, int T, cudaStream_t s) {
+    k_moe_slots<<<1, 64, 0, s>>>(ids, map, slots, T * kUsed);
+    launched("moe_slots");
+}
+void moe_combine(const float * gpu_pairs, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,
+                 cudaStream_t s) {
+    k_moe_combine<<<blocks(std::size_t(T) * kEmbd, 256), 256, 0, s>>>(gpu_pairs, cpu, shared, shared_gate, out, T * kEmbd);
+    launched("moe_combine");
 }
 
 }  // namespace ninfer::flashnext::cuda

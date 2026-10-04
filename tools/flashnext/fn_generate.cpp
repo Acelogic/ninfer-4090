@@ -2,11 +2,14 @@
 //
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
+//                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
 // --compare-ref also runs the reference on the prompt in this process and prints, per layer, the
 // relative error of every intermediate both produce, then the agreement of the prompt's logits.
+// --routing-stats loads expert routing counts to choose the experts kept in VRAM, and saves the
+// updated counts at the end.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -123,6 +126,10 @@ int main(int argc, char ** argv) {
         else if (a == "--json") json_path = next();
         else if (a == "--dump") dump_dir = next();
         else if (a == "--compare-ref") compare_ref = true;
+        else if (a == "--cache-mib") opt.expert_cache_mib = std::stoll(next());
+        else if (a == "--reserve-mib") opt.vram_reserve_mib = std::stoll(next());
+        else if (a == "--routing-stats") opt.routing_stats = next();
+        else if (a == "--no-graphs") opt.cuda_graphs = false;
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -144,7 +151,8 @@ int main(int argc, char ** argv) {
     auto t_load = std::chrono::steady_clock::now();
     GgufModel gguf(shard_paths(model_path));
     Engine engine(gguf, opt);
-    std::printf("loaded %s in %.1f s\n", model_path.c_str(), seconds_since(t_load));
+    std::printf("loaded %s in %.1f s; expert cache: %lld experts in %.2f GiB of VRAM\n", model_path.c_str(), seconds_since(t_load),
+                (long long) engine.stats().cached_experts, engine.stats().cache_gib);
 
     Capture mine;
     const bool capture = compare_ref || !dump_dir.empty();
@@ -259,9 +267,11 @@ int main(int argc, char ** argv) {
     if (!step_times.empty()) {
         const double total = std::accumulate(step_times.begin(), step_times.end(), 0.0);
         const EngineStats & st = engine.stats();
-        std::printf("decode: %zu tokens, %.2f ms/token (%.2f tok/s); CPU experts %.1f%% of engine time\n", step_times.size(),
-                    1e3 * total / double(step_times.size()), double(step_times.size()) / total, 100.0 * st.cpu_experts_ms / st.step_ms);
+        std::printf("decode: %zu tokens, %.2f ms/token (%.2f tok/s); CPU experts %.1f%% of engine time; VRAM expert hits %.1f%%\n",
+                    step_times.size(), 1e3 * total / double(step_times.size()), double(step_times.size()) / total,
+                    100.0 * st.cpu_experts_ms / st.step_ms, 100.0 * double(st.expert_hits) / double(std::max<std::int64_t>(1, st.expert_pairs)));
     }
+    if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
 
     if (!json_path.empty()) {
         std::ofstream f(json_path);

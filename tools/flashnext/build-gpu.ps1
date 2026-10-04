@@ -1,5 +1,6 @@
 # Builds the GPU Flash-Next tools into build-flashnext with nvcc (sm_89) and MSVC.
 # Usage: build-gpu.ps1 [target ...] [-Cuda <toolkit dir>]   (no target: all)
+[CmdletBinding(PositionalBinding = $false)]
 param([string]$Cuda = "$env:USERPROFILE\Developer\build-tools\cuda-13.3",
       [Parameter(ValueFromRemainingArguments)][string[]]$Only)
 $ErrorActionPreference = 'Stop'
@@ -26,9 +27,10 @@ try {
     $flags = @('-O3', '-std=c++20', '-arch=sm_89', '-lineinfo', '-Xcompiler=/O2,/EHsc,/arch:AVX512,/utf-8,/Zc:preprocessor', '-I', 'R:\src')
     $core = @('R:\src\flashnext\gguf.cpp', 'R:\src\flashnext\quants.cpp')
     $engine = @('R:\src\flashnext\cpu_experts.cpp', 'R:\src\flashnext\reference.cpp', 'R:\src\flashnext\engine.cpp',
-                'R:\src\flashnext\cuda\gemv.cu', 'R:\src\flashnext\cuda\ops.cu')
+                'R:\src\flashnext\cuda\gemv.cu', 'R:\src\flashnext\cuda\ops.cu', 'R:\src\flashnext\cuda\experts.cu')
     $targets = [ordered]@{
         test_gpu_gemv = @('R:\src\flashnext\cuda\gemv.cu', 'R:\tools\flashnext\test_gpu_gemv.cu')
+        test_gpu_experts = @('R:\src\flashnext\cuda\experts.cu', 'R:\tools\flashnext\test_gpu_experts.cu')
         fn_generate   = $engine + @('R:\tools\flashnext\fn_generate.cpp')
     }
     if ($Only) { foreach ($k in @($targets.Keys)) { if ($Only -notcontains $k) { $targets.Remove($k) } } }

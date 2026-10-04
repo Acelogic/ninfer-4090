@@ -16,8 +16,12 @@
 namespace ninfer::flashnext {
 
 struct EngineOptions {
-    std::int64_t max_ctx = 32768;  // KV cache length
-    int cpu_threads = 16;          // expert threads
+    std::int64_t max_ctx = 32768;         // KV cache length
+    int cpu_threads = 16;                 // expert threads
+    std::int64_t expert_cache_mib = -1;   // VRAM for routed experts; -1: all that is free but the reserve
+    std::int64_t vram_reserve_mib = 1536; // left free for the desktop and other programs
+    std::string routing_stats;            // per-layer expert counts that choose the cached experts ("" = none)
+    bool cuda_graphs = true;              // replay each step as one CUDA graph (off: launch kernels one by one)
 };
 
 // Named intermediate activations, row-major [n_tokens][width], with the same names and layout as
@@ -29,6 +33,9 @@ struct EngineStats {
     std::int64_t steps = 0, tokens = 0;
     double step_ms = 0;         // wall time inside forward()
     double cpu_experts_ms = 0;  // of which the CPU expert calls
+    std::int64_t expert_pairs = 0, expert_hits = 0;  // selected experts, and those computed from the VRAM cache
+    std::int64_t cached_experts = 0;
+    double cache_gib = 0;
 };
 
 class Engine {
@@ -47,6 +54,8 @@ public:
     int n_vocab() const;
     void set_activation_hook(EngineHook hook);  // slow: synchronizes and copies every activation
     const EngineStats & stats() const;
+    // Writes the routing counts (the loaded ones plus everything seen since) for the next start.
+    void save_routing_stats(const std::string & path) const;
 
     struct Impl;
 

@@ -74,17 +74,23 @@ void dn_recurrence(const float * conv_out, const float * z, const float * beta, 
                    const float * a, const float * norm_w, float * S, float * out, int T, float eps, cudaStream_t s);
 
 // ---- full attention ----
-// rope_inv_freq: [kRot/2] doubles in device memory.
+// Positions are read from device memory (pos0: the first token's position) so that a decode step
+// can be replayed as a CUDA graph. rope_inv_freq: [kRot/2] doubles in device memory.
 // q_full [T][24][q 256 | gate 256] -> q [T][24][256] (normed, rotated), gate [T][24][256];
 // k, v [T][2][256] -> rows pos0.. of the fp16 caches [ctx][2][256] (k normed and rotated).
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
-               const double * rope_inv_freq, float * q, float * gate, half * k_cache, half * v_cache, std::int64_t pos0, int T,
+               const double * rope_inv_freq, float * q, float * gate, half * k_cache, half * v_cache, const std::int64_t * pos0, int T,
                float eps, cudaStream_t s);
 // Causal softmax attention of T queries over cells [0, pos0 + t] times sigmoid(gate). out [T][24][256].
-// work: attn_work_floats(max_ctx, T) floats.
-std::size_t attn_work_floats(std::int64_t max_ctx, int T);
-void attn_decode(const float * q, const float * gate, const half * k_cache, const half * v_cache, std::int64_t pos0, int T,
+// Dense attention covers at most kAttnMaxCells cells (beyond that QSA selects 2051 of them), in up to
+// kAttnMaxChunks chunks; chunks past the context exit at once. work: attn_work_floats(T) floats.
+constexpr int kAttnMaxCells = 2051;
+constexpr int kAttnMaxChunks = (kAttnMaxCells + 255) / 256;
+std::size_t attn_work_floats(int T);
+void attn_decode(const float * q, const float * gate, const half * k_cache, const half * v_cache, const std::int64_t * pos0, int T,
                  float scale, float * work, float * out, cudaStream_t s);
+// dst[(pos0 + t) * row + i] = src[t * row + i]: appends T rows at the device-held position
+void store_rows(const float * src, float * dst, const std::int64_t * pos0, int row, int T, cudaStream_t s);
 
 // ---- MoE ----
 // softmax over 512 logits, top 10 (ties to the lower id), weights renormalised over the ten
@@ -93,5 +99,34 @@ void router_topk(const float * logits, std::int32_t * ids, float * weights, int 
 void swiglu(const float * g, const float * u, float * h, int n, cudaStream_t s);
 // out = moe + shared * sigmoid(shared_gate_logit[t])
 void ffn_combine(const float * moe, const float * shared, const float * shared_gate, float * out, int T, cudaStream_t s);
+// slots[i] = map[ids[i]] for the T * 10 selected experts (map: the layer's expert -> cache slot, -1 if not cached)
+void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, int T, cudaStream_t s);
+// out[t] = sum_k gpu_pairs[t*10+k] + cpu[t] + shared[t] * sigmoid(shared_gate_logit[t])
+void moe_combine(const float * gpu_pairs, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,
+                 cudaStream_t s);
+
+// ---- GPU <-> CPU hand-off of the routed experts, through mapped host memory ----
+// The GPU writes a layer's selections and FFN input, then raises req; the CPU computes the experts
+// that are not cached, writes out, then raises done; the GPU waits for done and continues. Both
+// flags carry the step's sequence number, so no reset is needed between steps.
+struct alignas(64) ExpertLink {
+    std::int64_t req;
+    std::int64_t pad0[7];
+    std::int64_t done;
+    std::int64_t pad1[7];
+    std::int32_t ids[kMaxTokens * kUsed];
+    float weights[kMaxTokens * kUsed];
+    float x[kMaxTokens * kEmbd];
+    float out[kMaxTokens * kEmbd];
+};
+// link: device address of the mapped ExpertLink; seq: device address of the step's sequence number
+void link_signal(const std::int32_t * ids, const float * weights, const float * x, int T, ExpertLink * link, const std::int64_t * seq,
+                 cudaStream_t s);
+// Waits for link->done == *seq, then copies link->out to out [T][2560]. After about a second
+// without an answer it gives up, writes zeros and sets *error (Windows resets a GPU after 2 s).
+void link_wait(ExpertLink * link, const std::int64_t * seq, float * out, int T, int * error, cudaStream_t s);
+
+// Lazy kernel setup (tables, shared-memory limits); call once before capturing a graph.
+void init_kernels();
 
 }  // namespace ninfer::flashnext::cuda
