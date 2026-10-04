@@ -75,6 +75,25 @@ __device__ __forceinline__ float dot_iq4xs(const BlockIQ4_XS * __restrict__ row,
     return acc;
 }
 
+// Dot of a Q8_0 row of 2560 weights (80 blocks of 34 bytes, 2-byte aligned) with x: lane l takes
+// blocks l, l+32 and l+64.
+__device__ __forceinline__ float dot_q8(const BlockQ8_0 * __restrict__ row, const float * __restrict__ x, int lane) {
+    float acc = 0.0f;
+    for (int b = lane; b < kEmbd / 32; b += 32) {
+        const BlockQ8_0 & blk = row[b];
+        const std::uint16_t * q = reinterpret_cast<const std::uint16_t *>(blk.qs);
+        const float * xb = x + 32 * b;
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const std::uint16_t v = q[j];
+            s += float(std::int8_t(v & 0xFF)) * xb[2 * j] + float(std::int8_t(v >> 8)) * xb[2 * j + 1];
+        }
+        acc += __half2float(*reinterpret_cast<const __half *>(&blk.d)) * s;
+    }
+    return acc;
+}
+
 template <GgufType G>
 __global__ void __launch_bounds__(32 * kRowsPerBlock) k_gate_up(const std::uint8_t * __restrict__ pool, std::size_t slot_bytes,
                                                                 std::size_t gate_row, std::size_t up_off, const std::int32_t * __restrict__ slots,
@@ -96,6 +115,9 @@ __global__ void __launch_bounds__(32 * kRowsPerBlock) k_gate_up(const std::uint8
     if constexpr (G == GgufType::IQ3_S) {
         g = dot_iq3s(reinterpret_cast<const BlockIQ3_S *>(base + r * gate_row), xt, grid, lane);
         u = dot_iq3s(reinterpret_cast<const BlockIQ3_S *>(base + up_off + r * gate_row), xt, grid, lane);
+    } else if constexpr (G == GgufType::Q8_0) {
+        g = dot_q8(reinterpret_cast<const BlockQ8_0 *>(base + r * gate_row), xt, lane);
+        u = dot_q8(reinterpret_cast<const BlockQ8_0 *>(base + up_off + r * gate_row), xt, lane);
     } else {
         g = dot_iq4xs(reinterpret_cast<const BlockIQ4_XS *>(base + r * gate_row), xt, lut, lane);
         u = dot_iq4xs(reinterpret_cast<const BlockIQ4_XS *>(base + up_off + r * gate_row), xt, lut, lane);
@@ -161,7 +183,7 @@ std::once_flag grid_once;
 }  // namespace
 
 ExpertLayout expert_layout(GgufType gate_up, GgufType down) {
-    if (gate_up != GgufType::IQ3_S && gate_up != GgufType::IQ4_XS)
+    if (gate_up != GgufType::IQ3_S && gate_up != GgufType::IQ4_XS && gate_up != GgufType::Q8_0)
         throw std::runtime_error(std::string("experts: no GPU kernel for gate/up ") + type_name(gate_up));
     if (down != GgufType::IQ4_NL && down != GgufType::Q8_0) throw std::runtime_error(std::string("experts: no GPU kernel for down ") + type_name(down));
     ExpertLayout l;
@@ -212,6 +234,8 @@ void experts_gpu(const ExpertLayout & l, const std::uint8_t * pool, const std::i
     const dim3 gu(T * kUsed, kExpertFF / kRowsPerBlock), dn(T * kUsed, kEmbd / kRowsPerBlock);
     if (l.gate_type == GgufType::IQ3_S)
         k_gate_up<GgufType::IQ3_S><<<gu, block, 0, stream>>>(pool, l.slot_bytes, l.gate_row, l.up_off, slots, x, h);
+    else if (l.gate_type == GgufType::Q8_0)
+        k_gate_up<GgufType::Q8_0><<<gu, block, 0, stream>>>(pool, l.slot_bytes, l.gate_row, l.up_off, slots, x, h);
     else
         k_gate_up<GgufType::IQ4_XS><<<gu, block, 0, stream>>>(pool, l.slot_bytes, l.gate_row, l.up_off, slots, x, h);
     check(cudaGetLastError(), "experts gate/up");

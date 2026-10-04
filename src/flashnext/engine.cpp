@@ -920,10 +920,16 @@ struct Engine::Impl {
         stats.expert_hits += std::int64_t(ke - misses);
         if (misses) {
             const auto c0 = clk::now();
-            for (int t0 = 0; t0 < T; t0 += CpuExperts::kMaxTokens) {
-                const int n = std::min(CpuExperts::kMaxTokens, T - t0);
-                const std::size_t xo = std::size_t(t0) * fc::kEmbd, ko = std::size_t(t0) * fc::kUsed;
-                experts->run(il, n, h_mixed->get() + xo, h_ids->get() + ko, h_w->get() + ko, h_oncpu->get() + ko, h_moe->get() + xo);
+            if (T <= CpuExperts::kMaxTokens) {
+                experts->run(il, T, h_mixed->get(), h_ids->get(), h_w->get(), h_oncpu->get(), h_moe->get());
+            } else {
+                // prompt chunk: every expert's weights are read once for all of its tokens
+                for (int t0 = 0; t0 < T; t0 += CpuExperts::kMaxBatchTokens) {
+                    const int n = std::min(CpuExperts::kMaxBatchTokens, T - t0);
+                    const std::size_t xo = std::size_t(t0) * fc::kEmbd, ko = std::size_t(t0) * fc::kUsed;
+                    experts->run_batch(il, n, h_mixed->get() + xo, h_ids->get() + ko, h_w->get() + ko, h_oncpu->get() + ko,
+                                       h_moe->get() + xo);
+                }
             }
             stats.cpu_experts_ms += std::chrono::duration<double, std::milli>(clk::now() - c0).count();
             check(cudaMemcpyAsync(moe.get(), h_moe->get(), xe, cudaMemcpyHostToDevice, stream), "moe");

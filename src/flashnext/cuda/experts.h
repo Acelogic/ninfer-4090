@@ -25,7 +25,7 @@ struct ExpertLayout {
     std::size_t slot_bytes = 0;
 };
 
-// Layout for a layer's expert types: gate/up IQ3_S or IQ4_XS, down IQ4_NL or Q8_0.
+// Layout for a layer's expert types: gate/up IQ3_S, IQ4_XS or Q8_0 (the MTP layer), down IQ4_NL or Q8_0.
 ExpertLayout expert_layout(GgufType gate_up, GgufType down);
 
 // Writes expert e of one layer into a slot image of layout.slot_bytes bytes.
