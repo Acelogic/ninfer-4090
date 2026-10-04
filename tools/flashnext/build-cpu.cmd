@@ -11,4 +11,7 @@ set "CORE="%SRC%\src\flashnext\gguf.cpp" "%SRC%\src\flashnext\quants.cpp""
 if errorlevel 1 exit /b 1
 %CXX% %CORE% "%SRC%\src\flashnext\cpu_experts.cpp" "%SRC%\tools\flashnext\test_cpu_experts.cpp" /Fe:"%OUT%\test_cpu_experts.exe"
 if errorlevel 1 exit /b 1
+rem FP32 reference forward pass and its greedy generator: no ggml.
+%CXX% %CORE% "%SRC%\src\flashnext\reference.cpp" "%SRC%\tools\flashnext\ref_generate.cpp" /Fe:"%OUT%\ref_generate.exe"
+if errorlevel 1 exit /b 1
 echo BUILD OK
