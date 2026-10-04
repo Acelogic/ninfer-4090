@@ -1,0 +1,97 @@
+// GPU kernels of the Qwen3.8-Flash-Next decode step other than the matrix-vector products.
+//
+// The shapes are the model's and fixed at compile time; Engine checks them against the GGUF. Every
+// formula matches the FP32 reference (src/flashnext/reference.cpp), which documents where it comes
+// from. Activations are FP32 [T][width] for T tokens at consecutive positions pos0 .. pos0+T-1.
+#pragma once
+#include <cstddef>
+#include <cstdint>
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+namespace ninfer::flashnext::cuda {
+
+constexpr int kEmbd = 2560;
+constexpr int kHc = 4;                 // hyper-connection streams
+constexpr int kHcd = kHc * kEmbd;      // 10240
+constexpr int kHcRank = 320;
+
+constexpr int kDnState = 128;          // Gated DeltaNet head size
+constexpr int kDnKHeads = 16;
+constexpr int kDnVHeads = 48;
+constexpr int kDnKeyDim = kDnKHeads * kDnState;          // 2048
+constexpr int kDnVDim = kDnVHeads * kDnState;            // 6144
+constexpr int kDnConvDim = 2 * kDnKeyDim + kDnVDim;      // 10240
+constexpr int kDnConv = 4;
+
+constexpr int kHeads = 24;             // full attention
+constexpr int kKvHeads = 2;
+constexpr int kHeadDim = 256;
+constexpr int kRot = 64;               // NEOX rotation of the first 64 dims
+constexpr int kGroup = kHeads / kKvHeads;
+constexpr int kIdxDim = 128;           // QSA indexer key size
+
+constexpr int kExperts = 512;
+constexpr int kUsed = 10;
+constexpr int kFfShared = 640;
+
+constexpr int kPleHeads = 16;
+constexpr int kPleHeadDim = 160;
+constexpr int kPleKernel = 4;
+constexpr int kPleDilation = 3;
+constexpr int kPleHist = (kPleKernel - 1) * kPleDilation;  // 9 earlier tokens
+
+constexpr int kMaxTokens = 4;          // tokens per decode step (MTP verification needs up to 4)
+
+// ---- hyper-connections ----
+// res [T][HC][E] = x [T][E] copied to every stream
+void hc_expand(const float * x, float * res, int T, cudaStream_t s);
+// xn [T][HC][E] = RMSNorm of each stream of res, times w [HC*E]
+void hc_norm(const float * res, const float * w, float * xn, int T, float eps, cudaStream_t s);
+// lo = silu(lo / HC), n values
+void hc_lowrank_act(float * lo, int n, cudaStream_t s);
+// mixed [T][E] = (1/HC) sum_c xn[c] * sigmoid(gate[c])
+void hc_gate_mean(const float * xn, const float * gate, float * mixed, int T, cudaStream_t s);
+// res[t][c] += out[t] * 2 sigmoid(inject[t][c] / HC)
+void hc_combine(float * res, const float * out, const float * inject, int T, cudaStream_t s);
+
+// ---- PLE (layer 1) ----
+// From the key projection [T][HCD], the value projection [T][E] and res: gated [T][HCD] =
+// value * g[t][c], with g = sigmoid(signed sqrt(rms(key)*nk . rms(res)*nq / sqrt(E))), and
+// normalized [T][HCD] = RMSNorm(gated) * nc.
+void ple_gate(const float * key, const float * value, const float * res, const float * norm_key, const float * norm_query,
+              const float * norm_conv, float * gated, float * normalized, float * gates, int T, float eps, cudaStream_t s);
+// res += gated + silu(depthwise causal conv(normalized)); hist [9][HCD] holds the earlier tokens.
+void ple_conv_add(float * res, const float * gated, const float * normalized, const float * conv_w, float * hist, int T,
+                  cudaStream_t s);
+
+// ---- Gated DeltaNet ----
+// conv over [state | qkv] (kernel 4) then SiLU; q and k heads L2-normalised; state updated.
+void dn_conv(const float * qkv, float * conv_state, const float * conv_w, float * out, int T, float eps, cudaStream_t s);
+// Gated delta rule per v head (k/q head h % 16), then RMSNorm(o) * norm_w * sigmoid(z). S: [48][128][128].
+void dn_recurrence(const float * conv_out, const float * z, const float * beta, const float * alpha, const float * dt_bias,
+                   const float * a, const float * norm_w, float * S, float * out, int T, float eps, cudaStream_t s);
+
+// ---- full attention ----
+// rope_inv_freq: [kRot/2] doubles in device memory.
+// q_full [T][24][q 256 | gate 256] -> q [T][24][256] (normed, rotated), gate [T][24][256];
+// k, v [T][2][256] -> rows pos0.. of the fp16 caches [ctx][2][256] (k normed and rotated).
+void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
+               const double * rope_inv_freq, float * q, float * gate, half * k_cache, half * v_cache, std::int64_t pos0, int T,
+               float eps, cudaStream_t s);
+// Causal softmax attention of T queries over cells [0, pos0 + t] times sigmoid(gate). out [T][24][256].
+// work: attn_work_floats(max_ctx, T) floats.
+std::size_t attn_work_floats(std::int64_t max_ctx, int T);
+void attn_decode(const float * q, const float * gate, const half * k_cache, const half * v_cache, std::int64_t pos0, int T,
+                 float scale, float * work, float * out, cudaStream_t s);
+
+// ---- MoE ----
+// softmax over 512 logits, top 10 (ties to the lower id), weights renormalised over the ten
+void router_topk(const float * logits, std::int32_t * ids, float * weights, int T, cudaStream_t s);
+// h = silu(g) * u
+void swiglu(const float * g, const float * u, float * h, int n, cudaStream_t s);
+// out = moe + shared * sigmoid(shared_gate_logit[t])
+void ffn_combine(const float * moe, const float * shared, const float * shared_gate, float * out, int T, cudaStream_t s);
+
+}  // namespace ninfer::flashnext::cuda
