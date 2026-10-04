@@ -151,8 +151,8 @@ struct alignas(64) ExpertLink {
 // link: device address of the mapped ExpertLink; seq: device address of the step's sequence number
 void link_signal(const std::int32_t * ids, const float * weights, const std::uint8_t * on_cpu, const float * x, int T, ExpertLink * link,
                  const std::int64_t * seq, cudaStream_t s);
-// Waits for link->done == *seq, then copies link->out to out [T][2560]. After about a second
-// without an answer it gives up, writes zeros and sets *error (Windows resets a GPU after 2 s).
+// Waits for link->done == *seq, then copies link->out to out [T][2560]. After 1.5 s without an
+// answer it gives up, writes zeros and sets *error (Windows resets a GPU after 2 s).
 void link_wait(ExpertLink * link, const std::int64_t * seq, float * out, int T, int * error, cudaStream_t s);
 
 // Lazy kernel setup (tables, shared-memory limits); call once before capturing a graph.

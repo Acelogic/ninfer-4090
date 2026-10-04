@@ -230,6 +230,7 @@ struct Engine::Impl {
         if (!opt.routing_stats.empty()) load_routing(opt.routing_stats);
         fill_cache();
         release_experts();  // CpuExperts and the VRAM cache have their own copies now
+        warm_up_cpu_experts();
         if (opt.host_expert_images) {
             build_images();
             release_experts();
@@ -603,6 +604,17 @@ struct Engine::Impl {
         tmp.resize(2 * sz.gate_up + sz.down);
         experts->export_expert(il, e, tmp.data(), tmp.data() + sz.gate_up, tmp.data() + 2 * sz.gate_up);
         fc::pack_expert_rows(C.lay, tmp.data(), tmp.data() + sz.gate_up, tmp.data() + 2 * sz.gate_up, dst);
+    }
+
+    // One CPU expert call per layer and token count on dummy data, so that the first real step does not
+    // pay for page faults and lazily allocated scratch while the GPU is waiting on it (with a deadline).
+    void warm_up_cpu_experts() {
+        const int T = fc::kMaxTokens;
+        std::vector<float> xw(std::size_t(T) * fc::kEmbd, 0.01f), w(std::size_t(T) * fc::kUsed, 0.1f), o(std::size_t(T) * fc::kEmbd);
+        std::vector<std::int32_t> idw(std::size_t(T) * fc::kUsed);
+        for (std::size_t i = 0; i < idw.size(); ++i) idw[i] = std::int32_t((i * 37) % fc::kExperts);
+        for (int il = 0; il < cfg.n_layer; ++il)
+            for (int t = 1; t <= T; ++t) experts->run(il, t, xw.data(), idw.data(), w.data(), nullptr, o.data());
     }
 
     void release_experts() {

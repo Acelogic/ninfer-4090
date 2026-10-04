@@ -553,7 +553,7 @@ __global__ void __launch_bounds__(256) k_link_wait(ExpertLink * link, const std:
         const std::uint64_t t0 = global_ns();
         ok = 1;
         while (*reinterpret_cast<volatile std::int64_t *>(&link->done) != want) {
-            if (global_ns() - t0 > 1000000000ull) {
+            if (global_ns() - t0 > 1500000000ull) {  // under Windows' 2 s GPU watchdog
                 ok = 0;
                 atomicExch(error, 1);
                 break;
