@@ -403,6 +403,9 @@ struct Engine::Impl {
         const GgufTensor & ge = g.tensor(b + "ffn_gate_exps.weight");
         const GgufTensor & ue = g.tensor(b + "ffn_up_exps.weight");
         const GgufTensor & de = g.tensor(b + "ffn_down_exps.weight");
+        const std::vector<std::int64_t> gate_shape{E, fc::kExpertFF, fc::kExperts}, down_shape{fc::kExpertFF, E, fc::kExperts};
+        if (ge.shape != gate_shape || ue.shape != gate_shape || de.shape != down_shape || ue.type != ge.type)
+            throw std::runtime_error("engine: unexpected MTP expert tensors in " + opt.mtp_path);
         M.experts.lay = fc::expert_layout(ge.type, de.type);
         M.experts.map.resize(fc::kExperts);
         M.experts.pool = fc::DeviceBuffer(std::size_t(fc::kExperts) * M.experts.lay.slot_bytes);
