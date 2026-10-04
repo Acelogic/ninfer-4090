@@ -97,7 +97,7 @@ expert cache). Options for these models:
 | `--flashnext-routing-stats FILE` | expert routing counts that choose the cached experts; read at start when present, written back whenever the request queue drains and at shutdown | none |
 | `--flashnext-host-expert-images` | keep a pinned host copy of every expert (tens of GB of RAM, only when free) | off |
 | `--flashnext-mtp FILE` | the MTP head GGUF; enables speculative decoding | off |
-| `--flashnext-draft K` | MTP drafts per decode step, `1..3` | `2` with `--flashnext-mtp` |
+| `--flashnext-draft K` | most MTP drafts per decode step, `1..3`; each step uses the length with the most expected tokens per second, from moving averages of draft acceptance and step time | `2` with `--flashnext-mtp` |
 
 They are rejected for `.ninfer` artifacts. Flash-Next does not support `--max-concurrency` above 1,
 `--spec` (it uses `--flashnext-mtp`), `--vision`, `--kv-dtype` other than `bf16`,

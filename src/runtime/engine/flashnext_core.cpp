@@ -10,6 +10,7 @@
 #include "runtime/engine/host_sampler.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -1178,11 +1179,12 @@ private:
             const std::uint32_t model_budget =
                 request.output.model_token_budget_remaining(budget.remaining());
             const std::uint32_t k =
-                model_budget == 0 ? 0 : std::min(draft_tokens, model_budget - 1);
+                model_budget == 0 ? 0 : std::min(choose_drafts(), model_budget - 1);
             if (k == 0) {
                 logits   = forward(std::span<const TokenId>(&token, 1));
                 position = static_cast<std::int32_t>(live_tokens) - 1;
                 purpose  = HostSampler::Purpose::Decode;
+                if (draft_tokens != 0) observe_step(0, Clock::now() - step_started);
                 continue;
             }
 
@@ -1203,6 +1205,7 @@ private:
                     std::span<const float>(rows).subspan(row * vocabulary, vocabulary),
                     static_cast<std::int32_t>(base + row), HostSampler::Purpose::Decode);
                 outcome = commit_model_token(request, budget, sampler, last);
+                if (row < k) observe_draft(row, last == drafted[row]);
                 if (row < k && last == drafted[row] &&
                     outcome.finish_reason == FinishReason::None && !outcome.control) {
                     ++request.speculative.accepted_per_position[row];
@@ -1211,6 +1214,7 @@ private:
                 }
                 break;
             }
+            observe_step(k, Clock::now() - step_started);
             // Keep the fed token and the accepted drafts; `last` is committed but not executed.
             if (kept < k) { engine->rollback(static_cast<int>(1 + kept)); }
             live_tokens = base + 1 + kept;
@@ -1229,6 +1233,49 @@ private:
                 unexecuted = last;
             }
         }
+    }
+
+    // Adaptive draft length. Drafts pay off only when they are accepted often enough to cover the
+    // longer verification step (on story-like text they did not: 63% accepted, slower than plain
+    // decoding; on chat 93%, 30% faster). Moving averages of each draft position's acceptance (given
+    // the earlier drafts were accepted) and of each length's step time pick the length with the most
+    // expected tokens per second; a longer length is tried now and then to keep its estimates fresh.
+    static constexpr std::uint32_t kMaxDrafts = 3;
+    static constexpr double kAlpha = 0.05;
+    std::array<double, kMaxDrafts> accept_ema{0.75, 0.75, 0.75};
+    std::array<double, kMaxDrafts + 1> step_ms_ema{0.0, 0.0, 0.0, 0.0};  // 0 = not measured yet
+    std::uint64_t speculative_steps = 0;
+
+    std::uint32_t choose_drafts() {
+        const std::uint32_t max_k = std::min(draft_tokens, kMaxDrafts);
+        if (max_k == 0) return 0;
+        const double t0 = step_ms_ema[0] > 0.0 ? step_ms_ema[0] : 20.0;
+        double expected = 1.0, reach = 1.0, best_rate = -1.0;
+        std::uint32_t best = 0;
+        for (std::uint32_t k = 0; k <= max_k; ++k) {
+            if (k > 0) {
+                reach *= accept_ema[k - 1];
+                expected += reach;
+            }
+            const double t    = step_ms_ema[k] > 0.0 ? step_ms_ema[k] : t0 * (1.0 + 0.5 * k);
+            const double rate = expected / t;
+            if (rate > best_rate) {
+                best_rate = rate;
+                best      = k;
+            }
+        }
+        if (++speculative_steps % 32 == 0 && best < max_k) ++best;
+        return best;
+    }
+
+    void observe_draft(std::uint32_t position, bool accepted) {
+        if (position < kMaxDrafts) accept_ema[position] += kAlpha * ((accepted ? 1.0 : 0.0) - accept_ema[position]);
+    }
+
+    void observe_step(std::uint32_t k, Clock::duration elapsed) {
+        const double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        double & e      = step_ms_ema[std::min(k, kMaxDrafts)];
+        e               = e > 0.0 ? e + kAlpha * (ms - e) : ms;
     }
 
     // Worker-owned sequence state. kv_tokens mirrors the engine's positional token history (what

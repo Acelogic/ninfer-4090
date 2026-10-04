@@ -370,6 +370,11 @@ static int run(int argc, char ** argv) {
     if (!step_times.empty()) {
         const double total = std::accumulate(step_times.begin(), step_times.end(), 0.0);
         const EngineStats & st = engine.stats();
+        std::vector<double> sorted = step_times;
+        std::sort(sorted.begin(), sorted.end());
+        std::printf("step times: median %.2f ms, p90 %.2f ms, max %.2f ms (step %d)\n", 1e3 * sorted[sorted.size() / 2],
+                    1e3 * sorted[sorted.size() * 9 / 10], 1e3 * sorted.back(),
+                    int(std::max_element(step_times.begin(), step_times.end()) - step_times.begin()));
         const double cpu_ms = st.cpu_experts_ms - after_prompt.cpu_experts_ms, eng_ms = st.step_ms - after_prompt.step_ms;
         const std::int64_t hits = st.expert_hits - after_prompt.expert_hits, pairs = st.expert_pairs - after_prompt.expert_pairs;
         const std::int64_t host = st.expert_host_reads - after_prompt.expert_host_reads;

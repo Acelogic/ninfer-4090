@@ -90,6 +90,18 @@ void release_mapped(const void * p, std::size_t n) {
 #endif
 }
 
+// Asks the OS to read part of the memory-mapped GGUF into its file cache in the background.
+void prefetch_mapped(const void * p, std::size_t n) {
+#ifdef _WIN32
+    WIN32_MEMORY_RANGE_ENTRY range{const_cast<void *>(p), n};
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+#else
+    const std::uintptr_t page = std::uintptr_t(sysconf(_SC_PAGESIZE));
+    const std::uintptr_t a = std::uintptr_t(p) & ~(page - 1);
+    madvise(reinterpret_cast<void *>(a), std::uintptr_t(p) + n - a, MADV_WILLNEED);
+#endif
+}
+
 void require(bool ok, const char * what) {
     if (!ok) throw std::runtime_error(std::string("engine: model does not match the compiled shapes: ") + what);
 }
@@ -191,6 +203,7 @@ struct Engine::Impl {
     std::vector<double> recent;        // [layer][expert], in units of recent_unit
     double recent_unit = 1.0;          // weight of an observation made now
     std::int64_t tokens_since_adapt = 0;
+    std::int64_t pairs_at_adapt = 0, hits_at_adapt = 0;  // expert counters at the last re-ranking
     std::unique_ptr<Pinned<std::uint8_t>> swap_staging;
     static constexpr int kSwapBatch = 64;
     fc::DeviceBuffer slots, eh, ypairs;   // decode steps: one row per (token, expert) pair
@@ -231,6 +244,9 @@ struct Engine::Impl {
         fill_cache();
         release_experts();  // CpuExperts and the VRAM cache have their own copies now
         warm_up_cpu_experts();
+        // every token reads 16 random rows of the 27 GB PLE table: warm the OS file cache in the
+        // background so that early tokens do not wait on disk reads
+        if (ple_table) prefetch_mapped(ple_table->data, ple_table->bytes);
         if (opt.host_expert_images) {
             build_images();
             release_experts();
@@ -1375,16 +1391,18 @@ std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, boo
     }
     impl_->stats.tokens += std::int64_t(n);
     // re-rank the cached experts after a prompt (its routing predicts the continuation) and from
-    // time to time while decoding
-    impl_->tokens_since_adapt += std::int64_t(n);
-    if (n >= 32) {
-        impl_->adapt_cache(1 << 30);
-        impl_->tokens_since_adapt = 0;
-    } else if (impl_->tokens_since_adapt >= 256) {
-        impl_->adapt_cache(128);
-        impl_->tokens_since_adapt = 0;
+    // time to time while decoding, sooner while the cache lags the text (under 80% hits)
+    Impl & I = *impl_;
+    I.tokens_since_adapt += std::int64_t(n);
+    const std::int64_t pairs = I.stats.expert_pairs - I.pairs_at_adapt, hits = I.stats.expert_hits - I.hits_at_adapt;
+    const bool lagging = pairs > 0 && double(hits) < 0.8 * double(pairs);
+    if (n >= 32 || I.tokens_since_adapt >= 256 || (lagging && I.tokens_since_adapt >= 64)) {
+        I.adapt_cache(n >= 32 ? (1 << 30) : lagging ? 256 : 128);
+        I.tokens_since_adapt = 0;
+        I.pairs_at_adapt = I.stats.expert_pairs;
+        I.hits_at_adapt = I.stats.expert_hits;
     }
-    impl_->stats.step_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    I.stats.step_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
     return all_logits ? all : last;
 }
 
