@@ -27,13 +27,19 @@ try {
     $flags = @('-O3', '-std=c++20', '-arch=sm_89', '-lineinfo', '-Xcompiler=/O2,/EHsc,/arch:AVX512,/utf-8,/Zc:preprocessor', '-I', 'R:\src')
     $core = @('R:\src\flashnext\gguf.cpp', 'R:\src\flashnext\quants.cpp')
     $engine = @('R:\src\flashnext\cpu_experts.cpp', 'R:\src\flashnext\reference.cpp', 'R:\src\flashnext\engine.cpp',
-                'R:\src\flashnext\cuda\gemv.cu', 'R:\src\flashnext\cuda\ops.cu', 'R:\src\flashnext\cuda\experts.cu')
+                'R:\src\flashnext\cuda\gemv.cu', 'R:\src\flashnext\cuda\ops.cu', 'R:\src\flashnext\cuda\experts.cu',
+                'R:\src\flashnext\cuda\gemm.cu', 'cublas.lib')
     $targets = [ordered]@{
         test_gpu_gemv = @('R:\src\flashnext\cuda\gemv.cu', 'R:\tools\flashnext\test_gpu_gemv.cu')
         test_gpu_experts = @('R:\src\flashnext\cuda\experts.cu', 'R:\tools\flashnext\test_gpu_experts.cu')
         fn_generate   = $engine + @('R:\tools\flashnext\fn_generate.cpp')
     }
     if ($Only) { foreach ($k in @($targets.Keys)) { if ($Only -notcontains $k) { $targets.Remove($k) } } }
+    # the engine's prompt path uses cuBLAS: ship its DLLs next to the executables
+    foreach ($dll in @('cublas64_13.dll', 'cublasLt64_13.dll')) {
+        $src = Join-Path $Cuda "bin\x64\$dll"
+        if ((Test-Path $src) -and -not (Test-Path "R:\build-flashnext\$dll")) { Copy-Item $src "R:\build-flashnext\$dll" }
+    }
     foreach ($t in $targets.Keys) {
         & $nvccExe @flags @core @($targets[$t]) -o "R:\build-flashnext\$t.exe" 2>&1 | Where-Object { $_ -notmatch '^\S+\.(cu|cpp)$|cudafe1\.cpp$' }
         if ($LASTEXITCODE) { throw "build of $t failed" }

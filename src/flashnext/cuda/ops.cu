@@ -133,21 +133,21 @@ __global__ void k_ple_conv_add(float * __restrict__ res, const float * __restric
                                const float * __restrict__ conv_w, float * __restrict__ hist, int T) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= kHcd) return;
-    float win[kPleHist + kMaxTokens];
-    for (int j = 0; j < kPleHist; ++j) win[j] = hist[std::size_t(j) * kHcd + ch];
-    for (int t = 0; t < T; ++t) win[kPleHist + t] = normalized[std::size_t(t) * kHcd + ch];
     float w[kPleKernel];
     for (int k = 0; k < kPleKernel; ++k) w[k] = conv_w[ch * kPleKernel + k];
+    // input at token r of this step: the history row for r < 0, else the new normalized row
+    auto in = [&](int r) { return r < 0 ? hist[std::size_t(kPleHist + r) * kHcd + ch] : normalized[std::size_t(r) * kHcd + ch]; };
     for (int t = 0; t < T; ++t) {
         float acc = 0.0f;
         for (int k = 0; k < kPleKernel; ++k) {
-            const float term = win[kPleHist + t - (kPleKernel - 1 - k) * kPleDilation] * w[k];
+            const float term = in(t - (kPleKernel - 1 - k) * kPleDilation) * w[k];
             acc = k == 0 ? term : acc + term;
         }
         const std::size_t i = std::size_t(t) * kHcd + ch;
         res[i] = res[i] + (gated[i] + siluf_(acc));
     }
-    for (int j = 0; j < kPleHist; ++j) hist[std::size_t(j) * kHcd + ch] = win[T + j];
+    // the last 9 inputs become the history, oldest first (reads run ahead of the writes)
+    for (int j = 0; j < kPleHist; ++j) hist[std::size_t(j) * kHcd + ch] = in(T - kPleHist + j);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -538,7 +538,7 @@ void ple_gate(const float * key, const float * value, const float * res, const f
 }
 void ple_conv_add(float * res, const float * gated, const float * normalized, const float * conv_w, float * hist, int T,
                   cudaStream_t s) {
-    if (T < 1 || T > kMaxTokens) throw std::runtime_error("ple_conv_add: T out of range");
+    if (T < 1) throw std::runtime_error("ple_conv_add: T out of range");
     k_ple_conv_add<<<blocks(kHcd, 256), 256, 0, s>>>(res, gated, normalized, conv_w, hist, T);
     launched("ple_conv_add");
 }
@@ -622,7 +622,7 @@ void ffn_combine(const float * moe, const float * shared, const float * shared_g
 }
 
 void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, int T, cudaStream_t s) {
-    k_moe_slots<<<1, 64, 0, s>>>(ids, map, slots, T * kUsed);
+    k_moe_slots<<<blocks(std::size_t(T) * kUsed, 256), 256, 0, s>>>(ids, map, slots, T * kUsed);
     launched("moe_slots");
 }
 void moe_combine(const float * gpu_pairs, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,

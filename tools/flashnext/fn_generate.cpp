@@ -2,7 +2,7 @@
 //
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
-//                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs]
+//                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
@@ -105,8 +105,19 @@ struct Capture {
 
 }  // namespace
 
+static int run(int argc, char ** argv);
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    try {
+        return run(argc, argv);
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
+}
+
+static int run(int argc, char ** argv) {
     std::string model_path, tokens_arg, tokens_file, json_path, dump_dir;
     int n_gen = 16;
     bool compare_ref = false;
@@ -130,6 +141,7 @@ int main(int argc, char ** argv) {
         else if (a == "--reserve-mib") opt.vram_reserve_mib = std::stoll(next());
         else if (a == "--routing-stats") opt.routing_stats = next();
         else if (a == "--no-graphs") opt.cuda_graphs = false;
+        else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -164,8 +176,8 @@ int main(int argc, char ** argv) {
     std::vector<float> logits = engine.forward(prompt);
     const double t_prefill = seconds_since(t0);
     engine.set_activation_hook(nullptr);
-    std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s\n", prompt.size(), t_prefill, double(prompt.size()) / t_prefill,
-                capture ? " with intermediates captured" : "");
+    std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s; %lld cached experts swapped for this prompt\n", prompt.size(), t_prefill,
+                double(prompt.size()) / t_prefill, capture ? " with intermediates captured" : "", (long long) engine.stats().cache_swaps);
 
     if (!dump_dir.empty()) {
         fs::create_directories(dump_dir);
@@ -247,6 +259,7 @@ int main(int argc, char ** argv) {
     std::vector<std::int32_t> generated;
     std::vector<std::vector<Top>> tops;
     std::vector<double> step_times;
+    const EngineStats after_prompt = engine.stats();
     const std::size_t V = std::size_t(engine.n_vocab());
     for (int step = 0; step < n_gen; ++step) {
         std::vector<Top> top = top_k(logits.data(), V, 5);
@@ -267,9 +280,11 @@ int main(int argc, char ** argv) {
     if (!step_times.empty()) {
         const double total = std::accumulate(step_times.begin(), step_times.end(), 0.0);
         const EngineStats & st = engine.stats();
+        const double cpu_ms = st.cpu_experts_ms - after_prompt.cpu_experts_ms, eng_ms = st.step_ms - after_prompt.step_ms;
+        const std::int64_t hits = st.expert_hits - after_prompt.expert_hits, pairs = st.expert_pairs - after_prompt.expert_pairs;
         std::printf("decode: %zu tokens, %.2f ms/token (%.2f tok/s); CPU experts %.1f%% of engine time; VRAM expert hits %.1f%%\n",
-                    step_times.size(), 1e3 * total / double(step_times.size()), double(step_times.size()) / total,
-                    100.0 * st.cpu_experts_ms / st.step_ms, 100.0 * double(st.expert_hits) / double(std::max<std::int64_t>(1, st.expert_pairs)));
+                    step_times.size(), 1e3 * total / double(step_times.size()), double(step_times.size()) / total, 100.0 * cpu_ms / eng_ms,
+                    100.0 * double(hits) / double(std::max<std::int64_t>(1, pairs)));
     }
     if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
 

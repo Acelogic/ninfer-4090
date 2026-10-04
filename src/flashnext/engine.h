@@ -2,8 +2,8 @@
 //
 // The dense part of every layer (hyper-connections, Gated DeltaNet or attention, router, shared
 // expert) and the output head run on the GPU with FP32 activations; the routed experts run on the
-// CPU (CpuExperts). Up to four tokens are processed per step, which serves decoding and MTP
-// verification; longer inputs are fed four tokens at a time.
+// CPU (CpuExperts). Steps of up to four tokens (decoding, MTP verification) run as one CUDA graph
+// each; longer inputs are processed in batched chunks with FP32 GEMMs.
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -22,6 +22,7 @@ struct EngineOptions {
     std::int64_t vram_reserve_mib = 1536; // left free for the desktop and other programs
     std::string routing_stats;            // per-layer expert counts that choose the cached experts ("" = none)
     bool cuda_graphs = true;              // replay each step as one CUDA graph (off: launch kernels one by one)
+    int prefill_chunk = 512;              // prompt tokens per batched pass (above 4 tokens)
 };
 
 // Named intermediate activations, row-major [n_tokens][width], with the same names and layout as
@@ -36,6 +37,7 @@ struct EngineStats {
     std::int64_t expert_pairs = 0, expert_hits = 0;  // selected experts, and those computed from the VRAM cache
     std::int64_t cached_experts = 0;
     double cache_gib = 0;
+    std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed
 };
 
 class Engine {

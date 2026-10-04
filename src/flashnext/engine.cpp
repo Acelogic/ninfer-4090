@@ -14,6 +14,7 @@
 
 #include "flashnext/cpu_experts.h"
 #include "flashnext/cuda/experts.h"
+#include "flashnext/cuda/gemm.h"
 #include "flashnext/cuda/gemv.h"
 #include "flashnext/cuda/ops.h"
 #include "flashnext/quants.h"
@@ -94,9 +95,13 @@ struct Engine::Impl {
     fc::DeviceBuffer res, x, xn, lo, gate, mixed, inject, qkv, z, beta, alpha, conv, dn_out, out, qfull, q, qgate, k, v, att, kraw,
         rlogits, ids, wts, sh_g, sh_u, sh_h, sd, sg, moe, ple_emb, ple_key_out, ple_val_out, ple_gated, ple_norm, ple_gates, logits,
         attn_work;
-    Pinned<float> h_x{fc::kMaxTokens * fc::kEmbd}, h_ple{fc::kMaxTokens * fc::kEmbd}, h_mixed{fc::kMaxTokens * fc::kEmbd},
-        h_moe{fc::kMaxTokens * fc::kEmbd}, h_w{fc::kMaxTokens * fc::kUsed};
-    Pinned<std::int32_t> h_ids{fc::kMaxTokens * fc::kUsed};
+    int cap = fc::kMaxTokens;  // tokens per pass: max(kMaxTokens, prefill_chunk)
+    std::unique_ptr<Pinned<float>> h_x, h_ple, h_mixed, h_moe, h_w;
+    std::unique_ptr<Pinned<std::int32_t>> h_ids;
+    std::unique_ptr<Pinned<std::uint8_t>> h_oncpu;
+    std::unique_ptr<Pinned<std::int64_t>> h_pos;  // prefill: the position of every 4-query group
+    fc::DeviceBuffer d_pos;
+    std::unique_ptr<fc::Gemm> gemm;
 
     std::vector<std::int32_t> history;
     std::int64_t n_past = 0;
@@ -109,8 +114,15 @@ struct Engine::Impl {
     };
     std::vector<LayerCache> cache;
     std::vector<std::int64_t> counts;  // routing counts [layer][expert]
+    // Routing of recent tokens, decayed with a half-life of kRecentHalfLife tokens: a prompt predicts
+    // the experts its continuation will use far better than counts gathered on other text.
+    static constexpr double kRecentHalfLife = 2048;
+    std::vector<double> recent;        // [layer][expert], in units of recent_unit
+    double recent_unit = 1.0;          // weight of an observation made now
+    std::int64_t tokens_since_adapt = 0;
+    std::unique_ptr<Pinned<std::uint8_t>> swap_staging;
+    static constexpr int kSwapBatch = 64;
     fc::DeviceBuffer slots, eh, ypairs;
-    Pinned<std::uint8_t> h_oncpu{fc::kMaxTokens * fc::kUsed};
 
     // step state read by the kernels: {pos0, seq}, uploaded at the start of every step
     fc::DeviceBuffer d_step, d_error;
@@ -132,6 +144,7 @@ struct Engine::Impl {
         allocate();
         experts = std::make_unique<CpuExperts>(model, CpuExpertsConfig{opt.cpu_threads, {}});
         counts.assign(std::size_t(cfg.n_layer) * fc::kExperts, 0);
+        recent.assign(counts.size(), 0.0);
         if (!opt.routing_stats.empty()) load_routing(opt.routing_stats);
         fill_cache();
         reset();
@@ -163,6 +176,94 @@ struct Engine::Impl {
         f.write(reinterpret_cast<const char *>(&ne), 4);
         f.write(reinterpret_cast<const char *>(counts.data()), std::streamsize(counts.size() * sizeof(std::int64_t)));
         if (!f) throw std::runtime_error("engine: could not write " + path);
+    }
+
+    void observe(int il, int e) {
+        const std::size_t i = std::size_t(il) * fc::kExperts + std::size_t(e);
+        ++counts[i];
+        recent[i] += recent_unit;
+    }
+
+    void decay(int T) {
+        recent_unit *= std::exp2(double(T) / kRecentHalfLife);
+        if (recent_unit > 1e100) {
+            for (double & r : recent) r /= recent_unit;
+            recent_unit = 1.0;
+        }
+    }
+
+    // Replaces cached experts that recent routing values less than an uncached one (with some
+    // hysteresis), at most max_swaps of them. Runs between steps, so no kernel reads the pools.
+    void adapt_cache(int max_swaps) {
+        struct Swap {
+            int il, in, out, slot;
+        };
+        std::vector<Swap> swaps;
+        for (int il = 0; il < cfg.n_layer && int(swaps.size()) < max_swaps; ++il) {
+            LayerCache & C = cache[std::size_t(il)];
+            const std::size_t base = std::size_t(il) * fc::kExperts;
+            double rmass = 0, cmass = 0;
+            for (int e = 0; e < fc::kExperts; ++e) {
+                rmass += recent[base + std::size_t(e)];
+                cmass += double(counts[base + std::size_t(e)]);
+            }
+            if (rmass <= 0) continue;
+            // recent routing, plus the long-run counts at half weight
+            auto score = [&](int e) {
+                return recent[base + std::size_t(e)] / rmass + 0.5 * double(counts[base + std::size_t(e)]) / std::max(cmass, 1.0);
+            };
+            std::vector<int> in, out;
+            for (int e = 0; e < fc::kExperts; ++e) (C.map[std::size_t(e)] >= 0 ? out : in).push_back(e);
+            if (out.empty()) continue;
+            std::sort(in.begin(), in.end(), [&](int a, int b) { return score(a) > score(b); });
+            std::sort(out.begin(), out.end(), [&](int a, int b) { return score(a) < score(b); });
+            for (std::size_t i = 0; i < in.size() && i < out.size() && int(swaps.size()) < max_swaps; ++i) {
+                if (score(in[i]) <= 1.25 * score(out[i]) + 1e-6) break;
+                swaps.push_back({il, in[i], out[i], C.map[std::size_t(out[i])]});
+            }
+        }
+        if (swaps.empty()) return;
+        check(cudaStreamSynchronize(stream), "adapt");
+        std::size_t slot_max = 0;
+        for (const LayerCache & C : cache) slot_max = std::max(slot_max, C.lay.slot_bytes);
+        if (!swap_staging) swap_staging = std::make_unique<Pinned<std::uint8_t>>(slot_max * kSwapBatch);
+        for (std::size_t b0 = 0; b0 < swaps.size(); b0 += kSwapBatch) {
+            const std::size_t n = std::min<std::size_t>(kSwapBatch, swaps.size() - b0);
+            std::vector<std::thread> workers;
+            const std::size_t nt = std::min<std::size_t>(16, n);
+            for (std::size_t t = 0; t < nt; ++t)
+                workers.emplace_back([&, t] {
+                    for (std::size_t j = t; j < n; j += nt) {
+                        const Swap & sw = swaps[b0 + j];
+                        const std::string b = "blk." + std::to_string(sw.il) + ".";
+                        fc::pack_expert(cache[std::size_t(sw.il)].lay, model.tensor(b + "ffn_gate_exps.weight"),
+                                        model.tensor(b + "ffn_up_exps.weight"), model.tensor(b + "ffn_down_exps.weight"), sw.in,
+                                        swap_staging->get() + j * slot_max);
+                    }
+                });
+            for (auto & w : workers) w.join();
+            for (std::size_t j = 0; j < n; ++j) {
+                const Swap & sw = swaps[b0 + j];
+                LayerCache & C = cache[std::size_t(sw.il)];
+                check(cudaMemcpyAsync(C.pool.as<std::uint8_t>() + std::size_t(sw.slot) * C.lay.slot_bytes, swap_staging->get() + j * slot_max,
+                                      C.lay.slot_bytes, cudaMemcpyHostToDevice, stream),
+                      "expert swap");
+            }
+            check(cudaStreamSynchronize(stream), "expert swap");
+        }
+        std::vector<bool> touched(std::size_t(cfg.n_layer), false);
+        for (const Swap & sw : swaps) {
+            LayerCache & C = cache[std::size_t(sw.il)];
+            C.map[std::size_t(sw.out)] = -1;
+            C.map[std::size_t(sw.in)] = sw.slot;
+            touched[std::size_t(sw.il)] = true;
+        }
+        for (int il = 0; il < cfg.n_layer; ++il)
+            if (touched[std::size_t(il)]) {
+                LayerCache & C = cache[std::size_t(il)];
+                check(cudaMemcpy(C.dmap.get(), C.map.data(), C.dmap.bytes(), cudaMemcpyHostToDevice), "expert map");
+            }
+        stats.cache_swaps += std::int64_t(swaps.size());
     }
 
     // Fills the free VRAM with the experts of highest routing count per byte.
@@ -248,6 +349,7 @@ struct Engine::Impl {
                                       cfg.ple_conv_kernel == fc::kPleKernel && cfg.ple_ngram == fc::kPleDilation),
                 "PLE");
         if (opt.max_ctx < 1 || opt.max_ctx > (std::int64_t(1) << 20)) throw std::runtime_error("engine: max_ctx out of range");
+        if (opt.prefill_chunk < 1 || opt.prefill_chunk > 8192) throw std::runtime_error("engine: prefill_chunk out of range");
     }
 
     fc::DeviceWeight W(const std::string & name, int k, int n) const {
@@ -329,7 +431,19 @@ struct Engine::Impl {
     }
 
     void allocate() {
-        const std::size_t T = fc::kMaxTokens, f = sizeof(float);
+        cap = std::max(fc::kMaxTokens, opt.prefill_chunk);
+        const std::size_t T = std::size_t(cap), f = sizeof(float);
+        h_x = std::make_unique<Pinned<float>>(T * fc::kEmbd);
+        h_ple = std::make_unique<Pinned<float>>(T * fc::kEmbd);
+        h_mixed = std::make_unique<Pinned<float>>(T * fc::kEmbd);
+        h_moe = std::make_unique<Pinned<float>>(T * fc::kEmbd);
+        h_w = std::make_unique<Pinned<float>>(T * fc::kUsed);
+        h_ids = std::make_unique<Pinned<std::int32_t>>(T * fc::kUsed);
+        h_oncpu = std::make_unique<Pinned<std::uint8_t>>(T * fc::kUsed);
+        h_pos = std::make_unique<Pinned<std::int64_t>>(T / 4 + 1);
+        d_pos = fc::DeviceBuffer((T / 4 + 1) * sizeof(std::int64_t));
+        // the largest dense matrix multiplied in batches: the attention query projection
+        gemm = std::make_unique<fc::Gemm>(std::size_t(2) * fc::kHeads * fc::kHeadDim * fc::kEmbd, stream);
         auto buf = [&](std::size_t floats) { return fc::DeviceBuffer(T * floats * f); };
         res = buf(fc::kHcd);
         x = buf(fc::kEmbd);
@@ -367,12 +481,12 @@ struct Engine::Impl {
         ple_gated = buf(fc::kHcd);
         ple_norm = buf(fc::kHcd);
         ple_gates = buf(fc::kHc);
-        logits = buf(std::size_t(cfg.n_vocab));
+        logits = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * cfg.n_vocab * f);
         attn_work = fc::DeviceBuffer(fc::attn_work_floats(fc::kMaxTokens) * f);
         slots = fc::DeviceBuffer(T * fc::kUsed * sizeof(std::int32_t));
         d_step = zeros(2 * sizeof(std::int64_t));
         d_error = zeros(sizeof(int));
-        h_logits = std::make_unique<Pinned<float>>(T * std::size_t(cfg.n_vocab));
+        h_logits = std::make_unique<Pinned<float>>(std::size_t(fc::kMaxTokens) * cfg.n_vocab);
         const std::size_t link_bytes = std::size_t(cfg.n_layer) * sizeof(fc::ExpertLink);
         check(cudaHostAlloc(reinterpret_cast<void **>(&link_h), link_bytes, cudaHostAllocMapped | cudaHostAllocPortable), "expert link");
         std::memset(link_h, 0, link_bytes);
@@ -407,15 +521,21 @@ struct Engine::Impl {
         fc::gemv(w.view, in.as<float>() + in_off, o.as<float>(), T, stream);
     }
 
+    // a dense layer over T tokens: matrix-vector kernels for decode steps, FP32 GEMM for prompts
+    void linear(const fc::DeviceWeight & w, const fc::DeviceBuffer & in, fc::DeviceBuffer & o, int T) {
+        if (T <= fc::kMaxTokens) fc::gemv(w.view, in.as<float>(), o.as<float>(), T, stream);
+        else gemm->run(w.view, in.as<float>(), o.as<float>(), T);
+    }
+
     // hyper-connection mixer over T tokens of res starting at token t0
     void hc_mix(const fc::DeviceBuffer & norm, const fc::DeviceWeight & down, const fc::DeviceWeight & up, const fc::DeviceWeight * inj,
                 int T, int t0 = 0) {
         fc::hc_norm(res.as<float>() + std::size_t(t0) * fc::kHcd, norm.as<float>(), xn.as<float>(), T, cfg.rms_eps, stream);
-        gemv(down, xn, lo, T);
+        linear(down, xn, lo, T);
         fc::hc_lowrank_act(lo.as<float>(), T * fc::kHcRank, stream);
-        gemv(up, lo, gate, T);
+        linear(up, lo, gate, T);
         fc::hc_gate_mean(xn.as<float>(), gate.as<float>(), mixed.as<float>(), T, stream);
-        if (inj) gemv(*inj, xn, inject, T);
+        if (inj) linear(*inj, xn, inject, T);
     }
 
     void ple_rows(std::int64_t pos, std::int32_t * idx) const {
@@ -449,16 +569,16 @@ struct Engine::Impl {
             for (int h = 0; h < fc::kPleHeads; ++h) {
                 if (rows[h] < 0 || rows[h] >= n_rows) throw std::runtime_error("engine: PLE row out of range");
                 dequantize_row(ple_table->type, ple_table->data + std::size_t(rows[h]) * rb,
-                               h_ple.get() + std::size_t(t) * fc::kEmbd + h * fc::kPleHeadDim, fc::kPleHeadDim);
+                               h_ple->get() + std::size_t(t) * fc::kEmbd + h * fc::kPleHeadDim, fc::kPleHeadDim);
             }
         }
     }
 
     void run_ple(const Layer & L, int il, int T) {
-        check(cudaMemcpyAsync(ple_emb.get(), h_ple.get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "ple");
+        check(cudaMemcpyAsync(ple_emb.get(), h_ple->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "ple");
         emit("ple_embd", il, ple_emb.get(), n_past, T, fc::kEmbd);
-        gemv(L.ple_key, ple_emb, ple_key_out, T);
-        gemv(L.ple_value, ple_emb, ple_val_out, T);
+        linear(L.ple_key, ple_emb, ple_key_out, T);
+        linear(L.ple_value, ple_emb, ple_val_out, T);
         fc::ple_gate(ple_key_out.as<float>(), ple_val_out.as<float>(), res.as<float>(), L.ple_nk.as<float>(), L.ple_nq.as<float>(),
                      L.ple_nc.as<float>(), ple_gated.as<float>(), ple_norm.as<float>(), ple_gates.as<float>(), T, cfg.rms_eps, stream);
         emit("ple_gate", il, ple_gates.get(), n_past, T, fc::kHc);
@@ -467,35 +587,45 @@ struct Engine::Impl {
     }
 
     void deltanet(Layer & L, int il, int T) {
-        gemv(L.wqkv, mixed, qkv, T);
-        gemv(L.wgate, mixed, z, T);
-        gemv(L.ssm_beta, mixed, beta, T);
-        gemv(L.ssm_alpha, mixed, alpha, T);
+        linear(L.wqkv, mixed, qkv, T);
+        linear(L.wgate, mixed, z, T);
+        linear(L.ssm_beta, mixed, beta, T);
+        linear(L.ssm_alpha, mixed, alpha, T);
         emit("linear_attn_qkv_mixed", il, qkv.get(), n_past, T, fc::kDnConvDim);
         emit("z", il, z.get(), n_past, T, fc::kDnVDim);
         fc::dn_conv(qkv.as<float>(), L.conv_state.as<float>(), L.conv1d.as<float>(), conv.as<float>(), T, cfg.rms_eps, stream);
         fc::dn_recurrence(conv.as<float>(), z.as<float>(), beta.as<float>(), alpha.as<float>(), L.dt.as<float>(), L.a.as<float>(),
                           L.ssm_norm.as<float>(), L.S.as<float>(), dn_out.as<float>(), T, cfg.rms_eps, stream);
         emit("final_output", il, dn_out.get(), n_past, T, fc::kDnVDim);
-        gemv(L.ssm_out, dn_out, out, T);
+        linear(L.ssm_out, dn_out, out, T);
     }
 
     void attention(Layer & L, int il, int T) {
-        gemv(L.wq, mixed, qfull, T);
-        gemv(L.wk, mixed, k, T);
-        gemv(L.wv, mixed, v, T);
+        linear(L.wq, mixed, qfull, T);
+        linear(L.wk, mixed, k, T);
+        linear(L.wv, mixed, v, T);
         emit("Qcur_full", il, qfull.get(), n_past, T, 2 * fc::kHeads * fc::kHeadDim);
         fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
                       q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), d_step.as<std::int64_t>(), T,
                       cfg.rms_eps, stream);
         emit("Qcur", il, q.get(), n_past, T, fc::kHeads * fc::kHeadDim);
-        gemv(L.idx_k, mixed, kraw, T);
+        linear(L.idx_k, mixed, kraw, T);
         emit("indexer_k_raw", il, kraw.get(), n_past, T, fc::kIdxDim);
         fc::store_rows(kraw.as<float>(), L.idx_raw.as<float>(), d_step.as<std::int64_t>(), fc::kIdxDim, T, stream);
-        fc::attn_decode(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), d_step.as<std::int64_t>(), T,
-                        cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
+        if (T <= fc::kMaxTokens) {
+            fc::attn_decode(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), d_step.as<std::int64_t>(), T,
+                            cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
+        } else {
+            // the whole chunk's keys are in the cache; each group of 4 queries masks the later ones
+            const std::size_t hw = std::size_t(fc::kHeads) * fc::kHeadDim;
+            for (int t0 = 0, g = 0; t0 < T; t0 += fc::kMaxTokens, ++g) {
+                const int n = std::min(fc::kMaxTokens, T - t0);
+                fc::attn_decode(q.as<float>() + t0 * hw, qgate.as<float>() + t0 * hw, L.k_cache.as<half>(), L.v_cache.as<half>(),
+                                d_pos.as<std::int64_t>() + g, n, cfg.kq_scale, attn_work.as<float>(), att.as<float>() + t0 * hw, stream);
+            }
+        }
         emit("attn_gated", il, att.get(), n_past, T, fc::kHeads * fc::kHeadDim);
-        gemv(L.wo, att, out, T);
+        linear(L.wo, att, out, T);
     }
 
     // CUDA-graph mode: the CPU's share of the experts comes through the mapped ExpertLink of the layer
@@ -537,15 +667,15 @@ struct Engine::Impl {
                 for (std::size_t i = 0; i < ke; ++i) {
                     const std::int32_t e = Lk.ids[i];
                     if (e < 0 || e >= fc::kExperts) throw std::runtime_error("engine: router returned an invalid expert");
-                    ++counts[std::size_t(il) * fc::kExperts + std::size_t(e)];
-                    h_oncpu.get()[i] = C.map[std::size_t(e)] < 0;
-                    misses += h_oncpu.get()[i];
+                    observe(il, e);
+                    h_oncpu->get()[i] = C.map[std::size_t(e)] < 0;
+                    misses += h_oncpu->get()[i];
                 }
                 stats.expert_pairs += std::int64_t(ke);
                 stats.expert_hits += std::int64_t(ke - misses);
                 if (misses) {
                     const auto c0 = clk::now();
-                    experts->run(il, T, Lk.x, Lk.ids, Lk.weights, h_oncpu.get(), Lk.out);
+                    experts->run(il, T, Lk.x, Lk.ids, Lk.weights, h_oncpu->get(), Lk.out);
                     stats.cpu_experts_ms += std::chrono::duration<double, std::milli>(clk::now() - c0).count();
                 } else {
                     std::memset(Lk.out, 0, std::size_t(T) * fc::kEmbd * sizeof(float));
@@ -564,12 +694,12 @@ struct Engine::Impl {
     void ffn(Layer & L, int il, int T) {
         if (graph_mode) return ffn_graph(L, il, T);
         const std::size_t xe = std::size_t(T) * fc::kEmbd * sizeof(float), ke = std::size_t(T) * fc::kUsed;
-        gemv(L.router, mixed, rlogits, T);
+        linear(L.router, mixed, rlogits, T);
         emit("ffn_moe_logits", il, rlogits.get(), n_past, T, fc::kExperts);
         fc::router_topk(rlogits.as<float>(), ids.as<std::int32_t>(), wts.as<float>(), T, stream);
-        check(cudaMemcpyAsync(h_ids.get(), ids.get(), ke * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream), "ids");
-        check(cudaMemcpyAsync(h_w.get(), wts.get(), ke * sizeof(float), cudaMemcpyDeviceToHost, stream), "weights");
-        check(cudaMemcpyAsync(h_mixed.get(), mixed.get(), xe, cudaMemcpyDeviceToHost, stream), "ffn input");
+        check(cudaMemcpyAsync(h_ids->get(), ids.get(), ke * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream), "ids");
+        check(cudaMemcpyAsync(h_w->get(), wts.get(), ke * sizeof(float), cudaMemcpyDeviceToHost, stream), "weights");
+        check(cudaMemcpyAsync(h_mixed->get(), mixed.get(), xe, cudaMemcpyDeviceToHost, stream), "ffn input");
         check(cudaEventRecord(ev_router, stream), "event");
         // while the CPU computes the experts that are not cached, the GPU computes the cached ones
         // and the shared expert
@@ -577,33 +707,37 @@ struct Engine::Impl {
         fc::moe_slots(ids.as<std::int32_t>(), C.dmap.as<std::int32_t>(), slots.as<std::int32_t>(), T, stream);
         fc::experts_gpu(C.lay, C.pool.as<std::uint8_t>(), slots.as<std::int32_t>(), wts.as<float>(), mixed.as<float>(), eh.as<float>(),
                         ypairs.as<float>(), T, stream);
-        gemv(L.sh_gate, mixed, sh_g, T);
-        gemv(L.sh_up, mixed, sh_u, T);
+        linear(L.sh_gate, mixed, sh_g, T);
+        linear(L.sh_up, mixed, sh_u, T);
         fc::swiglu(sh_g.as<float>(), sh_u.as<float>(), sh_h.as<float>(), T * fc::kFfShared, stream);
-        gemv(L.sh_down, sh_h, sd, T);
-        gemv(L.sh_gate_inp, mixed, sg, T);
+        linear(L.sh_down, sh_h, sd, T);
+        linear(L.sh_gate_inp, mixed, sg, T);
         check(cudaEventSynchronize(ev_router), "router");
         if (hook) {
             std::vector<float> fid(ke);
-            for (std::size_t i = 0; i < ke; ++i) fid[i] = float(h_ids.get()[i]);
+            for (std::size_t i = 0; i < ke; ++i) fid[i] = float(h_ids->get()[i]);
             hook("ffn_moe_topk", il, n_past, T, fc::kUsed, fid.data());
-            hook("ffn_moe_weights", il, n_past, T, fc::kUsed, h_w.get());
+            hook("ffn_moe_weights", il, n_past, T, fc::kUsed, h_w->get());
         }
         std::size_t misses = 0;
         for (std::size_t i = 0; i < ke; ++i) {
-            const std::int32_t e = h_ids.get()[i];
+            const std::int32_t e = h_ids->get()[i];
             if (e < 0 || e >= fc::kExperts) throw std::runtime_error("engine: router returned an invalid expert");
-            ++counts[std::size_t(il) * fc::kExperts + std::size_t(e)];
-            h_oncpu.get()[i] = C.map[std::size_t(e)] < 0;
-            misses += h_oncpu.get()[i];
+            observe(il, e);
+            h_oncpu->get()[i] = C.map[std::size_t(e)] < 0;
+            misses += h_oncpu->get()[i];
         }
         stats.expert_pairs += std::int64_t(ke);
         stats.expert_hits += std::int64_t(ke - misses);
         if (misses) {
             const auto c0 = clk::now();
-            experts->run(il, T, h_mixed.get(), h_ids.get(), h_w.get(), h_oncpu.get(), h_moe.get());
+            for (int t0 = 0; t0 < T; t0 += CpuExperts::kMaxTokens) {
+                const int n = std::min(CpuExperts::kMaxTokens, T - t0);
+                const std::size_t xo = std::size_t(t0) * fc::kEmbd, ko = std::size_t(t0) * fc::kUsed;
+                experts->run(il, n, h_mixed->get() + xo, h_ids->get() + ko, h_w->get() + ko, h_oncpu->get() + ko, h_moe->get() + xo);
+            }
             stats.cpu_experts_ms += std::chrono::duration<double, std::milli>(clk::now() - c0).count();
-            check(cudaMemcpyAsync(moe.get(), h_moe.get(), xe, cudaMemcpyHostToDevice, stream), "moe");
+            check(cudaMemcpyAsync(moe.get(), h_moe->get(), xe, cudaMemcpyHostToDevice, stream), "moe");
         } else {
             check(cudaMemsetAsync(moe.get(), 0, xe, stream), "moe");
         }
@@ -622,17 +756,22 @@ struct Engine::Impl {
         for (int t = 0; t < T; ++t) history.push_back(tokens[t]);
         const std::size_t rb = row_bytes(tok_embd->type, fc::kEmbd);
         for (int t = 0; t < T; ++t)
-            dequantize_row(tok_embd->type, tok_embd->data + std::size_t(tokens[t]) * rb, h_x.get() + std::size_t(t) * fc::kEmbd, fc::kEmbd);
+            dequantize_row(tok_embd->type, tok_embd->data + std::size_t(tokens[t]) * rb, h_x->get() + std::size_t(t) * fc::kEmbd, fc::kEmbd);
         if (ple_table) ple_host(T);
         h_step.get()[0] = pos0;
         h_step.get()[1] = ++seq;
+        for (int g = 0; g * fc::kMaxTokens < T; ++g) h_pos->get()[g] = pos0 + std::int64_t(g) * fc::kMaxTokens;
     }
 
     // Every GPU operation of a step, in order; host-free in graph mode, so it can be captured.
-    void enqueue(int T) {
+    // head_rows: how many of the last tokens get logits (at most kMaxTokens)
+    void enqueue(int T, int head_rows) {
         const std::int64_t pos0 = n_past;
         check(cudaMemcpyAsync(d_step.get(), h_step.get(), 2 * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "step");
-        check(cudaMemcpyAsync(x.get(), h_x.get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "embed");
+        if (T > fc::kMaxTokens)
+            check(cudaMemcpyAsync(d_pos.get(), h_pos->get(), std::size_t((T + 3) / 4) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream),
+                  "positions");
+        check(cudaMemcpyAsync(x.get(), h_x->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "embed");
         emit("model.input_embed", -1, x.get(), pos0, T, fc::kEmbd);
         fc::hc_expand(x.as<float>(), res.as<float>(), T, stream);
 
@@ -654,10 +793,11 @@ struct Engine::Impl {
             emit("l_out", il, res.get(), pos0, T, fc::kHcd);
         }
 
-        // the head for every token of the step (MTP verification reads them all)
-        hc_mix(out_hc_norm, out_hc_down, out_hc_up, nullptr, T);
-        gemv(output, mixed, logits, T);
-        check(cudaMemcpyAsync(h_logits->get(), logits.get(), std::size_t(T) * cfg.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, stream),
+        // the head for the last head_rows tokens (all of a graph step: MTP verification reads them all)
+        hc_mix(out_hc_norm, out_hc_down, out_hc_up, nullptr, head_rows, T - head_rows);
+        gemv(output, mixed, logits, head_rows);
+        check(cudaMemcpyAsync(h_logits->get(), logits.get(), std::size_t(head_rows) * cfg.n_vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                              stream),
               "logits");
     }
 
@@ -667,7 +807,7 @@ struct Engine::Impl {
         cudaGraph_t g = nullptr;
         check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
         try {
-            enqueue(T);
+            enqueue(T, T);
         } catch (...) {
             cudaStreamEndCapture(stream, &g);
             if (g) cudaGraphDestroy(g);
@@ -682,11 +822,15 @@ struct Engine::Impl {
         return graphs[T];
     }
 
-    // T tokens (1..kMaxTokens); returns logits of the last token or of all T
+    // T tokens (1..cap; all_logits only up to kMaxTokens); returns logits of the last token or of all T
     std::vector<float> step(const std::int32_t * tokens, int T, bool all_logits) {
         const std::int64_t pos0 = n_past;
+        if (T < 1 || T > cap || (all_logits && T > fc::kMaxTokens)) throw std::runtime_error("engine: bad step size");
         prepare(tokens, T);
-        if (opt.cuda_graphs && !hook) {
+        decay(T);
+        int head_rows = all_logits ? T : 1;
+        if (opt.cuda_graphs && !hook && T <= fc::kMaxTokens) {
+            head_rows = T;
             cudaGraphExec_t g = graph_for(T);
             check(cudaGraphLaunch(g, stream), "graph launch");
             cudaStreamQuery(stream);  // submit now (Windows batches work otherwise)
@@ -696,14 +840,14 @@ struct Engine::Impl {
             check(cudaMemcpy(&err, d_error.get(), sizeof(int), cudaMemcpyDeviceToHost), "error flag");
             if (err) throw std::runtime_error("engine: the GPU timed out waiting for the CPU experts");
         } else {
-            enqueue(T);
+            enqueue(T, head_rows);
             check(cudaStreamSynchronize(stream), "step");
         }
-        const int t_first = all_logits ? 0 : T - 1, n_out = T - t_first;
-        const float * src = h_logits->get() + std::size_t(t_first) * cfg.n_vocab;
+        const int n_out = all_logits ? T : 1, t_first = T - n_out, skip = head_rows - n_out;
+        const float * src = h_logits->get() + std::size_t(skip) * cfg.n_vocab;
         std::vector<float> lg(src, src + std::size_t(n_out) * cfg.n_vocab);
         if (hook) {
-            emit("result_norm", -1, mixed.as<float>() + std::size_t(t_first) * fc::kEmbd, pos0 + t_first, n_out, fc::kEmbd);
+            emit("result_norm", -1, mixed.as<float>() + std::size_t(skip) * fc::kEmbd, pos0 + t_first, n_out, fc::kEmbd);
             hook("result_output", -1, pos0 + t_first, n_out, cfg.n_vocab, lg.data());
         }
         n_past += T;
@@ -719,14 +863,25 @@ std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, boo
     const auto t0 = clk::now();
     std::vector<float> all, last;
     const std::size_t n = tokens.size();
-    for (std::size_t i = 0; i < n; i += cuda::kMaxTokens) {
-        const int T = int(std::min<std::size_t>(cuda::kMaxTokens, n - i));
+    const std::size_t chunk = all_logits ? cuda::kMaxTokens : std::size_t(impl_->cap);
+    for (std::size_t i = 0; i < n; i += chunk) {
+        const int T = int(std::min(chunk, n - i));
         std::vector<float> lg = impl_->step(tokens.data() + i, T, all_logits);
         if (all_logits) all.insert(all.end(), lg.begin(), lg.end());
         else if (i + T == n) last = std::move(lg);
         ++impl_->stats.steps;
     }
     impl_->stats.tokens += std::int64_t(n);
+    // re-rank the cached experts after a prompt (its routing predicts the continuation) and from
+    // time to time while decoding
+    impl_->tokens_since_adapt += std::int64_t(n);
+    if (n >= 32) {
+        impl_->adapt_cache(1 << 30);
+        impl_->tokens_since_adapt = 0;
+    } else if (impl_->tokens_since_adapt >= 256) {
+        impl_->adapt_cache(128);
+        impl_->tokens_since_adapt = 0;
+    }
     impl_->stats.step_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
     return all_logits ? all : last;
 }
