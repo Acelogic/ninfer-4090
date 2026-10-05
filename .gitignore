@@ -70,3 +70,7 @@ dist/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# This PC's runtime install and local work areas (windows/Build-NInfer.ps1)
+/app/
+/work/

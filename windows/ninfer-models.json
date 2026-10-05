@@ -119,18 +119,32 @@
         "--vision"
       ]
     },
-    "flash-next": {
-      "label": "Qwen3.8 Flash Next (GGUF, MTP up to 3, 262K)",
-      "file": "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+    "qwen3.8-flash-next": {
+      "label": "Qwen3.8 Flash-Next (GGUF UD-IQ4_XS, MTP up to 3, 262K, text)",
+      "file": "qwen3.8-flash-next\\UD-IQ4_XS\\Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
       "args": [
         "--max-context",
         "262144",
         "--flashnext-mtp",
-        "models\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+        "models\\qwen3.8-flash-next\\MTP\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
         "--flashnext-draft",
         "3",
         "--flashnext-routing-stats",
         "flash-next-routing.bin"
+      ]
+    },
+    "qwen3.8-flash-next-huihui": {
+      "label": "Qwen3.8 Flash-Next Huihui abliterated (UD-IQ4_XS recipe, MTP up to 3, 262K, text)",
+      "file": "qwen3.8-flash-next-huihui\\Huihui-Qwen3.8-Flash-Next-abliterated-UD-IQ4_XS.gguf",
+      "args": [
+        "--max-context",
+        "262144",
+        "--flashnext-mtp",
+        "models\\qwen3.8-flash-next\\MTP\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+        "--flashnext-draft",
+        "3",
+        "--flashnext-routing-stats",
+        "flash-next-huihui-routing.bin"
       ]
     }
   },

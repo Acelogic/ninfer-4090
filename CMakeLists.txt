@@ -19,7 +19,7 @@ option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator"
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 option(NINFER_WITH_FLASHNEXT
-  "Serve Qwen3.8-Flash-Next GGUF models (needs an AVX-512 CPU and cuBLAS)" OFF)
+  "Serve Qwen3.8-Flash-Next GGUF models (needs an AVX-512 CPU and cuBLAS)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -114,6 +114,9 @@ include(cmake/NinferTargets.cmake)
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)
+endif()
+if(NINFER_WITH_FLASHNEXT AND NINFER_BUILD_APPS)
+  add_subdirectory(tools/flashnext)
 endif()
 if(BUILD_TESTING)
   enable_testing()
