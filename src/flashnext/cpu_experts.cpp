@@ -26,7 +26,8 @@ namespace ninfer::flashnext {
 namespace {
 
 
-enum class GateUp { Q4L, Q4X };
+// Q8_0: gate/up as in the GGUF (the MTP head's experts); run() only, always with 16-bit activations
+enum class GateUp { Q4L, Q4X, Q8_0 };
 enum class Down { IQ4L, Q8_0 };
 
 struct Buffer {
@@ -497,6 +498,32 @@ void dn_p(const std::uint8_t * row, const HAct16 * const * hs, float * out) {
     for (int t = 0; t < NT; ++t) out[t] = _mm512_reduce_add_ps(acc[t]);
 }
 
+// Gate and up rows in Q8_0 (80 blocks of 32 weights; the MTP head's experts) against NT tokens' 16-bit activations, as
+// dn_p computes a Q8_0 down row: per 64-column chunk, lanes 0-7 sum the first block's products exactly in int32 and
+// lanes 8-15 the second's; each half is scaled by its block's d times the activation scale of its 256-block.
+template <int NT>
+void gu_q8p(const BlockQ8_0 * g, const BlockQ8_0 * u, const XAct16 * const * xs, float * og, float * ou) {
+    __m512 ag[NT], au[NT];
+    for (int t = 0; t < NT; ++t) ag[t] = au[t] = _mm512_setzero_ps();
+    for (int c = 0; c < 40; ++c) {
+        __m512i g0, g1, u0, u1;
+        widen_lanes(load_2x256(reinterpret_cast<const std::uint8_t *>(g[2 * c].qs), reinterpret_cast<const std::uint8_t *>(g[2 * c + 1].qs)), g0, g1);
+        widen_lanes(load_2x256(reinterpret_cast<const std::uint8_t *>(u[2 * c].qs), reinterpret_cast<const std::uint8_t *>(u[2 * c + 1].qs)), u0, u1);
+        const float dg0 = half_to_float(g[2 * c].d), dg1 = half_to_float(g[2 * c + 1].d);
+        const float du0 = half_to_float(u[2 * c].d), du1 = half_to_float(u[2 * c + 1].d);
+        const int b = c / 4;  // the activations' 256-block
+        for (int t = 0; t < NT; ++t) {
+            const __m512i x0 = _mm512_load_si512(xs[t]->q + 64 * c), x1 = _mm512_load_si512(xs[t]->q + 64 * c + 32);
+            const __m512i vg = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_setzero_si512(), g0, x0), g1, x1);
+            const __m512i vu = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_setzero_si512(), u0, x0), u1, x1);
+            const float dx = xs[t]->d[b];
+            ag[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vg), _mm512_insertf32x8(_mm512_set1_ps(dg0 * dx), _mm256_set1_ps(dg1 * dx), 1), ag[t]);
+            au[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vu), _mm512_insertf32x8(_mm512_set1_ps(du0 * dx), _mm256_set1_ps(du1 * dx), 1), au[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) { og[t] = _mm512_reduce_add_ps(ag[t]); ou[t] = _mm512_reduce_add_ps(au[t]); }
+}
+
 }  // namespace
 
 CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
@@ -517,7 +544,18 @@ CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
     if (want.empty())
         for (int i = 0; i < n_layer; ++i) want.push_back(i);
     layers_.resize(std::size_t(n_layer));
-    for (int il : want) {
+    for (int il : want) load_layer(model, il);
+}
+
+void CpuExperts::add_layer(const GgufModel & model, int il) {
+    if (il < 0) throw std::runtime_error("CpuExperts: negative layer");
+    if (std::size_t(il) >= layers_.size()) layers_.resize(std::size_t(il) + 1);
+    if (layers_[std::size_t(il)]) throw std::runtime_error("CpuExperts: layer " + std::to_string(il) + " is loaded already");
+    load_layer(model, il);
+}
+
+void CpuExperts::load_layer(const GgufModel & model, int il) {
+    {
         const std::string p = "blk." + std::to_string(il) + ".";
         const GgufTensor & tg = model.tensor(p + "ffn_gate_exps.weight");
         const GgufTensor & tu = model.tensor(p + "ffn_up_exps.weight");
@@ -536,6 +574,9 @@ CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
         } else if (tg.type == GgufType::IQ4_XS && tu.type == GgufType::IQ4_XS) {
             L->gu = GateUp::Q4X;
             L->gu_row_bytes = 10 * sizeof(BlockQ4X);
+        } else if (tg.type == GgufType::Q8_0 && tu.type == GgufType::Q8_0) {
+            L->gu = GateUp::Q8_0;
+            L->gu_row_bytes = 80 * sizeof(BlockQ8_0);
         } else {
             throw std::runtime_error("layer " + std::to_string(il) + ": gate/up format " + type_name(tg.type) + " is not supported");
         }
@@ -559,7 +600,10 @@ CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
         const int nt = pool_.size();
         pool_.run([&](int t) {
             for (int e = t; e < kExperts; e += nt) {
-                if (Lp->gu == GateUp::Q4L) {
+                if (Lp->gu == GateUp::Q8_0) {
+                    std::memcpy(Lp->gate + e * Lp->stride, tg.data + e * Lp->gu_expert_bytes, Lp->gu_expert_bytes);
+                    std::memcpy(Lp->up + e * Lp->stride, tu.data + e * Lp->gu_expert_bytes, Lp->gu_expert_bytes);
+                } else if (Lp->gu == GateUp::Q4L) {
                     const std::size_t src_bytes = std::size_t(kFF) * 10 * sizeof(BlockIQ3_S);
                     repack_iq3s_to_q4l(reinterpret_cast<const BlockIQ3_S *>(tg.data + e * src_bytes),
                                        reinterpret_cast<BlockQ4L *>(Lp->gate + e * Lp->stride), kFF * 10);
@@ -616,6 +660,7 @@ CpuExperts::HostLayer CpuExperts::host_layer(int layer) const {
 
 const char * CpuExperts::format_name(int layer) const {
     const Layer & L = *layers_.at(std::size_t(layer));
+    if (L.gu == GateUp::Q8_0) return L.dn == Down::IQ4L ? "q8_0/q8_0/iq4l" : "q8_0/q8_0/q8_0";
     if (L.gu == GateUp::Q4L) return L.dn == Down::IQ4L ? "q4l/q4l/iq4l" : "q4l/q4l/q8_0";
     return L.dn == Down::IQ4L ? "q4x/q4x/iq4l" : "q4x/q4x/q8_0";
 }
@@ -658,8 +703,10 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
     std::memset(out, 0, sizeof(float) * std::size_t(n_tokens) * kEmbd);
     if (n_pairs == 0) return;
 
+    // Q8_0 gate/up (the MTP head) has only the 16-bit activation kernels
+    const bool precise = precise_ || L.gu == GateUp::Q8_0;
     for (int t = 0; t < n_tokens; ++t) {
-        if (precise_) quantize_x16_lanes(x + std::size_t(t) * kEmbd, S.x16[t]);
+        if (precise) quantize_x16_lanes(x + std::size_t(t) * kEmbd, S.x16[t]);
         else quantize_x(x + std::size_t(t) * kEmbd, S.x[t]);
     }
 
@@ -681,7 +728,16 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
                     xs[i] = &S.x[pair_token[p0 + i]];
                     xs16[i] = &S.x16[pair_token[p0 + i]];
                 }
-                if (precise_ && L.gu == GateUp::Q4L) {
+                if (L.gu == GateUp::Q8_0) {
+                    const auto * g = reinterpret_cast<const BlockQ8_0 *>(gp);
+                    const auto * uu = reinterpret_cast<const BlockQ8_0 *>(up);
+                    switch (n) {
+                    case 1: gu_q8p<1>(g, uu, xs16, og, ou); break;
+                    case 2: gu_q8p<2>(g, uu, xs16, og, ou); break;
+                    case 3: gu_q8p<3>(g, uu, xs16, og, ou); break;
+                    default: gu_q8p<4>(g, uu, xs16, og, ou); break;
+                    }
+                } else if (precise && L.gu == GateUp::Q4L) {
                     const auto * g = reinterpret_cast<const BlockQ4L *>(gp);
                     const auto * uu = reinterpret_cast<const BlockQ4L *>(up);
                     switch (n) {
@@ -690,7 +746,7 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
                     case 3: gu_p<3, false>(g, uu, xs16, og, ou); break;
                     default: gu_p<4, false>(g, uu, xs16, og, ou); break;
                     }
-                } else if (precise_) {
+                } else if (precise) {
                     const auto * g = reinterpret_cast<const BlockQ4X *>(gp);
                     const auto * uu = reinterpret_cast<const BlockQ4X *>(up);
                     switch (n) {
@@ -728,7 +784,7 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
         alignas(64) float h[kFF];
         for (int p = th; p < n_pairs; p += nt) {
             for (int j = 0; j < kFF; j += 16) _mm512_store_ps(h + j, swiglu16(_mm512_load_ps(S.g[p] + j), _mm512_load_ps(S.u[p] + j)));
-            if (precise_) quantize_h16_lanes(h, S.h16[p]);
+            if (precise) quantize_h16_lanes(h, S.h16[p]);
             else quantize_h(h, S.h[p]);
         }
     });
@@ -749,14 +805,14 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
                         hs[i] = &S.h[p0 + i];
                         hs16[i] = &S.h16[p0 + i];
                     }
-                    if (precise_ && L.dn == Down::IQ4L) {
+                    if (precise && L.dn == Down::IQ4L) {
                         switch (n) {
                         case 1: dn_p<1, false>(row, hs16, d); break;
                         case 2: dn_p<2, false>(row, hs16, d); break;
                         case 3: dn_p<3, false>(row, hs16, d); break;
                         default: dn_p<4, false>(row, hs16, d); break;
                         }
-                    } else if (precise_) {
+                    } else if (precise) {
                         switch (n) {
                         case 1: dn_p<1, true>(row, hs16, d); break;
                         case 2: dn_p<2, true>(row, hs16, d); break;
@@ -1310,6 +1366,8 @@ private:
 
 void CpuExperts::run_batch(int layer, int n_tokens, const float * x, const std::int32_t * ids, const float * weights,
                            const std::uint8_t * on_cpu, float * out) {
+    if (has_layer(layer) && layers_[std::size_t(layer)]->gu == GateUp::Q8_0)
+        throw std::runtime_error("CpuExperts: run_batch does not support Q8_0 gate/up (layer " + std::to_string(layer) + ")");
     if (precise_) run_batch_impl<true>(layer, n_tokens, x, ids, weights, on_cpu, out);
     else run_batch_impl<false>(layer, n_tokens, x, ids, weights, on_cpu, out);
 }
@@ -1639,7 +1697,7 @@ void export_iq4nl_row(const RowIQ4L & s, BlockIQ4_NL * d) {
 CpuExperts::ExportSizes CpuExperts::export_sizes(int layer) const {
     if (!has_layer(layer)) throw std::runtime_error("CpuExperts: layer " + std::to_string(layer) + " is not loaded");
     const Layer & L = *layers_[std::size_t(layer)];
-    return {row_bytes(L.gu == GateUp::Q4L ? GgufType::IQ3_S : GgufType::IQ4_XS, kEmbd) * kFF,
+    return {row_bytes(L.gu == GateUp::Q4L ? GgufType::IQ3_S : L.gu == GateUp::Q4X ? GgufType::IQ4_XS : GgufType::Q8_0, kEmbd) * kFF,
             row_bytes(L.dn == Down::IQ4L ? GgufType::IQ4_NL : GgufType::Q8_0, kFF) * kEmbd};
 }
 
@@ -1651,7 +1709,9 @@ void CpuExperts::export_expert(int layer, int e, std::uint8_t * gate, std::uint8
     std::uint8_t * dst[2] = {gate, up};
     for (int k = 0; k < 2; ++k) {
         if (!dst[k]) continue;
-        if (L.gu == GateUp::Q4L) {
+        if (L.gu == GateUp::Q8_0) {
+            std::memcpy(dst[k], src[k], L.gu_expert_bytes);
+        } else if (L.gu == GateUp::Q4L) {
             const std::int32_t * index = iq3s_grid_index();
             const auto * sb = reinterpret_cast<const BlockQ4L *>(src[k]);
             auto * db = reinterpret_cast<BlockIQ3_S *>(dst[k]);

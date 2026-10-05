@@ -55,6 +55,12 @@ struct EngineOptions {
     bool host_expert_images = false;
     int gpu_miss_permille = 0;            // share of each step's cache misses the GPU reads from host memory
     std::string mtp_path;                 // the MTP head's GGUF (shared-Q8_0 variant) for draft tokens; "" = none
+    // The MTP layer's 512 routed experts (Q8_0, 2.7 GB): false = computed by the CPU (CpuExperts, 16-bit activations, as
+    // the main model's uncached experts) and the VRAM goes to the expert cache; true = all of them in VRAM.
+    bool mtp_experts_vram = false;
+    // Re-rank the expert cache after every decode step from the last steps' routing, swapping experts in the background
+    // (needs the pinned CPU copy, i.e. prefill_lend and prefill_stream). Off: only after prompts and every 256 tokens.
+    bool decode_adapt = true;
     // KV streaming (kv_cache.h): the attention layers' K/V live in pinned host memory and VRAM keeps a page
     // cache of kv_resident cells per layer, so a long window costs little VRAM. -1: on when max_ctx exceeds
     // kv_resident; 0: off (all of it in VRAM); 1: on.
@@ -76,11 +82,20 @@ struct EngineStats {
     std::int64_t steps = 0, tokens = 0;
     double step_ms = 0;         // wall time inside forward()
     double cpu_experts_ms = 0;  // of which the CPU expert calls
+    double gpu_wait_ms = 0;     // decode steps: the CPU waiting for the GPU to reach each layer's experts
+    double mtp_cpu_ms = 0;      // the MTP layer's routed experts on the CPU (drafts)
+    double mtp_wait_ms = 0, mtp_tail_ms = 0, mtp_catchup_ms = 0;  // drafts: waiting for the GPU before and after them; catch-up
+    double mtp_launch_ms = 0;   // drafts: launching the pass's graph
+    double swap_issue_ms = 0;   // queueing the background swaps (host time)
+    double adapt_ms = 0;        // choosing them after each decode step (host time)
     std::int64_t expert_pairs = 0, expert_hits = 0;  // selected experts, and those computed from the VRAM cache
+    std::int64_t cpu_expert_reads = 0;               // decode steps: distinct experts the CPU computed (summed over layers)
+    std::int64_t graph_steps[5] = {};                // decode steps by token count (1..4)
     std::int64_t expert_host_reads = 0;              // misses the GPU computed from pinned host memory
     std::int64_t cached_experts = 0;
     double cache_gib = 0;
     std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed
+    std::int64_t decode_swaps = 0; // of which swapped in the background between decode steps
     std::int64_t invalid_drafts = 0;  // MTP drafts dropped because the head's output was not a valid token
     double cache_swap_ms = 0;      // time spent replacing them
     // prompts
