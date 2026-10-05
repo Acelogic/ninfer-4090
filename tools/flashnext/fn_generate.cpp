@@ -437,12 +437,12 @@ static int run(int argc, char ** argv) {
             auto td = std::chrono::steady_clock::now();
             const std::vector<std::int32_t> d = engine.draft(tok, n_draft);
             draft_s += seconds_since(td);
-            h_drafts = fnv1a(d.data(), d.size() * sizeof(std::int32_t), h_drafts);
+            if (hash) h_drafts = fnv1a(d.data(), d.size() * sizeof(std::int32_t), h_drafts);
             seq.insert(seq.end(), d.begin(), d.end());
             auto tv = std::chrono::steady_clock::now();
             const std::vector<float> lg = engine.forward(seq, true);
             verify_s += seconds_since(tv);
-            h_decode = fnv1a(lg.data(), lg.size() * sizeof(float), h_decode);
+            if (hash) h_decode = fnv1a(lg.data(), lg.size() * sizeof(float), h_decode);  // 3 MB: only when asked (it is timed)
             int keep = 1;
             std::int32_t next = argmax(lg.data(), V);
             for (std::size_t i = 0; i < d.size() && next == d[i]; ++i) {
@@ -489,7 +489,7 @@ static int run(int argc, char ** argv) {
         auto ts = std::chrono::steady_clock::now();
         logits = engine.forward({next});
         step_times.push_back(seconds_since(ts));
-        h_decode = fnv1a(logits.data(), logits.size() * sizeof(float), h_decode);
+        if (hash) h_decode = fnv1a(logits.data(), logits.size() * sizeof(float), h_decode);
     }
     std::printf("generated:");
     for (std::int32_t id : generated) std::printf(" %d", id);

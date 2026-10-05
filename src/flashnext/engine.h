@@ -37,10 +37,11 @@ struct EngineOptions {
     bool prefill_stream = true;
     int prefill_stream_min = 1024;
     // Streamed chunks of at most this many tokens leave the experts predicted to get the fewest tokens to the
-    // CPU (they cost the CPU less RAM time than their copy costs PCIe time), concurrently with the GPU. 0: never.
-    // Those pairs use the CPU's numerics (16-bit activations, 5e-5) and the split depends on the routing seen
-    // so far, so such chunks are not bitwise reproducible across histories; chunks above it are.
-    int prefill_cpu_share_max = 4096;
+    // CPU (they cost the CPU less RAM time than their copy costs PCIe time), concurrently with the GPU. 0: never
+    // (the default: measured, it helped only 2K chunks at a 262K window, +14%, and slowed 3-4K chunks and 64K
+    // windows by 6-11%). Those pairs use the CPU's numerics (16-bit activations, 5e-5) and the split depends on
+    // the routing seen so far, so such chunks are not bitwise reproducible across histories.
+    int prefill_cpu_share_max = 0;
     // Prompt chunks multiply the Q8_0 dense weights on the tensor cores (exact weights, activations as two fp16
     // terms, FP32 accumulation of the main terms) instead of dequantizing them for FP32 cuBLAS SGEMM: 1.6x
     // faster and, measured against double precision on the model's matrices, more accurate (1-4e-7 relative
