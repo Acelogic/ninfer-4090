@@ -151,11 +151,27 @@ Measured and rejected: letting the GPU read a share of each step's cache misses 
 memory. Those reads draw on the same DRAM bandwidth as the CPU experts; a 30% share made decode 2.7x
 slower.
 
+### 4.1 Context window
+
+The window is reserved in VRAM when the engine loads, about 28.7 KB per token (fp16 KV of the 12
+attention layers, QSA block keys and the MTP layer's KV), and that memory comes out of the expert
+cache. Short prompts, idle machine:
+
+| Window | Expert cache (with MTP) | Chat, MTP 2 | Code, no MTP |
+|---|---:|---:|---:|
+| 64K | 10.6 GiB | 98 tok/s | 52 tok/s |
+| 200K | 6.9 GiB | 83 tok/s | 47 tok/s |
+| 262K | 5.4 GiB | 77 tok/s | 44 tok/s |
+
+A full 262K window through the server (256,125-token prompt of this repository's source with three
+facts planted at 10%, 50% and 90% depth): prefill 412 tok/s, the same rate as a 15K-token prompt
+(10 min 21 s cold); all three facts retrieved; decode 33 to 36 tok/s at that depth; a follow-up
+turn reused all 256K tokens and started in 1.0 s.
+
 ## 5. Next
 
-1. Serving through NInfer's OpenAI/Anthropic server and Qwen frontend, with prefix reuse and MTP.
-2. 16-bit activations for the CPU experts (removes the main deviation from exact math).
-3. Cache swaps from the CPU's resident copy of the experts (exact inverse repack) instead of the
-   memory-mapped GGUF.
-4. Fewer VRAM bytes for the MTP layer's experts, and a Pi profile, evaluation, and higher-precision
-   expert quantizations within the RAM budget.
+1. Grow the context's VRAM on demand, taking expert-cache slots only as a conversation gets long,
+   so short sessions keep the 64K-window speed under a 262K window.
+2. Find why a short request through the server decodes slower than `fn_generate` with the same
+   window (46 against 77 tok/s; different prompts, so measure like for like first).
+3. Higher-precision expert quantizations within the RAM budget, and an evaluation through Pi.

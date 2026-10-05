@@ -120,11 +120,11 @@
       ]
     },
     "flash-next": {
-      "label": "Qwen3.8 Flash Next (GGUF, MTP up to 3, 64K)",
+      "label": "Qwen3.8 Flash Next (GGUF, MTP up to 3, 262K)",
       "file": "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
       "args": [
         "--max-context",
-        "65536",
+        "262144",
         "--flashnext-mtp",
         "models\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
         "--flashnext-draft",
