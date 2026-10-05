@@ -68,7 +68,7 @@ Developer\
     work\              local tools, test data, comparisons                                      (not in git)
   models\              every model file; app\models points here
     qwen3.8-flash-next\UD-IQ4_XS\...gguf, qwen3.8-flash-next\MTP\...gguf
-    qwen3.8-flash-next-huihui\...gguf
+    qwen3.8-flash-next-huihui\UD-IQ4_XS\...gguf
     qwen3_8_27b_a8.ninfer, qwen3_8_27b_huihui_v3.ninfer, bonsai2_27b_*.ninfer
   build-tools\         CUDA 13.3, vcpkg and its packages
 ```
@@ -125,14 +125,14 @@ Flash-Next, all 25 stress scenarios of that extension pass.
 
 ## Abliterated models
 
-- **Flash-Next (Huihui):** quantized here from huihui-ai's BF16 release with the exact per-tensor recipe of Unsloth's
-  UD-IQ4_XS:
-  - dense layers Q8_0;
-  - experts IQ3_S gate/up and IQ4_NL down, with Unsloth's higher-precision exceptions;
-  - Q6_K head.
-
-  The quantization uses mradermacher's importance matrix (statistics from the abliterated model that guide the
-  rounding). The engine runs it with the same speed and kernels as the original.
+- **Flash-Next (Huihui):** built here from huihui-ai's BF16 release by patching Unsloth's UD-IQ4_XS file.
+  - Huihui's abliteration changes only the four tensor kinds that write into the residual stream: attention output,
+    DeltaNet output, and the routed and shared experts' down projections. Every other tensor is byte-identical to
+    the original model, so it keeps Unsloth's quantization.
+  - The changed tensors (82 GB of BF16 out of 354 GB) are quantized to the type the file already has there, IQ4_NL or
+    Q8_0. This uses ggml's own quantizer and mradermacher's importance matrix of the abliterated model (statistics
+    that guide the rounding).
+  - The result has the same formats, size and speed as the original.
 - **Qwen3.8 27B (Huihui)** and **Bonsai (Heretic):** see [windows/README.md](windows/README.md#abliterated-bonsai).
 
 ## What this build changes
