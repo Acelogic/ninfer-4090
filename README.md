@@ -17,18 +17,20 @@ Each row is a ready-made profile. The profile name is also the model id that cli
 
 | Profile | Model | Context | Writes | Reads prompts |
 |---|---|---|---:|---:|
-| `qwen3.8-flash-next` | Qwen3.8-Flash-Next, Unsloth UD-IQ4_XS (94 GB) | 262K, text | 77-98 tok/s chat, 44-52 code; 33-36 at 256K deep | ~410 tok/s |
+| `qwen3.8-flash-next` | Qwen3.8-Flash-Next, Unsloth UD-IQ4_XS (94 GB) | 262K, text | 50-60 tok/s; ~44 at 256K deep | 2,500-3,000 tok/s |
 | `qwen3.8-flash-next-huihui` | Qwen3.8-Flash-Next, abliterated (Huihui), same recipe | 262K, text | same as above | same |
 | `qwen3.8-27b-fast` | Qwen3.8 27B | 131K, text | ~225 tok/s, up to 400 on edits | ~3,600 tok/s |
-| `qwen3.8-27b` | Qwen3.8 27B | 229K, text + images | ~160 tok/s | ~3,600 tok/s |
-| `qwen3.8-27b-huihui` | Qwen3.8 27B, abliterated (Huihui) | 229K, text + images | same as `qwen3.8-27b` | |
+| `qwen3.8-27b` | Qwen3.8 27B | 208K, text + images | ~160 tok/s | ~3,600 tok/s |
+| `qwen3.8-27b-huihui` | Qwen3.8 27B, abliterated (Huihui) | 208K, text + images | same as `qwen3.8-27b` | |
 | `bonsai2-27b` | Ternary Bonsai 2 27B (Prism ML) | 262K, text + images | ~245 tok/s, up to 370 on edits | |
 | `bonsai2-27b-heretic` | Ternary Bonsai 2 27B, abliterated (Heretic) | 262K, text + images | same as `bonsai2-27b` | |
 
 - All numbers were measured on the machine above, with the GPU also driving the desktop.
-- **Flash-Next** writes 77-98 tok/s on chat and 44-52 on code. These numbers use multi-token prediction with 1-3
-  drafts, chosen adaptively. In an agent session, a follow-up turn starts in about 1 s, because the conversation's
-  state is reused. Only a session's first prompt is read in full.
+- **Flash-Next** writes 50-60 tok/s on short replies through the server, and about 44 tok/s 256K tokens deep. These
+  numbers use multi-token prediction with 1-3 drafts, chosen adaptively.
+- **Prompt reading:** Flash-Next reads prompts at 2,500-3,000 tok/s, so Pi's ~24K-token system prompt takes about
+  11 s and a 256K-token prompt about 97 s. In an agent session, a follow-up turn starts in about 1 s, because the
+  conversation's state is reused.
 - **No quality cost from speculation:** speculative decoding drafts several tokens ahead and has the full model
   check them, so the output is what the model would have written anyway.
 - **Exact numerics:** the Flash-Next engine keeps FP32 activations and the file's exact weights. Its logits match an
@@ -51,8 +53,17 @@ The 4-bit file is 94 GB, so it can't sit in VRAM. The engine splits the work acr
   The cache follows each conversation's routing. One CUDA graph runs per decode step.
 - **CPU:** experts that miss the cache run on all 16 cores with AVX-512 VNNI kernels, over lossless repacks of the
   quantized weights. The GPU and the CPU work at the same time and meet through mapped memory.
-- **Long context:** QSA keeps attention cost flat with depth, so a 262K window works end to end. A 256K-token prompt
-  was read at the same rate as a 15K one, and facts placed at 10%, 50% and 90% of it were all retrieved.
+- **Prompts:** the GPU computes every expert, in chunks of up to 8,192 tokens. The experts that aren't in VRAM
+  stream from pinned RAM over PCIe while earlier layers compute. This follows Strata's design, but uses this engine's
+  exact kernels, so the results are bit-identical however the experts are cached or streamed.
+- **Long context:**
+  - QSA keeps attention cost flat with depth.
+  - The attention cache lives in pinned RAM, with a page cache in VRAM, also following Strata's design. A 262K window
+    costs about 1 GB of VRAM instead of 7 GB, so the expert cache keeps about 10.6 GiB, and decode at a 262K window is
+    as fast as at 64K.
+  - Facts placed at 10%, 50% and 90% of a 256K-token prompt are all retrieved.
+- **Memory:** the experts' CPU copy (about 66 GB) and the attention cache (6 GB at 262K) are pinned in RAM, so the GPU
+  can read them directly.
 
 [docs/maintainer/flash-next-engine.md](docs/maintainer/flash-next-engine.md) has the design and the measurements.
 
@@ -121,7 +132,8 @@ The API is at `http://127.0.0.1:18085/v1`. A tray icon shows the loaded model an
      or the same file edited over and over.
 
 Local models rarely ask for help on their own, so the automatic triggers are what make the fallback work. With
-Flash-Next, all 25 stress scenarios of that extension pass.
+Flash-Next, 24 of the extension's 25 stress scenarios pass. In the 25th, a fake reviewer asks for a file the user never
+requested; Flash-Next checks the review against the request and declines to invent the requirement.
 
 ## Abliterated models
 
@@ -147,13 +159,15 @@ On top of JGamboa's NInfer-4090 for Windows `v2026.09.27b`:
   machine:
   - GPU kernels for every dense format and expert format in the file;
   - AVX-512 CPU expert kernels;
-  - QSA sparse attention up to 262K;
+  - QSA sparse attention up to 262K, with the attention cache paged through RAM;
+  - prompts that stream every uncached expert to the GPU;
   - MTP speculative decoding with an adaptive draft length;
   - an adaptive VRAM expert cache, and prefix reuse across agent turns.
 - **One build:** Flash-Next is part of the default build; `windows/Build-NInfer.ps1` builds, tests and installs it.
 - **Deeper MTP speculation** for the 27B models: up to 7 drafts per round instead of 5.
 - **More context on a desktop GPU:** memory is sized from the free VRAM measured before the weights load. Qwen3.8 27B
-  fits 229K context with vision.
+  fits 208K context with vision while the GPU also drives the desktop. At 229K with vision, Windows pages GPU memory
+  and decode drops from ~170 to ~75 tok/s.
 - **Windows tooling** in [`windows/`](windows/README.md): the profile launcher, stop script, tray icon and optional
   [Froggeric chat templates](third_party/froggeric).
 

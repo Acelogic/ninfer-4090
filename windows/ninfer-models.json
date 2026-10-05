@@ -32,13 +32,13 @@
       ]
     },
     "qwen3.8-27b": {
-      "label": "Qwen3.8 27B (int8 prefill)",
+      "label": "Qwen3.8 27B (int8 prefill, 208K, vision)",
       "file": "qwen3_8_27b_a8.ninfer",
       "args": [
         "--max-context",
-        "229376",
+        "212992",
         "--kv-capacity",
-        "229376",
+        "212992",
         "--kv-dtype",
         "rk4v4-e8",
         "--prefill-chunk",
@@ -58,9 +58,9 @@
       "file": "qwen3_8_27b_huihui_v3.ninfer",
       "args": [
         "--max-context",
-        "229376",
+        "212992",
         "--kv-capacity",
-        "229376",
+        "212992",
         "--kv-dtype",
         "rk4v4-e8",
         "--prefill-chunk",
