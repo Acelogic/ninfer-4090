@@ -393,14 +393,19 @@ static int run(int argc, char ** argv) {
         auto t_snap = std::chrono::steady_clock::now();
         const EngineSnapshot snap = engine.snapshot();
         const double snap_ms = 1e3 * seconds_since(t_snap);
+        // the 8 tokens, the logits after them, and the logits each token was chosen from
+        std::vector<std::vector<float>> seen[2];
+        int run_no = 0;
         auto greedy = [&](std::vector<float> lg) {
             std::vector<std::int32_t> ids;
-            std::vector<float> last;
             for (int i = 0; i < 8; ++i) {
+                seen[run_no].push_back(lg);
                 const std::int32_t id = top_k(lg.data(), std::size_t(engine.n_vocab()), 1)[0].id;
                 ids.push_back(id);
                 lg = engine.forward({id});
             }
+            seen[run_no].push_back(lg);
+            ++run_no;
             return std::make_pair(ids, lg);
         };
         const auto first = greedy(logits);
@@ -414,15 +419,36 @@ static int run(int argc, char ** argv) {
         engine.restore(snap);
         const double restore_ms = 1e3 * seconds_since(t_snap);
         const auto second = greedy(logits);
-        // With decode adaptation (the default) the cache changes during the first continuation, so the second computes
-        // some pairs on the other device: the same tokens, logits that differ in the last bits. Bitwise: --no-decode-adapt.
+        // The second continuation is bitwise the first only if the expert cache did not change in between: with decode
+        // adaptation (the default) it changes during the first continuation, and a detour's prompt refills and re-ranks it
+        // (unless there is no cache), so some pairs then run on the other device: the same tokens, logits that differ in
+        // the last bits. Bitwise: --no-decode-adapt, and without a detour or with --cache-mib 0.
+        const bool strict = !opt.decode_adapt && (detour == 0 || opt.expert_cache_mib == 0);
         const bool same_ids = first.first == second.first, same = same_ids && first.second == second.second;
         std::printf("snapshot %.1f MiB in %.1f ms, restore in %.1f ms; continuation after restore: tokens identical: %s, logits bitwise "
                     "identical: %s%s\n",
                     snap.state.size() / 1048576.0, snap_ms, restore_ms, same_ids ? "yes" : "NO", same ? "yes" : "no",
-                    opt.decode_adapt ? " (the expert cache adapts while decoding)" : "");
+                    strict ? "" : opt.decode_adapt ? " (the expert cache adapts while decoding)" : " (the detour changed the expert cache)");
+        if (!same) {
+            // how far apart: the largest logit difference over the 9 rows, and the closest top-1/top-2 margin the
+            // greedy choices had (a token flips only where the difference reaches the margin)
+            double maxd = 0, min_margin = 1e30;
+            int first_diff = -1;
+            for (std::size_t r = 0; r < seen[0].size() && r < seen[1].size(); ++r) {
+                const std::vector<float> & a = seen[0][r];
+                const std::vector<float> & b = seen[1][r];
+                for (std::size_t i = 0; i < a.size(); ++i) maxd = std::max(maxd, std::fabs(double(a[i]) - b[i]));
+                if (r < 8) {
+                    const auto t2 = top_k(a.data(), a.size(), 2);
+                    min_margin = std::min(min_margin, double(t2[0].logit) - t2[1].logit);
+                }
+                if (first_diff < 0 && r < 8 && first.first[r] != second.first[r]) first_diff = int(r);
+            }
+            std::printf("snapshot continuations differ by at most %.3g in a logit; smallest top-1/top-2 margin of the 8 choices %.3g%s\n", maxd,
+                        min_margin, first_diff >= 0 ? (", first different token at " + std::to_string(first_diff)).c_str() : "");
+        }
         engine.restore(snap);
-        if (!same_ids || (!same && !opt.decode_adapt)) return 1;
+        if (!same_ids || (!same && strict)) return 1;
     }
 
     std::vector<std::int32_t> generated;
