@@ -6,6 +6,7 @@
 //   gate/up IQ4_XS -> Q4X  (same nibble layout, 8-bit block scales)
 //   down    IQ4_NL -> IQ4L (same nibbles and scales, chunked for 64-weight loads)
 //   down    Q8_0   -> kept as is
+//   gate/up Q8_0   -> kept as is (the MTP head's layer, add_layer(); run() only, always with 16-bit activations)
 // A call computes, for each token, the weighted sum of the selected experts that the caller assigns
 // to the CPU. Tokens that share an expert share one pass over its weights.
 //
@@ -52,6 +53,8 @@ public:
 
     CpuExperts(const GgufModel & model, const CpuExpertsConfig & config);
     ~CpuExperts();
+    // Loads one more layer's experts from another model (the MTP head: blk.<layer>.ffn_*_exps of its own GGUF).
+    void add_layer(const GgufModel & model, int layer);
 
     // x: [n_tokens][2560]. ids, weights: [n_tokens][10]. on_cpu: [n_tokens][10], nonzero for the
     // (token, slot) pairs to compute here (nullptr = all). out: [n_tokens][2560], overwritten with
@@ -98,6 +101,7 @@ public:
     struct Layer;
 
 private:
+    void load_layer(const GgufModel & model, int layer);
     template <bool Precise>
     void run_batch_impl(int layer, int n_tokens, const float * x, const std::int32_t * ids, const float * weights,
                         const std::uint8_t * on_cpu, float * out);

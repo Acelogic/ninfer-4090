@@ -9,7 +9,7 @@
 //   All of the above for 8-bit and for 16-bit (precise) activations.
 //   export:   export_expert reproduces the GGUF bytes of every expert of every loaded layer; its speed
 // Usage: test_cpu_experts <shards...> [--layers 0,2,4,...] [--threads 16] [--tokens 40] [--batch 64,256,1024,4096]
-//        [--no-pin] [--mode int8|precise|both] [--no-export]
+//        [--no-pin] [--mode int8|precise|both] [--no-export] [--mtp <MTP head GGUF>: test its layer instead]
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -369,11 +369,63 @@ static int test_mode(const GgufModel & m, const Options & o, bool precise, bool 
     return failures;
 }
 
+// The MTP head's layer (Q8_0 gate/up and down, loaded with add_layer): one token against the double-precision reference,
+// 1..4 tokens sharing experts against single-token calls, and the speed of one token's 10 experts.
+static int test_mtp(const GgufModel & m, const std::string & mtp_path, const Options & o) {
+    GgufModel g(std::vector<std::string>{mtp_path});
+    const int il = int(m.get_int("qwen4exp.block_count"));  // the MTP block follows the main model's layers
+    CpuExpertsConfig cfg;
+    cfg.threads = o.threads;
+    cfg.pin_threads = o.pin;
+    cfg.precise_activations = false;  // the MTP layer uses 16-bit activations whatever this says
+    cfg.layers = {0};
+    CpuExperts ex(m, cfg);
+    ex.add_layer(g, il);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0, 1);
+    int failures = 0;
+    constexpr int T = 4;
+    std::vector<float> x(std::size_t(T) * 2560), w(T * 10), out(std::size_t(T) * 2560), one(2560);
+    std::vector<std::int32_t> ids(T * 10);
+    for (auto & v : x) v = nd(rng);
+    for (int t = 0; t < T; ++t)
+        for (int k = 0; k < 10; ++k) {
+            int e = 0;
+            bool dup = true;
+            while (dup) {  // tokens 1.. share their first 3 experts with token 0
+                e = (t > 0 && k < 3) ? ids[k] : int(rng() % 512);
+                dup = false;
+                for (int j = 0; j < k; ++j) dup |= ids[t * 10 + j] == e;
+            }
+            ids[t * 10 + k] = e;
+            w[t * 10 + k] = 0.05f + float(rng() % 100) / 1000.0f;
+        }
+    double worst_ref = 0, worst_batch = 0;
+    ex.run(il, T, x.data(), ids.data(), w.data(), nullptr, out.data());
+    for (int t = 0; t < T; ++t) {
+        const std::vector<double> ref = reference(g, il, x.data() + std::size_t(t) * 2560, ids.data() + 10 * t, w.data() + 10 * t);
+        std::vector<float> rf(ref.begin(), ref.end());
+        worst_ref = std::max(worst_ref, rel_diff(rf.data(), out.data() + std::size_t(t) * 2560, 2560));
+        ex.run(il, 1, x.data() + std::size_t(t) * 2560, ids.data() + 10 * t, w.data() + 10 * t, nullptr, one.data());
+        worst_batch = std::max(worst_batch, rel_diff(one.data(), out.data() + std::size_t(t) * 2560, 2560));
+    }
+    const bool ok = worst_ref < 2e-4 && worst_batch < 1e-6;
+    failures += !ok;
+    const int reps = 50;
+    const auto t0 = clk::now();
+    for (int r = 0; r < reps; ++r) ex.run(il, 1, x.data(), ids.data() + 10 * (r % T), w.data(), nullptr, one.data());
+    const double us = std::chrono::duration<double, std::micro>(clk::now() - t0).count() / reps;
+    printf("MTP layer %d (%s, %.2f MB per expert): rel. error vs exact %.2e, 4 tokens vs 1 at a time %.2e; one token's 10 experts %.0f us "
+           "(%.1f GB/s)  %s\n",
+           il, ex.format_name(il), ex.expert_bytes(il) / 1e6, worst_ref, worst_batch, us, 10.0 * ex.expert_bytes(il) / (us * 1e3), ok ? "ok" : "FAIL");
+    return failures;
+}
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::vector<std::string> shards;
     Options o;
-    std::string mode = "both";
+    std::string mode = "both", mtp;
     bool do_export = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -387,10 +439,16 @@ int main(int argc, char ** argv) {
         else if (a == "--no-pin") o.pin = false;
         else if (a == "--mode") mode = argv[++i];
         else if (a == "--no-export") do_export = false;
+        else if (a == "--mtp") mtp = argv[++i];
         else shards.push_back(a);
     }
     GgufModel m(shards);
     int failures = 0;
+    if (!mtp.empty()) {
+        failures += test_mtp(m, mtp, o);
+        printf(failures ? "FAILED\n" : "ALL OK\n");
+        return failures ? 1 : 0;
+    }
     if (mode != "precise") failures += test_mode(m, o, false, do_export);
     if (mode != "int8") failures += test_mode(m, o, true, do_export && mode == "precise");
     printf(failures ? "FAILED\n" : "ALL OK\n");
