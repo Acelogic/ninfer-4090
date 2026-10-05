@@ -3,7 +3,8 @@
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
-//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--mtp mtp.gguf [--draft K]] [--hash]
+//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--mtp mtp.gguf [--draft K]
+//                    [--mtp-experts-vram]] [--no-decode-adapt] [--hash]
 //                    [--kv-stream 0|1] [--kv-resident CELLS] [--kv-stage-cells CELLS] [--kv-group-tokens N] [--followup N[,N...]]
 //                    [--no-lend] [--no-stream] [--stream-min N] [--chunk-max N] [--cpu-share-max N] [--dense-sgemm] [--profile]
 //                    [--hash-state] [--pieces N] [--prefill-runs 0,2048:nostream,...]
@@ -189,6 +190,8 @@ static int run(int argc, char ** argv) {
         else if (a == "--snapshot-detour") detour = std::stoi(next());
         else if (a == "--no-host-images") opt.host_expert_images = false;
         else if (a == "--mtp") opt.mtp_path = next();
+        else if (a == "--mtp-experts-vram") opt.mtp_experts_vram = true;
+        else if (a == "--no-decode-adapt") opt.decode_adapt = false;
         else if (a == "--int8-cpu-experts") opt.precise_cpu_experts = false;
         else if (a == "--pin") opt.pin_cpu_threads = true;
         else if (a == "--draft") n_draft = std::stoi(next());
@@ -411,11 +414,15 @@ static int run(int argc, char ** argv) {
         engine.restore(snap);
         const double restore_ms = 1e3 * seconds_since(t_snap);
         const auto second = greedy(logits);
-        const bool same = first.first == second.first && first.second == second.second;
-        std::printf("snapshot %.1f MiB in %.1f ms, restore in %.1f ms; continuation after restore identical: %s\n",
-                    snap.state.size() / 1048576.0, snap_ms, restore_ms, same ? "yes" : "NO");
+        // With decode adaptation (the default) the cache changes during the first continuation, so the second computes
+        // some pairs on the other device: the same tokens, logits that differ in the last bits. Bitwise: --no-decode-adapt.
+        const bool same_ids = first.first == second.first, same = same_ids && first.second == second.second;
+        std::printf("snapshot %.1f MiB in %.1f ms, restore in %.1f ms; continuation after restore: tokens identical: %s, logits bitwise "
+                    "identical: %s%s\n",
+                    snap.state.size() / 1048576.0, snap_ms, restore_ms, same_ids ? "yes" : "NO", same ? "yes" : "no",
+                    opt.decode_adapt ? " (the expert cache adapts while decoding)" : "");
         engine.restore(snap);
-        if (!same) return 1;
+        if (!same_ids || (!same && !opt.decode_adapt)) return 1;
     }
 
     std::vector<std::int32_t> generated;
@@ -423,6 +430,29 @@ static int run(int argc, char ** argv) {
     std::vector<double> step_times;
     const EngineStats after_prompt = engine.stats();
     const std::size_t V = std::size_t(engine.n_vocab());
+    // The decode phase's expert statistics (the refill and re-ranking after a long prompt happen at the first decode
+    // step, so they are counted here, not in the prompt's line).
+    auto print_decode_experts = [&]() {
+        const EngineStats & st = engine.stats();
+        const std::int64_t hits = st.expert_hits - after_prompt.expert_hits, pairs = st.expert_pairs - after_prompt.expert_pairs;
+        std::int64_t steps = 0;
+        std::printf("decode experts: %.1f%% VRAM (%lld of %lld pairs); steps by tokens:", 100.0 * double(hits) / double(std::max<std::int64_t>(1, pairs)),
+                    (long long) hits, (long long) pairs);
+        for (int t = 1; t <= 4; ++t) {
+            const std::int64_t n = st.graph_steps[t] - after_prompt.graph_steps[t];
+            steps += n;
+            std::printf(" %d:%lld", t, (long long) n);
+        }
+        steps = std::max<std::int64_t>(1, steps);
+        std::printf("; per step: GPU wait %.2f ms, CPU experts %.2f ms, %.1f distinct CPU experts per layer; cache: %lld swaps (%lld in the "
+                    "background, %.1f per step, chosen in %.3f ms; %.0f ms for the others), refill %.0f ms\n",
+                    (st.gpu_wait_ms - after_prompt.gpu_wait_ms) / double(steps), (st.cpu_experts_ms - after_prompt.cpu_experts_ms) / double(steps),
+                    double(st.cpu_expert_reads - after_prompt.cpu_expert_reads) / double(steps) / 48.0,
+                    (long long) (st.cache_swaps - after_prompt.cache_swaps), (long long) (st.decode_swaps - after_prompt.decode_swaps),
+                    double(st.decode_swaps - after_prompt.decode_swaps) / double(steps), (st.adapt_ms - after_prompt.adapt_ms) / double(steps),
+                    st.cache_swap_ms - after_prompt.cache_swap_ms,
+                    st.refill_ms - after_prompt.refill_ms);
+    };
     if (engine.has_mtp() && n_draft > 0) {
         // greedy speculative decoding: draft with the MTP head, verify in one step, keep the agreed prefix
         std::int32_t tok = top_k(logits.data(), V, 1)[0].id;
@@ -463,8 +493,14 @@ static int run(int argc, char ** argv) {
         std::printf("\nMTP decode: %zu tokens in %d steps, %.2f ms/token (%.2f tok/s); drafts accepted %d/%d (%.1f%%), %.2f tokens per step\n",
                     generated.size(), steps, 1e3 * total / double(generated.size()), double(generated.size()) / total, accepted, drafted,
                     100.0 * accepted / std::max(1, drafted), double(generated.size()) / std::max(1, steps));
-        std::printf("per step: draft %.2f ms, verify %.2f ms (CPU experts %.2f ms), other %.2f ms\n", 1e3 * draft_s / steps, 1e3 * verify_s / steps,
-                    (engine.stats().cpu_experts_ms - cpu0) / steps, 1e3 * (total - draft_s - verify_s) / steps);
+        const EngineStats & es = engine.stats();
+        std::printf("per step: draft %.2f ms (catch-up %.2f, launches %.2f, GPU before the experts %.2f, MTP experts on the CPU %.2f, GPU after "
+                    "them %.2f), verify %.2f ms (CPU experts %.2f ms; queueing swaps %.2f ms), other %.2f ms\n",
+                    1e3 * draft_s / steps, (es.mtp_catchup_ms - after_prompt.mtp_catchup_ms) / steps,
+                    (es.mtp_launch_ms - after_prompt.mtp_launch_ms) / steps, (es.mtp_wait_ms - after_prompt.mtp_wait_ms) / steps,
+                    (es.mtp_cpu_ms - after_prompt.mtp_cpu_ms) / steps, (es.mtp_tail_ms - after_prompt.mtp_tail_ms) / steps, 1e3 * verify_s / steps,
+                    (es.cpu_experts_ms - cpu0) / steps, (es.swap_issue_ms - after_prompt.swap_issue_ms) / steps, 1e3 * (total - draft_s - verify_s) / steps);
+        print_decode_experts();
         if (hash)
             std::printf("hash verify logits: %016llx; hash drafts: %016llx\n", (unsigned long long) h_decode, (unsigned long long) h_drafts);
         print_kv(engine, "at the end");
@@ -512,6 +548,7 @@ static int run(int argc, char ** argv) {
                     step_times.size(), 1e3 * total / double(step_times.size()), double(step_times.size()) / total, 100.0 * cpu_ms / eng_ms,
                     100.0 * double(hits) / double(std::max<std::int64_t>(1, pairs)), 100.0 * double(host) / double(std::max<std::int64_t>(1, pairs)),
                     100.0 * double(pairs - hits - host) / double(std::max<std::int64_t>(1, pairs)));
+        print_decode_experts();
     }
     if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
 
