@@ -62,7 +62,8 @@ behind a VRAM expert cache. Pass any shard of a split model; the others are foun
 ./build/apps/ninfer-serve Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
   --port 8080 --model-id flash-next --max-context 65536 \
   --flashnext-routing-stats flash-next.routing \
-  --flashnext-mtp mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --flashnext-draft 2
+  --flashnext-mtp mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --flashnext-draft 2 \
+  --flashnext-vision mmproj-F16.gguf
 ```
 
 The endpoints, streaming, reasoning and tool-call parsing are the same as for an artifact. The
@@ -87,6 +88,17 @@ prompt begins with. Attention keys and values stay in the engine by position: a 
 until another prompt overwrites its positions, so alternating between conversations reuses only
 their common prefix. `--no-prefix-reuse` disables both kinds of reuse.
 
+With `--flashnext-vision`, requests may carry images (OpenAI chat `image_url` parts, Responses
+`input_image`, Anthropic `image` blocks; data URLs or base64) and the frontend preprocesses them as
+for the 27B artifacts: bicubic resize to multiples of 32 pixels, each image 8 to 4,096 tokens (one
+token per 32 x 32 pixels; llama.cpp's budget for this model), up to 32,768 image tokens per prompt.
+The vision encoder (Qwen3-VL's, from the model's mmproj GGUF; the same file serves the Huihui model)
+keeps its 0.9 GB of weights in pinned RAM and borrows its working memory from the expert cache only
+while it encodes, so a text-only server keeps the same VRAM and speed. Encoded images are kept (512
+MiB, by content), and prefix reuse tells images apart by their content, so a conversation that resends
+its images reuses the cached prompt. Video is rejected. The request log reports `vision_tokens` and the
+encode time.
+
 `--max-context` sizes the engine's attention caches (about 10 KB of VRAM per token, taken from the
 expert cache). Options for these models:
 
@@ -98,9 +110,11 @@ expert cache). Options for these models:
 | `--flashnext-host-expert-images` | keep a pinned host copy of every expert (tens of GB of RAM, only when free) | off |
 | `--flashnext-mtp FILE` | the MTP head GGUF; enables speculative decoding | off |
 | `--flashnext-draft K` | most MTP drafts per decode step, `1..3`; each step uses the length with the most expected tokens per second, from moving averages of draft acceptance and step time | `2` with `--flashnext-mtp` |
+| `--flashnext-vision FILE` | the vision encoder: the model's mmproj GGUF (`clip`, `qwen3vl_merger`, F16); enables image input | off (text only) |
 
 They are rejected for `.ninfer` artifacts. Flash-Next does not support `--max-concurrency` above 1,
-`--spec` (it uses `--flashnext-mtp`), `--vision`, `--kv-dtype` other than `bf16`,
+`--spec` (it uses `--flashnext-mtp`), `--vision` (it uses `--flashnext-vision`), video input,
+`--kv-dtype` other than `bf16`,
 `--auto-save-evicted`, `/slots` save and restore, or `ninfer-perplexity` scoring.
 
 ## Endpoints
