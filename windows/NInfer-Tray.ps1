@@ -62,6 +62,11 @@ function Get-Leases {
 
 function Clear-Leases { Get-ChildItem -LiteralPath $leaseDir -Filter '*.json' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue }
 
+# Only the leases of Pi sessions that are gone. A live session's lease must survive the moments the engine is down
+# while Pi switches models or the next one loads: Pi writes it once when it starts the engine, so a lease cleared
+# then is never written again, and killing that Pi afterwards left the engine loaded.
+function Remove-DeadLeases { Get-Leases | Where-Object { -not $_.alive } | ForEach-Object { Remove-Item -Force -LiteralPath $_.file -ErrorAction SilentlyContinue } }
+
 function Stop-Engine([string]$reason) {
     Write-Log "stopping engine: $reason"
     # The stop script only stops the process its launcher recorded.
@@ -73,6 +78,7 @@ function Stop-Engine([string]$reason) {
 function Start-Engine([string]$name) {
     $label = $cfg.profiles.$name.label
     if ((Get-EngineState).state -ne 'stopped') { Stop-Engine "Switching to $label"; Start-Sleep -Seconds 2 }
+    Clear-Leases # an engine started from the tray is the user's, never auto-stopped
     Write-Log "starting $name"
     try { & (Join-Path $configDir 'Start-NInfer.ps1') -Name $name | Out-Null } catch { Write-Log "start $($name): $($_.Exception.Message)"; $notify.ShowBalloonTip(5000, 'NInfer start failed', $_.Exception.Message, [System.Windows.Forms.ToolTipIcon]::Error) }
 }
@@ -138,8 +144,11 @@ $timer.add_Tick({
 
         if ($engine.state -eq 'stopped') {
             $script:deadPolls = 0
-            Clear-Leases
+            Remove-DeadLeases
             if (-not $script:stoppedSince) { $script:stoppedSince = Get-Date }
+            # A live Pi session may be between two models: stay for it (the tray Pi launches after its start would
+            # find this one still holding the mutex and quit, and nothing would watch the next engine).
+            if (@(Get-Leases | Where-Object alive).Count) { $script:stoppedSince = Get-Date }
             if ($cfg.exitWhenStopped -and ((Get-Date) - $script:stoppedSince).TotalSeconds -gt 15) {
                 $timer.Stop(); $notify.Visible = $false; [System.Windows.Forms.Application]::Exit()
             }
