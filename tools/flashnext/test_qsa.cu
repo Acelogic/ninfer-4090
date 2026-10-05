@@ -776,7 +776,8 @@ void test_kv_stream() {
     p = 30000;
     step(p, 9); p += 9;                                                         // short chunks deep: in groups of 4 queries
     step(p, 40); p += 40;
-    step(p, 41); p += 41;                                                       // one token more: staged
+    step(p, 58); p += 58;                                                       // up to max(40, p0 / 512 = 58): groups
+    step(p, 59); p += 59;                                                       // one token more: staged
     for (int i = 0; i < 20; ++i) { step(p, 1); p += 1; }
     // the host copy must equal the resident cache for every position written
     const KvStreamStats st = kvc.stats();
@@ -787,6 +788,48 @@ void test_kv_stream() {
     expect(bad == 0, "streamed attention bit-identical to resident");
     expect(!st.overflow, "no page cache overflow");
     expect(st.misses > 0 && st.staged_chunks > 0 && st.grouped_chunks > 0, "the test exercised misses, staging and groups");
+
+    // cost of a decode step's attention, resident vs streamed with every page already resident (the
+    // selection is copied back before each streamed call, since attend() rewrites it)
+    for (int T : {1, 3}) {
+        const std::int64_t p0 = p;
+        check(cudaMemcpyAsync(pos.get(), &p0, sizeof(p0), cudaMemcpyHostToDevice, s), "pos");
+        qsa_select(qi.as<float>(), blocks.as<float>(), pos.as<std::int64_t>(), T, ctx, sel_work.get(), cells_a.as<std::int32_t>(),
+                   n_cells.as<std::int32_t>(), s);
+        kvc.begin_step(p0, T, nullptr);
+        auto timed = [&](const std::function<void()> & fn) {
+            cudaEvent_t a, b;
+            cudaEventCreate(&a);
+            cudaEventCreate(&b);
+            for (int i = 0; i < 20; ++i) fn();
+            float best = INFINITY;
+            for (int trial = 0; trial < 5; ++trial) {
+                cudaEventRecord(a, s);
+                for (int i = 0; i < 200; ++i) fn();
+                cudaEventRecord(b, s);
+                cudaEventSynchronize(b);
+                float ms = 0;
+                cudaEventElapsedTime(&ms, a, b);
+                best = std::min(best, ms / 200);
+            }
+            cudaEventDestroy(a);
+            cudaEventDestroy(b);
+            return best * 1000.0f;
+        };
+        const std::size_t cb = std::size_t(T) * kW * 4;
+        const float t_res = timed([&] {
+            attn_sparse(q_a.as<float>(), g_a.as<float>(), kc[0].as<half>(), vc[0].as<half>(), cells_a.as<std::int32_t>(), n_cells.as<std::int32_t>(),
+                        T, kScale, work.as<float>(), o_a.as<float>(), s);
+        });
+        const float t_copy = timed([&] { cudaMemcpyAsync(cells_b.get(), cells_a.get(), cb, cudaMemcpyDeviceToDevice, s); });
+        const float t_str = timed([&] {
+            cudaMemcpyAsync(cells_b.get(), cells_a.get(), cb, cudaMemcpyDeviceToDevice, s);
+            kvc.attend(0, q_b.as<float>(), g_b.as<float>(), cells_b.as<std::int32_t>(), n_cells.as<std::int32_t>(), pos.as<std::int64_t>(), kScale,
+                       work.as<float>(), o_b.as<float>());
+        });
+        std::printf("  decode attention at %lld, T %d: resident %.1f us, streamed (resolve + copy + attention) %.1f us\n", (long long) p0, T,
+                    t_res, t_str - t_copy);
+    }
     check(cudaStreamDestroy(s), "stream");
 }
 

@@ -79,7 +79,7 @@ void KvStreamCache::begin_step(std::int64_t p0, int T, void * stage) {
         mode_ = Mode::Decode;
     } else if (p0 + T <= resident_) {
         mode_ = Mode::Prefix;
-    } else if (T <= group_tokens_) {
+    } else if (group_tokens_ > 0 && T <= std::max<std::int64_t>(group_tokens_, p0 / kGroupDepth)) {
         mode_ = Mode::Groups;
         ++grouped_chunks_;
     } else {

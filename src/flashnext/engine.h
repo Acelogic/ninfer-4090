@@ -37,7 +37,8 @@ struct EngineOptions {
     // kv_resident; 0: off (all of it in VRAM); 1: on.
     int kv_stream = -1;
     std::int64_t kv_resident = 32768;     // cells per attention layer kept in VRAM when streaming (>= 8448)
-    int kv_group_tokens = 64;             // prompt chunks beyond the page cache up to this long attend in groups instead of staging
+    int kv_group_tokens = 64;             // prompt chunks beyond the page cache up to max(this, depth / 512) tokens attend in groups
+                                          // instead of staging (0: never)
     // Cells of the dedicated staging pool for prompt chunks beyond the page cache (-1: max_ctx; 0: none, such
     // chunks then fail). Used only while the engine cannot borrow that VRAM for the prompt instead.
     std::int64_t kv_stage_cells = -1;

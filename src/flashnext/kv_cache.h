@@ -10,8 +10,9 @@
 //   - decode steps (T <= kMaxTokens, captured in graphs): resolve the selected blocks into the page cache;
 //   - prompt chunks that end within the page cache (pos0 + T <= resident_cells): make every block of
 //     [0, pos0 + T) resident (it fits), then read the page cache;
-//   - short prompt chunks beyond it (T <= group_tokens): the queries in groups small enough that a group's
-//     selected blocks always fit the page cache, each group resolved like a decode step;
+//   - short prompt chunks beyond it (T <= max(group_tokens, pos0 / kGroupDepth)): the queries in groups
+//     small enough that a group's selected blocks always fit the page cache, each resolved like a decode
+//     step (staging costs a fixed DMA of the whole depth that a short chunk cannot hide);
 //   - longer prompt chunks beyond it: stage the layer's rows [0, pos0) from the host copy into a
 //     full-context pool (one layer at a time, by DMA on a side stream overlapped with the previous layers),
 //     while attn_prep writes the chunk's rows into the stage, the host copy and any resident page.
@@ -35,7 +36,8 @@ namespace ninfer::flashnext {
 class KvStreamCache {
 public:
     // resident_cells: the page cache per layer (a multiple of 4, at least kMinResident); stream: the engine's.
-    // group_tokens: the longest prompt chunk beyond the page cache that runs in groups instead of staging.
+    // group_tokens: prompt chunks beyond the page cache up to this long (or pos0 / kGroupDepth if longer) run in
+    // groups instead of staging; 0: never.
     KvStreamCache(std::int64_t max_ctx, std::int64_t resident_cells, int group_tokens, cudaStream_t stream);
     ~KvStreamCache();
     KvStreamCache(const KvStreamCache &) = delete;
@@ -44,6 +46,10 @@ public:
     // Fewest resident cells: the distinct blocks of a decode step of kMaxTokens queries (4 x 514 pages) and at
     // least kKvResolveThreads pages.
     static constexpr std::int64_t kMinResident = 8448;
+    // Prompt chunks of up to pos0 / kGroupDepth tokens (and at least group_tokens) attend in groups. Measured at
+    // 250K depth: staging adds about 0.2 s per chunk (12 layers x 500 MB of DMA that a short chunk cannot
+    // hide), groups about 0.25 ms per token over one attention call; they break even near 500 tokens.
+    static constexpr std::int64_t kGroupDepth = 512;
 
     int add_layer();  // the next streamed layer's index
     std::int64_t resident_cells() const { return resident_; }
