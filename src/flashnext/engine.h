@@ -24,7 +24,29 @@ struct EngineOptions {
     std::int64_t vram_reserve_mib = 1536; // left free for the desktop and other programs
     std::string routing_stats;            // per-layer expert counts that choose the cached experts ("" = none)
     bool cuda_graphs = true;              // replay each step as one CUDA graph (off: launch kernels one by one)
-    int prefill_chunk = 512;              // prompt tokens per batched pass (above 4 tokens)
+    // Prompts (more than 4 tokens) run in chunks of prefill_chunk tokens; 0 = automatic: per prompt, the
+    // largest chunk (256-token grid, up to prefill_chunk_max) whose buffers fit in the VRAM the expert cache
+    // can lend. Chunks above 512 tokens borrow their buffers from the expert cache for the prompt's duration
+    // (prefill_lend); with prefill_lend off, buffers for prefill_chunk tokens stay allocated (the old way).
+    int prefill_chunk = 0;
+    int prefill_chunk_max = 8192;
+    bool prefill_lend = true;
+    // Chunks of at least prefill_stream_min tokens compute every routed expert on the GPU, copying the ones
+    // that are not cached from the CPU's pinned copy as the layers run; smaller ones split the experts
+    // between the GPU (cached) and the CPU (the rest).
+    bool prefill_stream = true;
+    int prefill_stream_min = 1024;
+    // Streamed chunks of at most this many tokens leave the experts predicted to get the fewest tokens to the
+    // CPU (they cost the CPU less RAM time than their copy costs PCIe time), concurrently with the GPU. 0: never.
+    // Those pairs use the CPU's numerics (16-bit activations, 5e-5) and the split depends on the routing seen
+    // so far, so such chunks are not bitwise reproducible across histories; chunks above it are.
+    int prefill_cpu_share_max = 4096;
+    // Prompt chunks multiply the Q8_0 dense weights on the tensor cores (exact weights, activations as two fp16
+    // terms, FP32 accumulation of the main terms) instead of dequantizing them for FP32 cuBLAS SGEMM: 1.6x
+    // faster and, measured against double precision on the model's matrices, more accurate (1-4e-7 relative
+    // against SGEMM's 3e-7 to 1.3e-6; test_gemm_tc).
+    bool prefill_dense_tc = true;
+    bool profile = false;                 // per-stage timings of prompt chunks on stderr (adds event records)
     // A pinned copy of every expert in the GPU's layout (about 55 GB of RAM, only if free): cache swaps
     // copy from it, and the GPU can read a share of each step's cache misses from it over PCIe. Off by
     // default: those PCIe reads come out of the same DRAM bandwidth the CPU experts need (measured: a
@@ -49,6 +71,15 @@ struct EngineStats {
     double cache_gib = 0;
     std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed
     double cache_swap_ms = 0;      // time spent replacing them
+    // prompts
+    std::int64_t prompt_chunks = 0, streamed_chunks = 0;
+    int last_chunk = 0;                // tokens per chunk of the last prompt
+    double lent_gib = 0;               // expert-cache VRAM the last prompt borrowed
+    std::int64_t streamed_experts = 0; // experts copied from host memory for prompt chunks
+    double streamed_gib = 0;
+    double refill_ms = 0;              // putting experts back into the lent VRAM after prompts
+    std::int64_t cpu_share_experts = 0; // experts of streamed chunks computed by the CPU instead
+    int pinned_layers = 0;             // layers whose CPU copy is pinned (streamable)
 };
 
 // The recurrent state after a sequence of tokens: DeltaNet recurrent and conv states, the PLE conv
@@ -85,6 +116,8 @@ public:
     int n_vocab() const;
     void set_activation_hook(EngineHook hook);  // slow: synchronizes and copies every activation
     const EngineStats & stats() const;
+    // Changes the prompt chunking for later forward() calls (EngineOptions::prefill_chunk, prefill_stream).
+    void set_prefill(int chunk, bool stream);
     // Writes the routing counts (the loaded ones plus everything seen since) for the next start.
     void save_routing_stats(const std::string & path) const;
 

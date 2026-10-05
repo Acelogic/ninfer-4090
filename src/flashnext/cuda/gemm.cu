@@ -47,8 +47,12 @@ Gemm::~Gemm() {
 }
 
 void Gemm::run(const GpuWeight & w, const float * x, float * y, int T) {
-    if (tc_ && w.format == WeightFormat::Q8_SPLIT && gemm_q8_tc_supported(w.n, w.k)) {
-        if (row_scales_.bytes() < std::size_t(T) * 2 * sizeof(float)) throw std::runtime_error("gemm: too many tokens for the tensor-core path");
+    // the tensor-core kernel puts a 64 x 256 tile on each block: a long, narrow product (the hyper-connection
+    // down projection, K = 10240, N = 320) with few tiles leaves most SMs idle, where SGEMM splits K
+    const long long tiles = ((w.n + 255) / 256) * ((T + 63) / 64);
+    const bool narrow_long = w.k >= 8192 && tiles < 128;
+    if (tc_ && !narrow_long && w.format == WeightFormat::Q8_SPLIT && gemm_q8_tc_supported(w.n, w.k) &&
+        row_scales_.bytes() >= std::size_t(T) * 2 * sizeof(float)) {
         gemm_q8_tc(static_cast<const std::int8_t *>(w.data), w.scales, w.n, w.k, x, y, T, row_scales_.as<float>(), stream_);
         return;
     }

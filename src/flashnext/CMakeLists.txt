@@ -7,6 +7,7 @@ add_library(ninfer_flashnext STATIC
   cpu_experts.cpp
   reference.cpp
   engine.cpp
+  prefill.cpp
   cuda/gemv.cu
   cuda/ops.cu
   cuda/experts.cu

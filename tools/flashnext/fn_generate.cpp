@@ -4,15 +4,21 @@
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
 //                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot] [--mtp mtp.gguf [--draft K]]
+//                    [--no-lend] [--no-stream] [--stream-min N] [--chunk-max N] [--cpu-share-max N] [--dense-sgemm] [--profile] [--hash-state]
+//                    [--prefill-runs 0,2048:nostream,...]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
 // --compare-ref also runs the reference on the prompt in this process and prints, per layer, the
 // relative error of every intermediate both produce, then the agreement of the prompt's logits.
 // --routing-stats loads expert routing counts to choose the experts kept in VRAM, and saves the
-// updated counts at the end.
+// updated counts at the end. --prefill-chunk 0 (the default) sizes prompt chunks automatically. --hash-state
+// prints hashes of the recurrent state and of the logits after the prompt (bitwise comparisons between
+// runs). --prefill-runs repeats the prompt (after a reset) once per entry, chunk[:nostream], and reports each
+// (the expert cache keeps what earlier runs taught it).
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -89,6 +95,12 @@ std::int32_t argmax(const float * x, std::size_t n) {
     return std::int32_t(std::max_element(x, x + n) - x);  // first of equal maxima, like top_k
 }
 
+std::uint64_t fnv1a(const void * data, std::size_t n, std::uint64_t h = 1469598103934665603ull) {
+    const auto * p = static_cast<const unsigned char *>(data);
+    for (std::size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
 double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -125,7 +137,9 @@ int main(int argc, char ** argv) {
 static int run(int argc, char ** argv) {
     std::string model_path, tokens_arg, tokens_file, json_path, dump_dir;
     int n_gen = 16;
-    bool compare_ref = false, test_snapshot = false;
+    bool compare_ref = false, test_snapshot = false, hash_state = false;
+    std::string prefill_runs;
+    std::size_t pieces = 0;  // feed the prompt in forward() calls of this many tokens (as the server does), with a snapshot after each
     int n_draft = 2;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
@@ -155,6 +169,17 @@ static int run(int argc, char ** argv) {
         else if (a == "--pin") opt.pin_cpu_threads = true;
         else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--gpu-miss-permille") opt.gpu_miss_permille = std::stoi(next());
+        else if (a == "--no-lend") opt.prefill_lend = false;
+        else if (a == "--no-stream") opt.prefill_stream = false;
+        else if (a == "--stream-min") opt.prefill_stream_min = std::stoi(next());
+        else if (a == "--chunk-max") opt.prefill_chunk_max = std::stoi(next());
+        else if (a == "--cpu-share-max") opt.prefill_cpu_share_max = std::stoi(next());
+        else if (a == "--dense-tc") opt.prefill_dense_tc = true;
+        else if (a == "--dense-sgemm") opt.prefill_dense_tc = false;
+        else if (a == "--profile") opt.profile = true;
+        else if (a == "--hash-state") hash_state = true;
+        else if (a == "--prefill-runs") prefill_runs = next();
+        else if (a == "--pieces") pieces = std::stoul(next());
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -185,13 +210,60 @@ static int run(int argc, char ** argv) {
         engine.set_activation_hook([&](const std::string & name, int layer, std::int64_t, std::int64_t n_tokens, std::int64_t width,
                                        const float * data) { mine.add(name, layer, n_tokens, width, data); });
     }
+    if (!prefill_runs.empty()) {
+        // the same prompt once per entry "chunk[:nostream]", after a reset
+        std::stringstream ss(prefill_runs);
+        for (std::string item; std::getline(ss, item, ',');) {
+            const bool nostream = item.find(":nostream") != std::string::npos;
+            const int chunk = std::stoi(item.substr(0, item.find(':')));
+            engine.set_prefill(chunk, !nostream && opt.prefill_stream);
+            engine.reset();
+            const EngineStats s0 = engine.stats();
+            auto tr = std::chrono::steady_clock::now();
+            const std::vector<float> lg = engine.forward(prompt);
+            const double dt = seconds_since(tr);
+            const EngineStats & s1 = engine.stats();
+            std::printf("prefill run chunk %s: %zu tokens in %.2f s (%.1f tok/s); chunks of %d, %lld streamed of %lld; lent %.2f GiB; streamed %lld experts "
+                        "(%.1f GiB); refill %.0f ms; swaps %lld (%.0f ms); CPU experts %.2f s; logits hash %016llx\n",
+                        item.c_str(), prompt.size(), dt, double(prompt.size()) / dt, s1.last_chunk, (long long) (s1.streamed_chunks - s0.streamed_chunks),
+                        (long long) (s1.prompt_chunks - s0.prompt_chunks), s1.lent_gib, (long long) (s1.streamed_experts - s0.streamed_experts),
+                        s1.streamed_gib - s0.streamed_gib, s1.refill_ms - s0.refill_ms, (long long) (s1.cache_swaps - s0.cache_swaps),
+                        s1.cache_swap_ms - s0.cache_swap_ms, (s1.cpu_experts_ms - s0.cpu_experts_ms) / 1e3,
+                        (unsigned long long) fnv1a(lg.data(), lg.size() * sizeof(float)));
+        }
+        engine.reset();
+        engine.set_prefill(opt.prefill_chunk, opt.prefill_stream);
+    }
+    const EngineStats s0 = engine.stats();
     auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> logits = engine.forward(prompt);
+    std::vector<float> logits;
+    if (pieces) {
+        for (std::size_t i = 0; i < prompt.size(); i += pieces) {
+            const std::size_t e = std::min(prompt.size(), i + pieces);
+            logits = engine.forward(std::vector<std::int32_t>(prompt.begin() + std::ptrdiff_t(i), prompt.begin() + std::ptrdiff_t(e)));
+            if (e < prompt.size()) (void) engine.snapshot();  // the server snapshots at prefix frontiers
+        }
+    } else {
+        logits = engine.forward(prompt);
+    }
     const double t_prefill = seconds_since(t0);
     engine.set_activation_hook(nullptr);
-    std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s; %lld cached experts swapped (%.2f s); CPU experts %.2f s\n", prompt.size(),
-                t_prefill, double(prompt.size()) / t_prefill, capture ? " with intermediates captured" : "", (long long) engine.stats().cache_swaps,
-                engine.stats().cache_swap_ms / 1e3, engine.stats().cpu_experts_ms / 1e3);
+    {
+        const EngineStats & s1 = engine.stats();
+        std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s; %lld cached experts swapped (%.2f s); CPU experts %.2f s\n", prompt.size(),
+                    t_prefill, double(prompt.size()) / t_prefill, capture ? " with intermediates captured" : "",
+                    (long long) (s1.cache_swaps - s0.cache_swaps), (s1.cache_swap_ms - s0.cache_swap_ms) / 1e3, (s1.cpu_experts_ms - s0.cpu_experts_ms) / 1e3);
+        std::printf("prefill: chunks of %d tokens, %lld chunks (%lld streamed); lent %.2f GiB; streamed %lld experts (%.1f GiB), %lld on the CPU; "
+                    "refill %.0f ms; pinned layers %d\n",
+                    s1.last_chunk, (long long) (s1.prompt_chunks - s0.prompt_chunks), (long long) (s1.streamed_chunks - s0.streamed_chunks), s1.lent_gib,
+                    (long long) (s1.streamed_experts - s0.streamed_experts), s1.streamed_gib - s0.streamed_gib,
+                    (long long) (s1.cpu_share_experts - s0.cpu_share_experts), s1.refill_ms - s0.refill_ms, s1.pinned_layers);
+    }
+    if (hash_state) {
+        const EngineSnapshot snap = engine.snapshot();
+        std::printf("state hash %016llx (%zu bytes), logits hash %016llx\n", (unsigned long long) fnv1a(snap.state.data(), snap.state.size()),
+                    snap.state.size(), (unsigned long long) fnv1a(logits.data(), logits.size() * sizeof(float)));
+    }
 
     if (!dump_dir.empty()) {
         fs::create_directories(dump_dir);

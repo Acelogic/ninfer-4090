@@ -4,8 +4,13 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <fstream>
+#include <future>
 #include <initializer_list>
 #include <stdexcept>
 #include <thread>
@@ -23,12 +28,14 @@
 #endif
 
 #include "flashnext/cpu_experts.h"
+#include "flashnext/cuda/expert_stream.h"
 #include "flashnext/cuda/experts.h"
 #include "flashnext/cuda/experts_batch.h"
 #include "flashnext/cuda/gemm.h"
 #include "flashnext/cuda/gemv.h"
 #include "flashnext/cuda/ops.h"
 #include "flashnext/cuda/qsa.h"
+#include "flashnext/prefill.h"
 #include "flashnext/quants.h"
 #include "flashnext/reference.h"
 
@@ -147,8 +154,10 @@ struct Engine::Impl {
     std::unique_ptr<Pinned<std::int32_t>> h_ids;
     std::unique_ptr<Pinned<std::uint8_t>> h_oncpu;
     fc::DeviceBuffer qi, cells, n_cells, sel_work;  // QSA indexer queries and selections
-    // raw indexer keys are needed only until their block of 4 is complete: a ring of a step's worth
-    std::int64_t raw_ring() const { return std::max<std::int64_t>(fc::kMaxTokens, opt.prefill_chunk) + 2 * fc::kQsaRatio; }
+    // raw indexer keys are needed only until their block of 4 is complete: a ring of a batch's worth (prompt
+    // chunks store them kQsaBatch tokens at a time, see qsa_index)
+    static constexpr int kQsaBatch = 256;
+    std::int64_t raw_ring() const { return std::max<std::int64_t>(fc::kMaxTokens, kQsaBatch) + 2 * fc::kQsaRatio; }
     std::unique_ptr<fc::Gemm> gemm;
 
     // the token at every position whose keys and values are in the caches; the first n_past are the
@@ -242,6 +251,8 @@ struct Engine::Impl {
         recent.assign(counts.size(), 0.0);
         if (!opt.routing_stats.empty()) load_routing(opt.routing_stats);
         fill_cache();
+        setup_streaming();
+        prof.enable(opt.profile || std::getenv("NINFER_FN_PROFILE") != nullptr);
         release_experts();  // CpuExperts and the VRAM cache have their own copies now
         warm_up_cpu_experts();
         // every token reads 16 random rows of the 27 GB PLE table: warm the OS file cache in the
@@ -329,34 +340,9 @@ struct Engine::Impl {
         if (swaps.empty()) return;
         const auto t_adapt = clk::now();
         check(cudaStreamSynchronize(stream), "adapt");
-        std::size_t slot_max = 0;
-        for (const LayerCache & C : cache) slot_max = std::max(slot_max, C.lay.slot_bytes);
-        if (!swap_staging && images.empty()) swap_staging = std::make_unique<Pinned<std::uint8_t>>(slot_max * kSwapBatch);
-        for (std::size_t b0 = 0; b0 < swaps.size(); b0 += kSwapBatch) {
-            const std::size_t n = std::min<std::size_t>(kSwapBatch, swaps.size() - b0);
-            if (images.empty()) {
-                std::vector<std::thread> workers;
-                const std::size_t nt = std::min<std::size_t>(16, n);
-                for (std::size_t t = 0; t < nt; ++t)
-                    workers.emplace_back([&, t] {
-                        for (std::size_t j = t; j < n; j += nt) {
-                            const Swap & sw = swaps[b0 + j];
-                            pack_slot(sw.il, sw.in, swap_staging->get() + j * slot_max);
-                        }
-                    });
-                for (auto & w : workers) w.join();
-            }
-            for (std::size_t j = 0; j < n; ++j) {
-                const Swap & sw = swaps[b0 + j];
-                LayerCache & C = cache[std::size_t(sw.il)];
-                const std::uint8_t * src = images.empty() ? swap_staging->get() + j * slot_max
-                                                          : images[std::size_t(sw.il)] + std::size_t(sw.in) * C.lay.slot_bytes;
-                check(cudaMemcpyAsync(C.pool.as<std::uint8_t>() + std::size_t(sw.slot) * C.lay.slot_bytes, src, C.lay.slot_bytes,
-                                      cudaMemcpyHostToDevice, stream),
-                      "expert swap");
-            }
-            check(cudaStreamSynchronize(stream), "expert swap");
-        }
+        std::vector<SlotLoad> loads;
+        for (const Swap & sw : swaps) loads.push_back({sw.il, sw.in, sw.slot});
+        load_slots(loads);
         std::vector<bool> touched(std::size_t(cfg.n_layer), false);
         for (const Swap & sw : swaps) {
             LayerCache & C = cache[std::size_t(sw.il)];
@@ -364,11 +350,7 @@ struct Engine::Impl {
             C.map[std::size_t(sw.in)] = sw.slot;
             touched[std::size_t(sw.il)] = true;
         }
-        for (int il = 0; il < cfg.n_layer; ++il)
-            if (touched[std::size_t(il)]) {
-                LayerCache & C = cache[std::size_t(il)];
-                check(cudaMemcpy(C.dmap.get(), C.map.data(), C.dmap.bytes(), cudaMemcpyHostToDevice), "expert map");
-            }
+        upload_maps(touched);
         stats.cache_swaps += std::int64_t(swaps.size());
         stats.cache_swap_ms += std::chrono::duration<double, std::milli>(clk::now() - t_adapt).count();
     }
@@ -551,9 +533,13 @@ struct Engine::Impl {
         if (rows_valid <= 0) return;
         const std::int64_t end = rows_pos0 + rows_valid;
         if (M.pos < rows_pos0) M.pos = rows_pos0;  // rows lost (e.g. after restore): a gap in the MTP cache
-        const int n = int(end - M.pos);
+        // a long prompt: drafts attend to the last kQsaWidth positions at most, so the positions before
+        // mtp_skip_below are never read (their hidden rows are in this step, so the next pair still has its input)
+        if (M.pos < mtp_skip_below) M.pos = std::min(mtp_skip_below, end);
         const std::size_t hb = fc::kHcd * sizeof(float);
-        if (n > 0) {
+        for (bool first = true; M.pos < end; first = false) {
+            const int n = int(std::min<std::int64_t>(end - M.pos, cap));  // the MTP buffers hold cap tokens
+            if (!first) check(cudaStreamSynchronize(stream), "MTP");  // h_e is refilled below
             for (int i = 0; i < n; ++i) {
                 const std::int64_t q = M.pos + i;
                 const float * src = q - 1 < rows_pos0 ? M.pending_h.as<float>() : res.as<float>() + std::size_t(q - 1 - rows_pos0) * fc::kHcd;
@@ -561,7 +547,7 @@ struct Engine::Impl {
                 mtp_embed(i, history[std::size_t(q)]);
             }
             mtp_pass(n, M.pos, false);
-            M.pos = end;
+            M.pos += n;
         }
         // the next pair starts from the hidden state of the last kept position
         check(cudaMemcpyAsync(M.pending_h.get(), res.as<float>() + std::size_t(rows_valid - 1) * fc::kHcd, hb, cudaMemcpyDeviceToDevice, stream),
@@ -572,6 +558,7 @@ struct Engine::Impl {
 
     std::vector<std::int32_t> draft(std::int32_t next, int k) {
         if (!mtp) throw std::runtime_error("engine: no MTP head loaded");
+        end_prompt(true);  // the draft pass (and its graph) uses the permanent buffers
         if (next < 0 || next >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
         mtp_catchup();
         Mtp & M = *mtp;
@@ -705,6 +692,13 @@ struct Engine::Impl {
         std::size_t most = 0;
         for (int il = 0; il < nl; ++il) most = std::max(most, chosen[std::size_t(il)].size() * cache[std::size_t(il)].lay.slot_bytes);
         std::unique_ptr<Pinned<std::uint8_t>> staging = most ? std::make_unique<Pinned<std::uint8_t>>(most) : nullptr;
+        // one allocation for every pool, layer after layer: a prompt can borrow its tail (lend())
+        pool_off.assign(std::size_t(nl), 0);
+        for (int il = 0; il < nl; ++il) {
+            pool_off[std::size_t(il)] = arena_bytes;
+            arena_bytes += (chosen[std::size_t(il)].size() * cache[std::size_t(il)].lay.slot_bytes + 255) / 256 * 256;
+        }
+        if (arena_bytes) cache_arena = fc::DeviceBuffer(arena_bytes);
         for (int il = 0; il < nl; ++il) {
             LayerCache & C = cache[std::size_t(il)];
             std::vector<int> & list = chosen[std::size_t(il)];
@@ -718,7 +712,7 @@ struct Engine::Impl {
                             pack_slot(il, list[j], staging->get() + j * C.lay.slot_bytes);
                     });
                 for (auto & th : pool) th.join();
-                C.pool = fc::DeviceBuffer(list.size() * C.lay.slot_bytes);
+                C.pool = fc::DeviceBuffer::view(cache_arena.as<std::uint8_t>() + pool_off[std::size_t(il)], list.size() * C.lay.slot_bytes);
                 check(cudaMemcpy(C.pool.get(), staging->get(), C.pool.bytes(), cudaMemcpyHostToDevice), "expert cache");
                 for (std::size_t j = 0; j < list.size(); ++j) C.map[std::size_t(list[j])] = std::int32_t(j);
             }
@@ -729,6 +723,12 @@ struct Engine::Impl {
     }
     ~Impl() {
         if (stream) cudaStreamSynchronize(stream);
+        if (copy_stream) cudaStreamSynchronize(copy_stream);
+        if (bound_T) {  // give the permanent buffers back (no refill: everything goes)
+            std::vector<Act> acts = chunk_buffers(bound_T);
+            for (std::size_t i = 0; i < acts.size() && i < saved_acts.size(); ++i) *acts[i].b = std::move(saved_acts[i]);
+        }
+        teardown_streaming();
         for (cudaGraphExec_t g : graphs)
             if (g) cudaGraphExecDestroy(g);
         if (link_h) cudaFreeHost(link_h);
@@ -754,7 +754,8 @@ struct Engine::Impl {
                                       cfg.ple_conv_kernel == fc::kPleKernel && cfg.ple_ngram == fc::kPleDilation),
                 "PLE");
         if (opt.max_ctx < 1 || opt.max_ctx > (std::int64_t(1) << 20)) throw std::runtime_error("engine: max_ctx out of range");
-        if (opt.prefill_chunk < 1 || opt.prefill_chunk > 8192) throw std::runtime_error("engine: prefill_chunk out of range");
+        if (opt.prefill_chunk < 0 || opt.prefill_chunk > 8192) throw std::runtime_error("engine: prefill_chunk out of range");
+        if (opt.prefill_chunk_max < 256 || opt.prefill_chunk_max > 8192) throw std::runtime_error("engine: prefill_chunk_max out of range");
     }
 
     fc::DeviceWeight W(const std::string & name, int k, int n) const {
@@ -845,21 +846,19 @@ struct Engine::Impl {
     }
 
     void allocate() {
-        cap = std::max(fc::kMaxTokens, opt.prefill_chunk);
+        // the permanent buffers hold cap tokens; bigger prompt chunks borrow theirs from the expert cache
+        // (prefill_lend; without it they are allocated for prefill_chunk tokens, as before)
+        const int chunk = opt.prefill_chunk > 0 ? opt.prefill_chunk : kBaseCap;
+        cap = std::max(fc::kMaxTokens, opt.prefill_lend ? std::min(chunk, kBaseCap) : chunk);
         const std::size_t T = std::size_t(cap), f = sizeof(float);
-        h_x = std::make_unique<Pinned<float>>(T * fc::kEmbd);
-        h_ple = std::make_unique<Pinned<float>>(T * fc::kEmbd);
-        h_mixed = std::make_unique<Pinned<float>>(T * fc::kEmbd);
-        h_moe = std::make_unique<Pinned<float>>(T * fc::kEmbd);
-        h_w = std::make_unique<Pinned<float>>(T * fc::kUsed);
-        h_ids = std::make_unique<Pinned<std::int32_t>>(T * fc::kUsed);
-        h_oncpu = std::make_unique<Pinned<std::uint8_t>>(T * fc::kUsed);
+        ensure_host(opt.prefill_lend ? std::max(cap, opt.prefill_chunk_max) : cap);
         qi = fc::DeviceBuffer(T * fc::kQsaHeads * fc::kQsaDim * f);
         cells = fc::DeviceBuffer(T * fc::kQsaWidth * sizeof(std::int32_t));
         n_cells = fc::DeviceBuffer(T * sizeof(std::int32_t));
-        sel_work = fc::DeviceBuffer(fc::qsa_select_work_bytes(int(T), opt.max_ctx));
+        sel_work = fc::DeviceBuffer(fc::qsa_select_work_bytes(std::min(cap, kQsaBatch), opt.max_ctx));
         // the largest dense matrix multiplied in batches: the attention query projection
         gemm = std::make_unique<fc::Gemm>(std::size_t(2) * fc::kHeads * fc::kHeadDim * fc::kEmbd, stream);
+        gemm->set_tensor_cores(opt.prefill_dense_tc);
         auto buf = [&](std::size_t floats) { return fc::DeviceBuffer(T * floats * f); };
         res = buf(fc::kHcd);
         x = buf(fc::kEmbd);
@@ -1027,11 +1026,15 @@ struct Engine::Impl {
     void hc_mix(const fc::DeviceBuffer & norm, const fc::DeviceWeight & down, const fc::DeviceWeight & up, const fc::DeviceWeight * inj,
                 int T, int t0 = 0, const float * src = nullptr) {
         fc::hc_norm((src ? src : res.as<float>()) + std::size_t(t0) * fc::kHcd, norm.as<float>(), xn.as<float>(), T, cfg.rms_eps, stream);
+        prof_mark("hc_norm");
         if (inj) linear_multi({{&down, &lo}, {inj, &inject}}, xn, T);
         else linear(down, xn, lo, T);
+        prof_mark("hc_down");
         fc::hc_lowrank_act(lo.as<float>(), T * fc::kHcRank, stream);
         linear(up, lo, gate, T);
+        prof_mark("hc_up");
         fc::hc_gate_mean(xn.as<float>(), gate.as<float>(), mixed.as<float>(), T, stream);
+        prof_mark("hc_gate");
     }
 
     void ple_rows(std::int64_t pos, std::int32_t * idx) const {
@@ -1055,19 +1058,28 @@ struct Engine::Impl {
         }
     }
 
-    // host part of PLE: the hashed n-gram rows of the step's tokens, dequantized into h_ple
-    void ple_host(int T) {
+    // host part of PLE: the hashed n-gram rows of T tokens at pos0.., dequantized into dst
+    void ple_host(int T, std::int64_t pos0, float * dst) const {
         const std::size_t rb = row_bytes(ple_table->type, fc::kPleHeadDim);
         const std::int64_t n_rows = ple_table->shape[1];
         for (int t = 0; t < T; ++t) {
             std::int32_t rows[fc::kPleHeads];
-            ple_rows(n_past + t, rows);
+            ple_rows(pos0 + t, rows);
             for (int h = 0; h < fc::kPleHeads; ++h) {
                 if (rows[h] < 0 || rows[h] >= n_rows) throw std::runtime_error("engine: PLE row out of range");
-                dequantize_row(ple_table->type, ple_table->data + std::size_t(rows[h]) * rb,
-                               h_ple->get() + std::size_t(t) * fc::kEmbd + h * fc::kPleHeadDim, fc::kPleHeadDim);
+                dequantize_row(ple_table->type, ple_table->data + std::size_t(rows[h]) * rb, dst + std::size_t(t) * fc::kEmbd + h * fc::kPleHeadDim,
+                               fc::kPleHeadDim);
             }
         }
+    }
+
+    // The host inputs of T tokens at pos0.. (history already holds them): embeddings into hx, PLE rows into hple.
+    // Reads only the history and the model, so it can run on a thread while the GPU runs another step.
+    void prepare_host(const std::int32_t * tokens, int T, std::int64_t pos0, float * hx, float * hple) const {
+        const std::size_t rb = row_bytes(tok_embd->type, fc::kEmbd);
+        for (int t = 0; t < T; ++t)
+            dequantize_row(tok_embd->type, tok_embd->data + std::size_t(tokens[t]) * rb, hx + std::size_t(t) * fc::kEmbd, fc::kEmbd);
+        if (ple_table) ple_host(T, pos0, hple);
     }
 
     void run_ple(const Layer & L, int il, int T) {
@@ -1086,14 +1098,17 @@ struct Engine::Impl {
 
     void deltanet(Layer & L, int il, int T) {
         linear_multi({{&L.wqkv, &qkv}, {&L.wgate, &z}, {&L.ssm_beta, &beta}, {&L.ssm_alpha, &alpha}}, mixed, T);
+        prof_mark("dn_proj");
         emit("linear_attn_qkv_mixed", il, qkv.get(), n_past, T, fc::kDnConvDim);
         emit("z", il, z.get(), n_past, T, fc::kDnVDim);
         const bool snap = mtp && T > 1 && T <= fc::kMaxTokens;  // keep per-token states for rollback()
         fc::dn_conv(qkv.as<float>(), L.conv_state.as<float>(), L.conv1d.as<float>(), conv.as<float>(), T, cfg.rms_eps, stream,
                     snap ? L.conv_snap.as<float>() : nullptr);
+        prof_mark("dn_conv");
         fc::dn_recurrence(conv.as<float>(), z.as<float>(), beta.as<float>(), alpha.as<float>(), L.dt.as<float>(), L.a.as<float>(),
                           L.ssm_norm.as<float>(), L.S.as<float>(), dn_out.as<float>(), T, cfg.rms_eps, stream,
                           snap ? L.S_snap.as<float>() : nullptr);
+        prof_mark("dn_recurrence");
         emit("final_output", il, dn_out.get(), n_past, T, fc::kDnVDim);
         linear(L.ssm_out, dn_out, out, T);
     }
@@ -1108,12 +1123,7 @@ struct Engine::Impl {
         emit("indexer_k_raw", il, kraw.get(), n_past, T, fc::kIdxDim);
         // QSA: block keys and selections are kept from the first token on, so that past 2051 tokens
         // each query attends to its own 2051 cells; below that the selection is every earlier cell
-        fc::store_rows(kraw.as<float>(), L.idx_raw.as<float>(), pos, fc::kIdxDim, T, raw_ring(), stream);
-        fc::qsa_update_blocks(L.idx_raw.as<float>(), raw_ring(), L.idx_k_norm.as<float>(), rope_freq.as<double>(), L.blocks.as<float>(), pos,
-                              T, cfg.rms_eps, stream);
-        fc::qsa_query(qi.as<float>(), L.idx_q_norm.as<float>(), rope_freq.as<double>(), pos, T, cfg.rms_eps, stream);
-        fc::qsa_select(qi.as<float>(), L.blocks.as<float>(), pos, T, opt.max_ctx, sel_work.get(), cells.as<std::int32_t>(),
-                       n_cells.as<std::int32_t>(), stream);
+        qsa_index(L, T);
         fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
                         n_cells.as<std::int32_t>(), T, cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
         emit("attn_gated", il, att.get(), n_past, T, fc::kHeads * fc::kHeadDim);
@@ -1198,6 +1208,7 @@ struct Engine::Impl {
 
     void ffn(Layer & L, int il, int T) {
         if (graph_mode) return ffn_graph(L, il, T);
+        if (stream_chunk && host_pinned[std::size_t(il)]) return ffn_stream(L, il, T);
         const std::size_t xe = std::size_t(T) * fc::kEmbd * sizeof(float), ke = std::size_t(T) * fc::kUsed;
         linear(L.router, mixed, rlogits, T);
         emit("ffn_moe_logits", il, rlogits.get(), n_past, T, fc::kExperts);
@@ -1206,6 +1217,7 @@ struct Engine::Impl {
         check(cudaMemcpyAsync(h_w->get(), wts.get(), ke * sizeof(float), cudaMemcpyDeviceToHost, stream), "weights");
         check(cudaMemcpyAsync(h_mixed->get(), mixed.get(), xe, cudaMemcpyDeviceToHost, stream), "ffn input");
         check(cudaEventRecord(ev_router, stream), "event");
+        prof_mark("router");
         // while the CPU computes the experts that are not cached, the GPU computes the cached ones
         // and the shared expert
         LayerCache & C = cache[std::size_t(il)];
@@ -1222,7 +1234,10 @@ struct Engine::Impl {
         fc::swiglu(sh_g.as<float>(), sh_u.as<float>(), sh_h.as<float>(), T * fc::kFfShared, stream);
         linear(L.sh_down, sh_h, sd, T);
         linear(L.sh_gate_inp, mixed, sg, T);
+        prof_mark("experts_cached+shared");
+        const auto w0 = clk::now();
         check(cudaEventSynchronize(ev_router), "router");
+        prof.add_host("router_wait", std::chrono::duration<double, std::milli>(clk::now() - w0).count());
         if (hook) {
             std::vector<float> fid(ke);
             for (std::size_t i = 0; i < ke; ++i) fid[i] = float(h_ids->get()[i]);
@@ -1259,20 +1274,24 @@ struct Engine::Impl {
         }
         if (batched) fc::moe_combine_sum(gpu_sum.as<float>(), moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
         else fc::moe_combine(ypairs.as<float>(), nullptr, moe.as<float>(), sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
+        prof_mark("experts_cpu+combine");
     }
 
     // Host work before a step: token history, embeddings, PLE rows, and the step record.
     void prepare(const std::int32_t * tokens, int T) {
         const std::int64_t pos0 = n_past;
         if (pos0 + T > opt.max_ctx) throw std::runtime_error("engine: context full (max_ctx " + std::to_string(opt.max_ctx) + ")");
-        for (int t = 0; t < T; ++t)
-            if (tokens[t] < 0 || tokens[t] >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
-        if (history.size() < std::size_t(pos0 + T)) history.resize(std::size_t(pos0 + T));
-        for (int t = 0; t < T; ++t) history[std::size_t(pos0 + t)] = tokens[t];
-        const std::size_t rb = row_bytes(tok_embd->type, fc::kEmbd);
-        for (int t = 0; t < T; ++t)
-            dequantize_row(tok_embd->type, tok_embd->data + std::size_t(tokens[t]) * rb, h_x->get() + std::size_t(t) * fc::kEmbd, fc::kEmbd);
-        if (ple_table) ple_host(T);
+        if (!prepared_ahead) {  // else prompt() prepared this chunk on a thread
+            for (int t = 0; t < T; ++t)
+                if (tokens[t] < 0 || tokens[t] >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
+            if (history.size() < std::size_t(pos0 + T)) history.resize(std::size_t(pos0 + T));
+            for (int t = 0; t < T; ++t) history[std::size_t(pos0 + t)] = tokens[t];
+            ensure_host(T);
+            const auto t0 = clk::now();
+            prepare_host(tokens, T, pos0, h_x->get(), h_ple->get());
+            if (T > fc::kMaxTokens) prof.add_host("prepare (embeddings, PLE rows)", std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+        }
+        prepared_ahead = false;
         h_step.get()[0] = pos0;
         h_step.get()[1] = ++seq;
     }
@@ -1283,21 +1302,29 @@ struct Engine::Impl {
         const std::int64_t pos0 = n_past;
         check(cudaMemcpyAsync(d_step.get(), h_step.get(), 2 * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "step");
         check(cudaMemcpyAsync(x.get(), h_x->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "embed");
+        if (!graph_mode) upload_batch_positions(T);
         emit("model.input_embed", -1, x.get(), pos0, T, fc::kEmbd);
         fc::hc_expand(x.as<float>(), res.as<float>(), T, stream);
+        prof_mark("embed");
 
         for (int il = 0; il < cfg.n_layer; ++il) {
             Layer & L = layers[std::size_t(il)];
-            if (L.ple) run_ple(L, il, T);
+            if (L.ple) {
+                run_ple(L, il, T);
+                prof_mark("ple");
+            }
             hc_mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, &L.hc_attn_inject, T);
             emit("hc_attn_mixed", il, mixed.get(), pos0, T, fc::kEmbd);
+            prof_mark("hc");
             if (L.recurrent) deltanet(L, il, T);
             else attention(L, il, T);
             emit(L.recurrent ? "linear_attn_out" : "attn_output", il, out.get(), pos0, T, fc::kEmbd);
+            prof_mark(L.recurrent ? "deltanet" : "attention");
             fc::hc_combine(res.as<float>(), out.as<float>(), inject.as<float>(), T, stream);
 
             hc_mix(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, &L.hc_ffn_inject, T);
             emit("hc_ffn_mixed", il, mixed.get(), pos0, T, fc::kEmbd);
+            prof_mark("hc");
             ffn(L, il, T);
             emit("ffn_out", il, out.get(), pos0, T, fc::kEmbd);
             fc::hc_combine(res.as<float>(), out.as<float>(), inject.as<float>(), T, stream);
@@ -1310,6 +1337,7 @@ struct Engine::Impl {
         check(cudaMemcpyAsync(h_logits->get(), logits.get(), std::size_t(head_rows) * cfg.n_vocab * sizeof(float), cudaMemcpyDeviceToHost,
                               stream),
               "logits");
+        prof_mark("head");
     }
 
     cudaGraphExec_t graph_for(int T) {
@@ -1335,13 +1363,16 @@ struct Engine::Impl {
 
     // T tokens (1..cap; all_logits only up to kMaxTokens); returns logits of the last token or of all T
     std::vector<float> step(const std::int32_t * tokens, int T, bool all_logits) {
+        const bool profiled = prof.on() && T > fc::kMaxTokens;
+        if (profiled) prof.begin(stream);
         mtp_catchup();  // the MTP layer consumes the previous step's hidden rows before res is overwritten
+        if (profiled) prof.mark("mtp_catchup", stream);
         const std::int64_t pos0 = n_past;
-        if (T < 1 || T > cap || (all_logits && T > fc::kMaxTokens)) throw std::runtime_error("engine: bad step size");
+        if (T < 1 || T > max_step() || (all_logits && T > fc::kMaxTokens)) throw std::runtime_error("engine: bad step size");
         prepare(tokens, T);
         decay(T);
         int head_rows = all_logits ? T : 1;
-        if (opt.cuda_graphs && !hook && T <= fc::kMaxTokens) {
+        if (opt.cuda_graphs && !hook && T <= fc::kMaxTokens && !bound_T) {
             head_rows = T;
             cudaGraphExec_t g = graph_for(T);
             check(cudaGraphLaunch(g, stream), "graph launch");
@@ -1352,8 +1383,14 @@ struct Engine::Impl {
             check(cudaMemcpy(&err, d_error.get(), sizeof(int), cudaMemcpyDeviceToHost), "error flag");
             if (err) throw std::runtime_error("engine: the GPU timed out waiting for the CPU experts");
         } else {
+            if (stream_chunk) {
+                plan_stream(T);
+                issue_copies();  // the first layers' experts copy while the GPU starts on the chunk
+            }
             enqueue(T, head_rows);
             check(cudaStreamSynchronize(stream), "step");
+            if (profiled) prof.end_chunk();
+            if (stream_chunk) finish_stream_chunk(T);
         }
         const int n_out = all_logits ? T : 1, t_first = T - n_out, skip = head_rows - n_out;
         const float * src = h_logits->get() + std::size_t(skip) * cfg.n_vocab;
@@ -1369,6 +1406,856 @@ struct Engine::Impl {
         last_T = T;
         return lg;
     }
+    // ---------------------------------------------------------------------------------------------
+    // Prompt processing (prefill.h): chunk buffers lent by the expert cache, every expert of big chunks on
+    // the GPU with the uncached ones streamed from the CPU's pinned copy, and the per-stage profile.
+
+    static constexpr int kBaseCap = 512;  // permanent activation buffers hold this many tokens; bigger chunks borrow
+    static constexpr int kEvents = 256;   // ring events, reused round robin (far fewer groups are ever in flight)
+    std::size_t ring_target = std::size_t(640) << 20;  // bytes of the streaming ring (NINFER_FN_RING_MB)
+    int group_override = 0;                             // experts per streamed group (NINFER_FN_GROUP; 0: by chunk size)
+    static constexpr int kRefillBatch = 8;                              // experts per refill/swap conversion batch
+
+    fc::DeviceBuffer cache_arena;              // every layer's expert pool is a view into it, layer after layer
+    std::vector<std::size_t> pool_off;         // [layer] offset of the pool in the arena
+    std::size_t arena_bytes = 0;
+    std::size_t lent_bytes = 0;                // the arena's tail [arena_bytes - lent_bytes, arena_bytes) is lent
+    std::vector<std::vector<int>> lent_slots;  // [layer] slots in the lent tail (their experts were dropped)
+    int bound_T = 0;                           // tokens the bound (lent) chunk buffers hold; 0: the permanent ones
+    std::vector<fc::DeviceBuffer> saved_acts;  // the permanent buffers while lent views are bound
+    std::uint8_t * ring = nullptr;             // streaming ring, conversion slots and KV staging, in the lent region
+    std::size_t ring_bytes = 0;
+    std::uint8_t * conv_area = nullptr;        // conversion slots of the streamed experts
+    int conv_slots = 0;
+    std::uint8_t * kv_stage = nullptr;
+    std::size_t kv_stage_reserved = 0;
+    // the CPU's resident expert copy, registered with the driver per layer (the streamable layers)
+    std::vector<CpuExperts::HostLayer> host;
+    std::vector<fc::HostExpertFormat> host_fmt;
+    std::vector<char> host_pinned;
+    std::size_t blob_max = 0, slot_max = 0;
+    cudaStream_t copy_stream = nullptr;
+    std::vector<cudaEvent_t> ev_copied, ev_released;
+    fc::DeviceBuffer d_keymap, d_ptrs, refill_staging, d_pos;
+    std::unique_ptr<Pinned<std::int32_t>> h_keymap;
+    std::unique_ptr<Pinned<std::uint64_t>> h_ptrs;
+    std::unique_ptr<Pinned<std::int64_t>> h_pos;
+    std::unique_ptr<Pinned<std::int32_t>> h_ids_all;  // [layer][T*10]: a streamed chunk's routing, for the cache's statistics
+    std::size_t ids_all_cap = 0;
+    std::size_t host_cap = 0;                          // tokens the step's pinned host buffers hold
+    // the current chunk's stream plan
+    bool stream_chunk = false;
+    std::vector<StreamLayer> s_layers;
+    std::vector<StreamGroup> s_groups;
+    int s_next = 0, s_enqueued = 0;
+    std::deque<int> s_inflight;
+    std::int64_t s_hits = 0;
+    std::int64_t mtp_skip_below = 0;  // the MTP catch-up of a prompt starts here (drafts never look further back)
+    // the CPU's share of a streamed chunk: a worker thread computes, per layer, the pairs of the experts that
+    // plan_stream left to it (key -1), while the GPU computes the rest; the stream waits for it in a host function
+    struct ShareWait {
+        std::atomic<std::int64_t> * done;
+        std::int64_t want;
+    };
+    std::thread share_thread;
+    std::mutex share_mu;
+    std::condition_variable share_cv;
+    bool share_stop = false;
+    std::int64_t share_chunk = 0;                     // id of the current chunk (the flags count chunks)
+    std::unique_ptr<std::atomic<std::int64_t>[]> share_done;  // [layer] the last chunk whose CPU share is done
+    std::vector<ShareWait> share_wait;
+    std::vector<cudaEvent_t> ev_route;                // [layer] the routing and FFN input are on the host
+    std::atomic<bool> share_error{false};
+    ShareModel share_model;
+    struct ShareItem {
+        int il, T;
+        std::int64_t chunk;
+    };
+    std::deque<ShareItem> share_items;
+    std::string share_error_text;
+    std::atomic<std::int64_t> share_cpu_us{0};        // the worker's CPU time, read after the chunk
+    // the next prompt chunk's host inputs, prepared on a thread while the current chunk runs (prompt())
+    std::unique_ptr<Pinned<float>> h_x_alt, h_ple_alt;
+    bool prepared_ahead = false;
+    StageProfile prof;
+
+    void prof_mark(const char * stage) {
+        if (prof.on() && !graph_mode) prof.mark(stage, stream);
+    }
+
+    int max_step() const { return bound_T ? bound_T : cap; }
+
+    // Grows the pinned host buffers of a step to T tokens. allocate() sizes them for the largest chunk up front:
+    // the decode graphs copy from them, so growing them later means capturing those graphs again.
+    void ensure_host(int T) {
+        if (std::size_t(T) <= host_cap) return;
+        if (stream) cudaStreamSynchronize(stream);
+        for (cudaGraphExec_t & g : graphs)
+            if (g) {
+                cudaGraphExecDestroy(g);
+                g = nullptr;
+            }
+        const std::size_t n = std::size_t(T);
+        h_x = std::make_unique<Pinned<float>>(n * fc::kEmbd);
+        h_ple = std::make_unique<Pinned<float>>(n * fc::kEmbd);
+        h_mixed = std::make_unique<Pinned<float>>(n * fc::kEmbd);
+        h_moe = std::make_unique<Pinned<float>>(n * fc::kEmbd);
+        h_w = std::make_unique<Pinned<float>>(n * fc::kUsed);
+        h_ids = std::make_unique<Pinned<std::int32_t>>(n * fc::kUsed);
+        h_oncpu = std::make_unique<Pinned<std::uint8_t>>(n * fc::kUsed);
+        host_cap = n;
+    }
+
+    // Registers every layer's CPU expert copy with the driver, so that prompt chunks can copy experts from it
+    // by DMA. Windows refuses some registrations when memory is short: those layers keep the hybrid path.
+    void setup_streaming() {
+        const int nl = cfg.n_layer;
+        host.assign(std::size_t(nl), {});
+        host_fmt.assign(std::size_t(nl), {});
+        host_pinned.assign(std::size_t(nl), 0);
+        lent_slots.assign(std::size_t(nl), {});
+        check(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking), "copy stream");
+        for (int i = 0; i < kEvents; ++i) {
+            cudaEvent_t a = nullptr, b = nullptr;
+            check(cudaEventCreateWithFlags(&a, cudaEventDisableTiming), "event");
+            check(cudaEventCreateWithFlags(&b, cudaEventDisableTiming), "event");
+            ev_copied.push_back(a);
+            ev_released.push_back(b);
+        }
+        d_keymap = fc::DeviceBuffer(std::size_t(nl) * fc::kExperts * sizeof(std::int32_t));
+        d_ptrs = fc::DeviceBuffer(std::size_t(nl) * fc::kExperts * sizeof(std::uint64_t));
+        h_keymap = std::make_unique<Pinned<std::int32_t>>(std::size_t(nl) * fc::kExperts);
+        h_ptrs = std::make_unique<Pinned<std::uint64_t>>(std::size_t(nl) * fc::kExperts);
+        h_pos = std::make_unique<Pinned<std::int64_t>>(64);
+        d_pos = fc::DeviceBuffer(64 * sizeof(std::int64_t));
+        share_done = std::make_unique<std::atomic<std::int64_t>[]>(std::size_t(nl));
+        for (int il = 0; il < nl; ++il) share_done[std::size_t(il)].store(0);
+        share_wait.assign(std::size_t(nl), {nullptr, 0});
+        for (int il = 0; il < nl; ++il) {
+            cudaEvent_t e = nullptr;
+            check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
+            ev_route.push_back(e);
+        }
+        if (const char * r = std::getenv("NINFER_FN_RING_MB")) ring_target = std::size_t(std::atoll(r)) << 20;
+        if (const char * g = std::getenv("NINFER_FN_GROUP")) group_override = std::clamp(std::atoi(g), 1, fc::kMaxConvert);
+        if (const char * m = std::getenv("NINFER_FN_SHARE"))  // "us per expert,us per pair,us dense per token" (tuning)
+            std::sscanf(m, "%lf,%lf,%lf", &share_model.us_per_expert, &share_model.us_per_pair, &share_model.us_dense);
+        for (int il = 0; il < nl; ++il) slot_max = std::max(slot_max, cache[std::size_t(il)].lay.slot_bytes);
+        if (!opt.prefill_lend || !opt.prefill_stream) return;
+        const auto t0 = clk::now();
+        for (int il = 0; il < nl; ++il) {
+            const CpuExperts::HostLayer H = experts->host_layer(il);
+            fc::HostExpertFormat F;
+            F.gate_q4x = H.gate_q4x;
+            F.down_q8 = H.down_q8;
+            F.gate_bytes = H.gate_bytes;
+            F.down_bytes = H.down_bytes;
+            if (fc::stream_layout(F).slot_bytes != cache[std::size_t(il)].lay.slot_bytes)
+                throw std::runtime_error("engine: the CPU expert format of layer " + std::to_string(il) + " does not map to its cache layout");
+            host[std::size_t(il)] = H;
+            host_fmt[std::size_t(il)] = F;
+            const cudaError_t err = cudaHostRegister(const_cast<std::uint8_t *>(H.base), H.bytes, cudaHostRegisterPortable);
+            if (err != cudaSuccess) {
+                cudaGetLastError();
+                std::fprintf(stderr, "engine: could not pin the experts of layer %d (%s); its prompt experts stay on the CPU\n", il,
+                             cudaGetErrorString(err));
+                continue;
+            }
+            host_pinned[std::size_t(il)] = 1;
+            ++stats.pinned_layers;
+            blob_max = std::max(blob_max, H.stride);
+        }
+        if (stats.pinned_layers) refill_staging = fc::DeviceBuffer(std::size_t(kRefillBatch) * blob_max);
+        if (std::getenv("NINFER_FN_VERBOSE"))
+            std::fprintf(stderr, "engine: pinned the CPU experts of %d layers in %.0f ms\n", stats.pinned_layers,
+                         std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    }
+
+    void teardown_streaming() {
+        if (share_thread.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(share_mu);
+                share_stop = true;
+            }
+            share_cv.notify_all();
+            share_thread.join();
+        }
+        for (cudaEvent_t e : ev_route) cudaEventDestroy(e);
+        for (std::size_t il = 0; il < host_pinned.size(); ++il)
+            if (host_pinned[il]) cudaHostUnregister(const_cast<std::uint8_t *>(host[il].base));
+        for (cudaEvent_t e : ev_copied) cudaEventDestroy(e);
+        for (cudaEvent_t e : ev_released) cudaEventDestroy(e);
+        if (copy_stream) cudaStreamDestroy(copy_stream);
+    }
+
+    struct SlotLoad {
+        int il, e, slot;
+    };
+    // Writes experts into cache slots: from the pinned host images if there are any, else from the CPU's pinned
+    // copy through the GPU conversion, else packed on the CPU (pack_slot) and copied. Synchronizes the stream.
+    void load_slots(std::vector<SlotLoad> loads) {
+        if (loads.empty()) return;
+        std::sort(loads.begin(), loads.end(), [](const SlotLoad & a, const SlotLoad & b) { return a.il != b.il ? a.il < b.il : a.e < b.e; });
+        std::vector<SlotLoad> on_cpu;
+        for (std::size_t i = 0; i < loads.size();) {
+            const int il = loads[i].il;
+            LayerCache & C = cache[std::size_t(il)];
+            std::size_t j = i;
+            while (j < loads.size() && loads[j].il == il) ++j;
+            if (!images.empty()) {
+                for (std::size_t k = i; k < j; ++k)
+                    check(cudaMemcpyAsync(C.pool.as<std::uint8_t>() + std::size_t(loads[k].slot) * C.lay.slot_bytes,
+                                          images[std::size_t(il)] + std::size_t(loads[k].e) * C.lay.slot_bytes, C.lay.slot_bytes, cudaMemcpyHostToDevice,
+                                          stream),
+                          "expert load");
+            } else if (host_pinned.size() > std::size_t(il) && host_pinned[std::size_t(il)] && refill_staging.get()) {
+                const CpuExperts::HostLayer & H = host[std::size_t(il)];
+                for (std::size_t b0 = i; b0 < j; b0 += kRefillBatch) {
+                    fc::ConvertBatch cb;
+                    cb.n = int(std::min<std::size_t>(kRefillBatch, j - b0));
+                    for (int k = 0; k < cb.n; ++k) {
+                        const SlotLoad & l = loads[b0 + std::size_t(k)];
+                        std::uint8_t * st = refill_staging.as<std::uint8_t>() + std::size_t(k) * blob_max;
+                        check(cudaMemcpyAsync(st, H.base + std::size_t(l.e) * H.stride, H.stride, cudaMemcpyHostToDevice, stream), "expert load");
+                        cb.src[k] = st;
+                        cb.dst[k] = C.pool.as<std::uint8_t>() + std::size_t(l.slot) * C.lay.slot_bytes;
+                    }
+                    fc::convert_experts(host_fmt[std::size_t(il)], C.lay, cb, stream);
+                }
+            } else {
+                on_cpu.insert(on_cpu.end(), loads.begin() + std::ptrdiff_t(i), loads.begin() + std::ptrdiff_t(j));
+            }
+            i = j;
+        }
+        if (!on_cpu.empty()) {
+            if (!swap_staging) swap_staging = std::make_unique<Pinned<std::uint8_t>>(slot_max * kSwapBatch);
+            for (std::size_t b0 = 0; b0 < on_cpu.size(); b0 += kSwapBatch) {
+                const std::size_t n = std::min<std::size_t>(kSwapBatch, on_cpu.size() - b0);
+                check(cudaStreamSynchronize(stream), "expert load");  // the staging is free again
+                std::vector<std::thread> workers;
+                const std::size_t nt = std::min<std::size_t>(16, n);
+                for (std::size_t t = 0; t < nt; ++t)
+                    workers.emplace_back([&, t] {
+                        for (std::size_t k = t; k < n; k += nt) pack_slot(on_cpu[b0 + k].il, on_cpu[b0 + k].e, swap_staging->get() + k * slot_max);
+                    });
+                for (auto & w : workers) w.join();
+                for (std::size_t k = 0; k < n; ++k) {
+                    const SlotLoad & l = on_cpu[b0 + k];
+                    LayerCache & C = cache[std::size_t(l.il)];
+                    check(cudaMemcpyAsync(C.pool.as<std::uint8_t>() + std::size_t(l.slot) * C.lay.slot_bytes, swap_staging->get() + k * slot_max,
+                                          C.lay.slot_bytes, cudaMemcpyHostToDevice, stream),
+                          "expert load");
+                }
+            }
+        }
+        check(cudaStreamSynchronize(stream), "expert load");
+    }
+
+    void upload_maps(const std::vector<bool> & touched) {
+        for (int il = 0; il < cfg.n_layer; ++il)
+            if (touched[std::size_t(il)]) {
+                LayerCache & C = cache[std::size_t(il)];
+                check(cudaMemcpy(C.dmap.get(), C.map.data(), C.dmap.bytes(), cudaMemcpyHostToDevice), "expert map");
+            }
+    }
+
+    // Lends the arena's tail of `bytes` (rounded up to whole MiB) to a prompt: the experts in its slots leave the
+    // cache until refill(). Returns its device address.
+    std::uint8_t * lend(std::size_t bytes) {
+        bytes = (bytes + (std::size_t(1) << 20) - 1) & ~((std::size_t(1) << 20) - 1);
+        if (bytes > arena_bytes) throw std::runtime_error("engine: prompt buffers larger than the expert cache");
+        check(cudaStreamSynchronize(stream), "lend");
+        const std::size_t lo = arena_bytes - bytes;
+        std::vector<bool> touched(std::size_t(cfg.n_layer), false);
+        for (int il = 0; il < cfg.n_layer; ++il) {
+            LayerCache & C = cache[std::size_t(il)];
+            if (!C.pool.get()) continue;
+            const std::size_t sb = C.lay.slot_bytes, n_slots = C.pool.bytes() / sb;
+            if (pool_off[std::size_t(il)] + n_slots * sb <= lo) continue;
+            std::vector<int> expert_of(n_slots, -1);
+            for (int e = 0; e < fc::kExperts; ++e)
+                if (C.map[std::size_t(e)] >= 0) expert_of[std::size_t(C.map[std::size_t(e)])] = e;
+            for (std::size_t s = 0; s < n_slots; ++s) {
+                if (pool_off[std::size_t(il)] + (s + 1) * sb <= lo) continue;
+                if (expert_of[s] >= 0) C.map[std::size_t(expert_of[s])] = -1;
+                lent_slots[std::size_t(il)].push_back(int(s));
+                touched[std::size_t(il)] = true;
+            }
+        }
+        upload_maps(touched);
+        lent_bytes = bytes;
+        stats.lent_gib = double(bytes) / double(1 << 30);
+        return cache_arena.as<std::uint8_t>() + lo;
+    }
+
+    // Gives the lent tail back to the cache: its slots get the uncached experts that rank highest (recent routing
+    // plus the long-run counts, as adapt_cache ranks them).
+    void refill() {
+        if (!lent_bytes) return;
+        const auto t0 = clk::now();
+        std::vector<SlotLoad> loads;
+        std::vector<bool> touched(std::size_t(cfg.n_layer), false);
+        for (int il = 0; il < cfg.n_layer; ++il) {
+            std::vector<int> & free_slots = lent_slots[std::size_t(il)];
+            if (free_slots.empty()) continue;
+            LayerCache & C = cache[std::size_t(il)];
+            const std::size_t base = std::size_t(il) * fc::kExperts;
+            double rmass = 0, cmass = 0;
+            for (int e = 0; e < fc::kExperts; ++e) {
+                rmass += recent[base + std::size_t(e)];
+                cmass += double(counts[base + std::size_t(e)]);
+            }
+            auto score = [&](int e) {
+                return recent[base + std::size_t(e)] / std::max(rmass, 1e-30) + 0.5 * double(counts[base + std::size_t(e)]) / std::max(cmass, 1.0);
+            };
+            std::vector<int> cand;
+            for (int e = 0; e < fc::kExperts; ++e)
+                if (C.map[std::size_t(e)] < 0) cand.push_back(e);
+            std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return score(a) > score(b); });
+            for (std::size_t i = 0; i < free_slots.size() && i < cand.size(); ++i) {
+                loads.push_back({il, cand[i], free_slots[i]});
+                C.map[std::size_t(cand[i])] = free_slots[i];
+            }
+            free_slots.clear();
+            touched[std::size_t(il)] = true;
+        }
+        load_slots(loads);
+        upload_maps(touched);
+        lent_bytes = 0;
+        stats.refill_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    }
+
+    // The buffers a chunk of T tokens borrows, and which of them may share memory: set 0 lives through a
+    // layer; the members of each other set are live only while that set's stage runs (the hyper-connection
+    // mixers, PLE, Gated DeltaNet, attention, FFN), so the sets overlay each other.
+    struct Act {
+        fc::DeviceBuffer * b;
+        std::size_t bytes;
+        int set;
+    };
+    std::vector<Act> chunk_buffers(int T) {
+        const std::size_t t = std::size_t(T), f = sizeof(float);
+        const std::size_t ws = std::max(fc::experts_batch_workspace_bytes(T), fc::experts_phased_workspace_bytes(T));
+        return {
+            {&res, t * fc::kHcd * f, 0}, {&mixed, t * fc::kEmbd * f, 0}, {&inject, t * fc::kHc * f, 0}, {&out, t * fc::kEmbd * f, 0},
+            {&x, t * fc::kEmbd * f, 1}, {&xn, t * fc::kHcd * f, 1}, {&lo, t * fc::kHcRank * f, 1}, {&gate, t * fc::kHcd * f, 1},
+            {&ple_emb, t * fc::kEmbd * f, 2}, {&ple_key_out, t * fc::kHcd * f, 2}, {&ple_val_out, t * fc::kEmbd * f, 2},
+            {&ple_gated, t * fc::kHcd * f, 2}, {&ple_norm, t * fc::kHcd * f, 2}, {&ple_gates, t * fc::kHc * f, 2},
+            {&qkv, t * fc::kDnConvDim * f, 3}, {&z, t * fc::kDnVDim * f, 3}, {&beta, t * fc::kDnVHeads * f, 3}, {&alpha, t * fc::kDnVHeads * f, 3},
+            {&conv, t * fc::kDnConvDim * f, 3}, {&dn_out, t * fc::kDnVDim * f, 3},
+            {&qfull, t * 2 * fc::kHeads * fc::kHeadDim * f, 4}, {&k, t * fc::kKvHeads * fc::kHeadDim * f, 4},
+            {&v, t * fc::kKvHeads * fc::kHeadDim * f, 4}, {&kraw, t * fc::kIdxDim * f, 4}, {&qi, t * fc::kQsaHeads * fc::kQsaDim * f, 4},
+            {&q, t * fc::kHeads * fc::kHeadDim * f, 4}, {&qgate, t * fc::kHeads * fc::kHeadDim * f, 4}, {&att, t * fc::kHeads * fc::kHeadDim * f, 4},
+            {&cells, t * fc::kQsaWidth * sizeof(std::int32_t), 4}, {&n_cells, t * sizeof(std::int32_t), 4},
+            {&attn_work, fc::attn_sparse_work_floats(T) * f, 4}, {&sel_work, fc::qsa_select_work_bytes(std::min(T, kQsaBatch), opt.max_ctx), 4},
+            {&rlogits, t * fc::kExperts * f, 5}, {&ids, t * fc::kUsed * f, 5}, {&wts, t * fc::kUsed * f, 5},
+            {&slots, t * fc::kUsed * sizeof(std::int32_t), 5}, {&sh_g, t * fc::kFfShared * f, 5}, {&sh_u, t * fc::kFfShared * f, 5},
+            {&sh_h, t * fc::kFfShared * f, 5}, {&sd, t * fc::kEmbd * f, 5}, {&sg, t * f, 5}, {&moe, t * fc::kEmbd * f, 5},
+            {&gpu_sum, t * fc::kEmbd * f, 5}, {&batch_ws, ws, 5},
+        };
+    }
+    // Offsets of chunk_buffers(T) in a lent region; returns the bytes they span.
+    std::size_t chunk_layout(const std::vector<Act> & acts, std::vector<std::size_t> * offs) {
+        Carve c;
+        if (offs) offs->assign(acts.size(), 0);
+        for (std::size_t i = 0; i < acts.size(); ++i)
+            if (acts[i].set == 0) {
+                const std::size_t o = c.take(acts[i].bytes);
+                if (offs) (*offs)[i] = o;
+            }
+        const std::size_t base = c.at;
+        std::size_t end = base;
+        for (int set = 1; set <= 5; ++set) {
+            Carve s{base};
+            for (std::size_t i = 0; i < acts.size(); ++i)
+                if (acts[i].set == set) {
+                    const std::size_t o = s.take(acts[i].bytes);
+                    if (offs) (*offs)[i] = o;
+                }
+            end = std::max(end, s.at);
+        }
+        return end;
+    }
+    int conv_count(int T) const { return group_override ? group_override : T >= 4096 ? 32 : 64; }
+    // Bytes a prompt with chunks of T tokens borrows.
+    std::size_t prompt_bytes(int T, bool streaming, std::size_t ring_b, std::size_t kv_b) {
+        std::size_t b = chunk_layout(chunk_buffers(T), nullptr);
+        if (streaming) b += (ring_b + 255) / 256 * 256 + std::size_t(conv_count(T)) * slot_max;
+        return b + (kv_b + 255) / 256 * 256;
+    }
+
+    // Swaps the activation buffers for views of a lent region sized for chunks of T tokens.
+    void bind_prompt(int T, bool streaming, std::size_t ring_b, std::size_t kv_b) {
+        std::vector<Act> acts = chunk_buffers(T);
+        std::vector<std::size_t> offs;
+        Carve c{chunk_layout(acts, &offs)};
+        const std::size_t ring_off = streaming ? c.take(ring_b) : 0;
+        const std::size_t conv_off = streaming ? c.take(std::size_t(conv_count(T)) * slot_max) : 0;
+        const std::size_t kv_off = kv_b ? c.take(kv_b) : 0;
+        std::uint8_t * base = lend(c.at);
+        saved_acts.clear();
+        for (std::size_t i = 0; i < acts.size(); ++i) {
+            saved_acts.push_back(std::move(*acts[i].b));
+            *acts[i].b = fc::DeviceBuffer::view(base + offs[i], acts[i].bytes);
+        }
+        ring = streaming ? base + ring_off : nullptr;
+        ring_bytes = streaming ? ring_b : 0;
+        conv_area = streaming ? base + conv_off : nullptr;
+        conv_slots = streaming ? conv_count(T) : 0;
+        kv_stage = kv_b ? base + kv_off : nullptr;
+        kv_stage_reserved = kv_b;
+        bound_T = T;
+        ensure_host(T);
+        if (streaming && ids_all_cap < std::size_t(T)) {
+            h_ids_all = std::make_unique<Pinned<std::int32_t>>(std::size_t(cfg.n_layer) * std::size_t(T) * fc::kUsed);
+            ids_all_cap = std::size_t(T);
+        }
+    }
+
+    // Back to the permanent buffers; the lent VRAM returns to the expert cache.
+    void unbind_prompt() {
+        if (!bound_T) return;
+        cudaStreamSynchronize(stream);
+        cudaStreamSynchronize(copy_stream);
+        std::vector<Act> acts = chunk_buffers(bound_T);
+        for (std::size_t i = 0; i < acts.size(); ++i) *acts[i].b = std::move(saved_acts[i]);
+        saved_acts.clear();
+        bound_T = 0;
+        ring = conv_area = kv_stage = nullptr;
+        ring_bytes = kv_stage_reserved = 0;
+        conv_slots = 0;
+        stream_chunk = false;
+        refill();
+    }
+
+    // KV staging for the attention of deep prompt chunks (kv-agent's KV streaming): the bytes a chunk ending at
+    // pos_end needs. TODO(merge): the KV streaming branch defines the real one; nothing is needed without it.
+    std::size_t kv_stage_bytes(std::int64_t /*pos_end*/) const { return 0; }
+    // A contiguous, 256-byte aligned device region of at least `bytes`, valid while the current prompt chunk's
+    // work runs, or nullptr outside prompt chunks or beyond what kv_stage_bytes() reserved.
+    void * kv_stage_borrow(std::size_t bytes) { return bound_T && kv_stage && bytes <= kv_stage_reserved ? kv_stage : nullptr; }
+
+    // The stream plan of a chunk: per layer, the cached experts get keys 0.. (their pool slots) and the others
+    // follow in id order, in groups that are copied into the ring, converted into the conversion slots and
+    // computed group by group. Keys and slot addresses go to the device once per chunk.
+    void plan_stream(int T) {
+        const int nl = cfg.n_layer, G = conv_slots;
+        s_layers.assign(std::size_t(nl), {});
+        s_groups.clear();
+        s_hits = 0;
+        ++share_chunk;
+        // the CPU takes a share of small chunks (needs every layer streamable: run_batch runs on one thread at a time)
+        const bool share = T <= opt.prefill_cpu_share_max && stats.pinned_layers == nl;
+        for (int il = 0; il < nl; ++il) {
+            if (!host_pinned[std::size_t(il)]) continue;
+            LayerCache & C = cache[std::size_t(il)];
+            StreamLayer & SL = s_layers[std::size_t(il)];
+            std::int32_t * km = h_keymap->get() + std::size_t(il) * fc::kExperts;
+            std::uint64_t * pp = h_ptrs->get() + std::size_t(il) * fc::kExperts;
+            int key = 0;
+            std::vector<int> rest;
+            for (int e = 0; e < fc::kExperts; ++e) {
+                if (C.map[std::size_t(e)] >= 0) {
+                    SL.resident.push_back(e);
+                    km[e] = key;
+                    pp[key++] = std::uint64_t(reinterpret_cast<std::uintptr_t>(C.pool.as<std::uint8_t>() + std::size_t(C.map[std::size_t(e)]) * C.lay.slot_bytes));
+                } else {
+                    rest.push_back(e);
+                }
+            }
+            if (share && !rest.empty()) {
+                const std::size_t base = std::size_t(il) * fc::kExperts;
+                double rmass = 0, cmass = 0;
+                for (int e = 0; e < fc::kExperts; ++e) {
+                    rmass += recent[base + std::size_t(e)];
+                    cmass += double(counts[base + std::size_t(e)]);
+                }
+                std::vector<double> sh(fc::kExperts);
+                for (int e = 0; e < fc::kExperts; ++e)  // recent routing, or the long-run counts before there is any
+                    sh[std::size_t(e)] = rmass > 0 ? recent[base + std::size_t(e)] / rmass
+                                                   : double(counts[base + std::size_t(e)]) / std::max(cmass, 1.0);
+                const double us_copy = double(host[std::size_t(il)].stride) / 26.5e3;  // ~26.5 GB/s of pinned DMA
+                SL.cpu = pick_cpu_share(rest, sh, T, us_copy, share_model);
+                if (!SL.cpu.empty()) {
+                    std::vector<int> gpu;
+                    std::size_t j = 0;
+                    for (int e : rest) {
+                        if (j < SL.cpu.size() && SL.cpu[j] == e) {
+                            km[e] = -1;
+                            ++j;
+                        } else {
+                            gpu.push_back(e);
+                        }
+                    }
+                    rest.swap(gpu);
+                }
+            }
+            SL.first_group = int(s_groups.size());
+            for (std::size_t i0 = 0; i0 < rest.size(); i0 += std::size_t(G)) {
+                StreamGroup g;
+                g.layer = il;
+                g.key0 = key;
+                for (std::size_t j = i0; j < rest.size() && j < i0 + std::size_t(G); ++j) {
+                    km[rest[j]] = key;
+                    pp[key++] = std::uint64_t(reinterpret_cast<std::uintptr_t>(conv_area + (j - i0) * slot_max));
+                    g.experts.push_back(rest[j]);
+                }
+                g.key1 = key;
+                g.bytes = g.experts.size() * host[std::size_t(il)].stride;
+                s_groups.push_back(std::move(g));
+            }
+            SL.n_groups = int(s_groups.size()) - SL.first_group;
+        }
+        if (!place_groups(s_groups, ring_bytes)) throw std::runtime_error("engine: streaming ring smaller than one group");
+        check(cudaMemcpyAsync(d_keymap.get(), h_keymap->get(), d_keymap.bytes(), cudaMemcpyHostToDevice, stream), "stream plan");
+        check(cudaMemcpyAsync(d_ptrs.get(), h_ptrs->get(), d_ptrs.bytes(), cudaMemcpyHostToDevice, stream), "stream plan");
+        s_next = 0;
+        s_enqueued = 0;
+        s_inflight.clear();
+    }
+
+    // Queues the copies of the next groups on the copy stream, as far as the ring allows: a group may overwrite
+    // ring bytes only after the compute stream has converted the groups that used them before, and the host can
+    // order that wait only once those conversions are queued. Never blocks the host.
+    void issue_copies() {
+        int issued = 0;
+        while (s_next < int(s_groups.size())) {
+            const StreamGroup & g = s_groups[std::size_t(s_next)];
+            int need = -1;
+            for (int f : s_inflight) {
+                const StreamGroup & o = s_groups[std::size_t(f)];
+                if (o.ring_off < g.ring_off + g.bytes && g.ring_off < o.ring_off + o.bytes) need = std::max(need, f);
+            }
+            if (need >= s_enqueued) break;  // its conversion is not queued yet
+            if (need >= 0) {
+                check(cudaStreamWaitEvent(copy_stream, ev_released[std::size_t(need % kEvents)], 0), "ring wait");
+                while (!s_inflight.empty() && s_inflight.front() <= need) s_inflight.pop_front();
+            }
+            const CpuExperts::HostLayer & H = host[std::size_t(g.layer)];
+            for (std::size_t i = 0; i < g.experts.size();) {
+                std::size_t j = i + 1;
+                while (j < g.experts.size() && g.experts[j] == g.experts[j - 1] + 1) ++j;
+                check(cudaMemcpyAsync(ring + g.ring_off + i * H.stride, H.base + std::size_t(g.experts[i]) * H.stride, (j - i) * H.stride,
+                                      cudaMemcpyHostToDevice, copy_stream),
+                      "expert stream");
+                i = j;
+            }
+            check(cudaEventRecord(ev_copied[std::size_t(s_next % kEvents)], copy_stream), "ring event");
+            s_inflight.push_back(s_next++);
+            ++issued;
+        }
+        if (issued) cudaStreamQuery(copy_stream);  // submit now (Windows batches work otherwise)
+    }
+
+    // FFN of a prompt chunk with every routed expert on the GPU: the cached ones from their pool slots, the
+    // others group by group as their copies land in the ring.
+    void ffn_stream(Layer & L, int il, int T) {
+        const std::size_t ke = std::size_t(T) * fc::kUsed;
+        LayerCache & C = cache[std::size_t(il)];
+        const StreamLayer & SL = s_layers[std::size_t(il)];
+        linear(L.router, mixed, rlogits, T);
+        emit("ffn_moe_logits", il, rlogits.get(), n_past, T, fc::kExperts);
+        fc::router_topk(rlogits.as<float>(), ids.as<std::int32_t>(), wts.as<float>(), T, stream);
+        check(cudaMemcpyAsync(h_ids_all->get() + std::size_t(il) * ke, ids.get(), ke * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream),
+              "routing");
+        const bool share = !SL.cpu.empty();
+        if (share) {  // the CPU's part starts as soon as the routing and the FFN input are on the host
+            check(cudaMemcpyAsync(h_w->get(), wts.get(), ke * sizeof(float), cudaMemcpyDeviceToHost, stream), "weights");
+            check(cudaMemcpyAsync(h_mixed->get(), mixed.get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyDeviceToHost, stream),
+                  "ffn input");
+            check(cudaEventRecord(ev_route[std::size_t(il)], stream), "event");
+            start_share_worker();
+            {
+                std::lock_guard<std::mutex> lk(share_mu);
+                share_items.push_back({il, T, share_chunk});
+            }
+            share_cv.notify_one();
+        }
+        if (hook) {
+            std::vector<float> w(ke);
+            check(cudaMemcpyAsync(w.data(), wts.get(), ke * sizeof(float), cudaMemcpyDeviceToHost, stream), "weights");
+            check(cudaStreamSynchronize(stream), "routing");
+            std::vector<float> fid(ke);
+            for (std::size_t i = 0; i < ke; ++i) fid[i] = float(h_ids_all->get()[std::size_t(il) * ke + i]);
+            hook("ffn_moe_topk", il, n_past, T, fc::kUsed, fid.data());
+            hook("ffn_moe_weights", il, n_past, T, fc::kUsed, w.data());
+        }
+        const std::uint8_t * const * ptrs = d_ptrs.as<const std::uint8_t *>() + std::size_t(il) * fc::kExperts;
+        fc::moe_slots(ids.as<std::int32_t>(), d_keymap.as<std::int32_t>() + std::size_t(il) * fc::kExperts, slots.as<std::int32_t>(), T, stream);
+        fc::experts_phased_begin(T, mixed.as<float>(), slots.as<std::int32_t>(), batch_ws.get(), stream);
+        prof_mark("router");
+        linear_multi({{&L.sh_gate, &sh_g}, {&L.sh_up, &sh_u}, {&L.sh_gate_inp, &sg}}, mixed, T);
+        fc::swiglu(sh_g.as<float>(), sh_u.as<float>(), sh_h.as<float>(), T * fc::kFfShared, stream);
+        linear(L.sh_down, sh_h, sd, T);
+        prof_mark("shared");
+        if (!SL.resident.empty())
+            fc::experts_phased_run(C.lay, ptrs, 0, int(SL.resident.size()), T, mixed.as<float>(), batch_ws.get(), stream);
+        prof_mark("experts_cached");
+        for (int gi = SL.first_group; gi < SL.first_group + SL.n_groups; ++gi) {
+            issue_copies();
+            if (s_next <= gi) throw std::logic_error("engine: a streamed group was not queued before its use");
+            const StreamGroup & g = s_groups[std::size_t(gi)];
+            check(cudaStreamWaitEvent(stream, ev_copied[std::size_t(gi % kEvents)], 0), "ring wait");
+            prof_mark("stream_wait");
+            fc::ConvertBatch cb;
+            cb.n = int(g.experts.size());
+            for (int j = 0; j < cb.n; ++j) {
+                cb.src[j] = ring + g.ring_off + std::size_t(j) * host[std::size_t(il)].stride;
+                cb.dst[j] = conv_area + std::size_t(j) * slot_max;
+            }
+            fc::convert_experts(host_fmt[std::size_t(il)], C.lay, cb, stream);
+            check(cudaEventRecord(ev_released[std::size_t(gi % kEvents)], stream), "ring event");
+            s_enqueued = gi + 1;
+            prof_mark("convert");
+            fc::experts_phased_run(C.lay, ptrs, g.key0, g.key1, T, mixed.as<float>(), batch_ws.get(), stream);
+            prof_mark("experts_streamed");
+        }
+        issue_copies();
+        fc::experts_phased_end(T, slots.as<std::int32_t>(), wts.as<float>(), gpu_sum.as<float>(), batch_ws.get(), stream);
+        if (share) {  // the stream waits for the CPU's part of this layer, then adds it
+            share_wait[std::size_t(il)] = {&share_done[std::size_t(il)], share_chunk};
+            check(cudaLaunchHostFunc(stream, share_wait_fn, &share_wait[std::size_t(il)]), "cpu share wait");
+            prof_mark("cpu_share_wait");
+            check(cudaMemcpyAsync(moe.get(), h_moe->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "moe");
+        }
+        fc::moe_combine_sum(gpu_sum.as<float>(), share ? moe.as<float>() : nullptr, sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
+        prof_mark("combine");
+    }
+
+    static void CUDART_CB share_wait_fn(void * p) {
+        const ShareWait * w = static_cast<const ShareWait *>(p);
+        const auto t0 = clk::now();
+        while (w->done->load(std::memory_order_acquire) < w->want) {
+            std::this_thread::yield();
+            if (clk::now() - t0 > std::chrono::seconds(60)) return;  // the worker failed; step() reports it
+        }
+    }
+
+    void start_share_worker() {
+        if (share_thread.joinable()) return;
+        share_thread = std::thread([this] { share_worker(); });
+    }
+
+    // The CPU's share of streamed chunks, layer by layer as the GPU reaches them.
+    void share_worker() {
+        for (;;) {
+            ShareItem it{};
+            {
+                std::unique_lock<std::mutex> lk(share_mu);
+                share_cv.wait(lk, [&] { return share_stop || !share_items.empty(); });
+                if (share_items.empty()) return;
+                it = share_items.front();
+                share_items.pop_front();
+            }
+            try {
+                if (!share_error.load()) {
+                    check(cudaEventSynchronize(ev_route[std::size_t(it.il)]), "cpu share routing");
+                    const auto c0 = clk::now();
+                    const std::size_t ke = std::size_t(it.T) * fc::kUsed;
+                    const std::int32_t * id = h_ids_all->get() + std::size_t(it.il) * ke;
+                    const std::int32_t * km = h_keymap->get() + std::size_t(it.il) * fc::kExperts;
+                    std::uint8_t * oc = h_oncpu->get();
+                    for (std::size_t i = 0; i < ke; ++i) oc[i] = id[i] >= 0 && id[i] < fc::kExperts && km[id[i]] < 0;
+                    for (int t0 = 0; t0 < it.T; t0 += CpuExperts::kMaxBatchTokens) {
+                        const int n = std::min(CpuExperts::kMaxBatchTokens, it.T - t0);
+                        const std::size_t xo = std::size_t(t0) * fc::kEmbd, ko = std::size_t(t0) * fc::kUsed;
+                        experts->run_batch(it.il, n, h_mixed->get() + xo, id + ko, h_w->get() + ko, oc + ko, h_moe->get() + xo);
+                    }
+                    share_cpu_us += std::int64_t(std::chrono::duration<double, std::micro>(clk::now() - c0).count());
+                }
+            } catch (const std::exception & e) {
+                share_error_text = e.what();
+                share_error.store(true);
+            }
+            share_done[std::size_t(it.il)].store(it.chunk, std::memory_order_release);
+        }
+    }
+
+    // After a streamed chunk: its routing feeds the cache statistics (as the hybrid path does per layer).
+    void finish_stream_chunk(int T) {
+        const std::size_t ke = std::size_t(T) * fc::kUsed;
+        for (int il = 0; il < cfg.n_layer; ++il) {
+            if (!host_pinned[std::size_t(il)]) continue;
+            const LayerCache & C = cache[std::size_t(il)];
+            const std::int32_t * id = h_ids_all->get() + std::size_t(il) * ke;
+            std::size_t hits = 0;
+            for (std::size_t i = 0; i < ke; ++i) {
+                if (id[i] < 0 || id[i] >= fc::kExperts) throw std::runtime_error("engine: router returned an invalid expert");
+                observe(il, id[i]);
+                hits += C.map[std::size_t(id[i])] >= 0;
+            }
+            stats.expert_pairs += std::int64_t(ke);
+            stats.expert_hits += std::int64_t(hits);
+        }
+        for (const StreamGroup & g : s_groups) {
+            stats.streamed_experts += std::int64_t(g.experts.size());
+            stats.streamed_gib += double(g.bytes) / double(1 << 30);
+        }
+        for (const StreamLayer & SL : s_layers) stats.cpu_share_experts += std::int64_t(SL.cpu.size());
+        stats.cpu_experts_ms += double(share_cpu_us.exchange(0)) / 1e3;
+        ++stats.streamed_chunks;
+        if (share_error.exchange(false)) throw std::runtime_error("engine: CPU share of a prompt chunk failed: " + share_error_text);
+    }
+
+    // QSA indexing of the step's tokens: raw keys into the ring, block keys, the queries, then each query's
+    // cells. Prompt chunks store and select kQsaBatch tokens at a time, so the raw-key ring and the selection's
+    // scratch stay that small (the results are the same as in one pass: every query and block is computed alone).
+    void qsa_index(Layer & L, int T) {
+        const std::int64_t * pos = d_step.as<std::int64_t>();
+        const int nb = (T + kQsaBatch - 1) / kQsaBatch;
+        auto pos_of = [&](int b) { return nb == 1 ? pos : d_pos.as<std::int64_t>() + b; };
+        for (int b = 0; b < nb; ++b) {
+            const int t0 = b * kQsaBatch, n = std::min(kQsaBatch, T - t0);
+            fc::store_rows(kraw.as<float>() + std::size_t(t0) * fc::kIdxDim, L.idx_raw.as<float>(), pos_of(b), fc::kIdxDim, n, raw_ring(), stream);
+            fc::qsa_update_blocks(L.idx_raw.as<float>(), raw_ring(), L.idx_k_norm.as<float>(), rope_freq.as<double>(), L.blocks.as<float>(),
+                                  pos_of(b), n, cfg.rms_eps, stream);
+        }
+        fc::qsa_query(qi.as<float>(), L.idx_q_norm.as<float>(), rope_freq.as<double>(), pos, T, cfg.rms_eps, stream);
+        for (int b = 0; b < nb; ++b) {
+            const int t0 = b * kQsaBatch, n = std::min(kQsaBatch, T - t0);
+            fc::qsa_select(qi.as<float>() + std::size_t(t0) * fc::kQsaHeads * fc::kQsaDim, L.blocks.as<float>(), pos_of(b), n, opt.max_ctx,
+                           sel_work.get(), cells.as<std::int32_t>() + std::size_t(t0) * fc::kQsaWidth, n_cells.as<std::int32_t>() + t0, stream);
+        }
+    }
+
+    // The positions of a prompt chunk's QSA batches, for qsa_index (before the chunk's kernels).
+    void upload_batch_positions(int T) {
+        const int nb = (T + kQsaBatch - 1) / kQsaBatch;
+        if (nb <= 1) return;
+        if (nb > 64) throw std::runtime_error("engine: chunk too long for the QSA batches");
+        for (int b = 0; b < nb; ++b) h_pos->get()[b] = n_past + std::int64_t(b) * kQsaBatch;
+        check(cudaMemcpyAsync(d_pos.get(), h_pos->get(), std::size_t(nb) * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "positions");
+    }
+
+    struct ChunkPlan {
+        int T = 0;
+        bool stream = false;
+    };
+    // The chunks of a prompt of n tokens (n > cap) and what they borrow: the largest chunk on a 256-token grid
+    // (up to prefill_chunk_max, or prefill_chunk if set) whose buffers, a ring of up to ring_target bytes (at
+    // least two groups) and the KV staging fit in 90% of the expert cache; the last chunk takes the rest.
+    // Chunks of at least prefill_stream_min tokens stream their experts. Empty: nothing fits (use cap).
+    std::vector<ChunkPlan> plan_prompt(std::int64_t n, int & bind_T, bool & bind_stream, std::size_t & ring_b, std::size_t & kv_b) {
+        kv_b = kv_stage_bytes(n_past + n);
+        const bool can_stream = opt.prefill_stream && stats.pinned_layers > 0;
+        const std::size_t lendable = arena_bytes / 10 * 9;
+        const int grid = 256;
+        int T = opt.prefill_chunk > 0 ? int(std::min<std::int64_t>(opt.prefill_chunk, n))
+                                      : int(std::min<std::int64_t>(opt.prefill_chunk_max, (n + grid - 1) / grid * grid));
+        auto fits = [&](int t) {
+            const bool st = can_stream && t >= opt.prefill_stream_min;
+            const std::size_t floor_ring = std::max(std::size_t(256) << 20, std::size_t(2 * conv_count(t)) * blob_max);
+            const std::size_t fixed = prompt_bytes(t, st, 0, kv_b);
+            if (fixed > lendable) return false;
+            if (st) {
+                const std::size_t r = std::min(ring_target, lendable - fixed);
+                if (r < floor_ring) return false;
+                ring_b = r;
+            } else {
+                ring_b = 0;
+            }
+            return true;
+        };
+        if (opt.prefill_chunk <= 0)
+            while (T > grid && !fits(T)) T -= grid;
+        if (T <= cap || !fits(T)) return {};
+        std::vector<ChunkPlan> plan;
+        bind_stream = false;
+        for (std::int64_t done = 0; done < n;) {
+            const int t = int(std::min<std::int64_t>(T, n - done));
+            plan.push_back({t, can_stream && t >= opt.prefill_stream_min});
+            bind_stream = bind_stream || plan.back().stream;
+            done += t;
+        }
+        if (!bind_stream) ring_b = 0;
+        bind_T = T;
+        return plan;
+    }
+
+    // A prompt of n > cap tokens with borrowed buffers; returns the last token's logits.
+    std::vector<float> prompt(const std::int32_t * tokens, std::int64_t n) {
+        int T = 0;
+        bool streaming = false;
+        std::size_t ring_b = 0, kv_b = 0;
+        const std::vector<ChunkPlan> plan = plan_prompt(n, T, streaming, ring_b, kv_b);
+        if (plan.empty()) return {};
+        if (n_past + n > opt.max_ctx) throw std::runtime_error("engine: context full (max_ctx " + std::to_string(opt.max_ctx) + ")");
+        for (std::int64_t t = 0; t < n; ++t)
+            if (tokens[t] < 0 || tokens[t] >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
+        // the whole prompt's history first: the thread preparing chunk c+1 reads the end of chunk c
+        if (history.size() < std::size_t(n_past + n)) history.resize(std::size_t(n_past + n));
+        std::copy(tokens, tokens + n, history.begin() + std::ptrdiff_t(n_past));
+        // a prompt fed in pieces (the server splits long ones) keeps the buffers of the previous piece if they fit
+        if (bound_T && (T > bound_T || (streaming && !ring) || kv_b > kv_stage_reserved)) end_prompt(false);
+        if (!bound_T) bind_prompt(T, streaming, ring_b, kv_b);
+        if (plan.size() > 1 && !h_x_alt) {
+            h_x_alt = std::make_unique<Pinned<float>>(host_cap * fc::kEmbd);
+            h_ple_alt = std::make_unique<Pinned<float>>(host_cap * fc::kEmbd);
+        }
+        std::vector<float> last;
+        int swaps = 0;
+        std::future<void> ahead;
+        auto swap_host = [&] {
+            std::swap(h_x, h_x_alt);
+            std::swap(h_ple, h_ple_alt);
+            ++swaps;
+        };
+        try {
+            std::int64_t i = 0;
+            for (std::size_t c = 0; c < plan.size(); ++c) {
+                if (ahead.valid()) {
+                    const auto w0 = clk::now();
+                    ahead.get();
+                    prof.add_host("prepare wait", std::chrono::duration<double, std::milli>(clk::now() - w0).count());
+                    swap_host();
+                    prepared_ahead = true;
+                }
+                if (c + 1 < plan.size()) {  // the next chunk's embeddings and PLE rows, while this one runs
+                    const std::int32_t * nt = tokens + i + plan[c].T;
+                    const int tn = plan[c + 1].T;
+                    const std::int64_t pn = n_past + plan[c].T;
+                    float * hx = h_x_alt->get();
+                    float * hp = h_ple_alt->get();
+                    ahead = std::async(std::launch::async, [this, nt, tn, pn, hx, hp] { prepare_host(nt, tn, pn, hx, hp); });
+                }
+                stream_chunk = plan[c].stream;
+                last = step(tokens + i, plan[c].T, false);
+                i += plan[c].T;
+                ++stats.steps;
+                ++stats.prompt_chunks;
+                // a hybrid chunk's routing predicts the rest of the prompt: re-rank the cache before the next one
+                if (!plan[c].stream && c + 1 < plan.size() && !plan[c + 1].stream) adapt_cache(1 << 30);
+            }
+            stream_chunk = false;
+            stats.last_chunk = T;
+            if (swaps & 1) swap_host();  // the decode graphs copy from the original buffers
+            // the buffers stay lent until a step that needs the cache (end_prompt): the next piece of a long
+            // prompt reuses them
+        } catch (...) {
+            if (ahead.valid()) ahead.wait();
+            stream_chunk = false;
+            prepared_ahead = false;
+            if (swaps & 1) swap_host();
+            end_prompt(false);
+            throw;
+        }
+        return last;
+    }
+
+    // Ends a prompt that borrowed buffers: the MTP layer catches up on the last chunk (its hidden rows are in
+    // the lent buffers), the permanent buffers come back, the lent VRAM is refilled with experts, and the cache
+    // is re-ranked from the prompt's routing (with adapt).
+    void end_prompt(bool adapt) {
+        if (!bound_T) return;
+        mtp_catchup();
+        unbind_prompt();
+        if (adapt) {
+            adapt_cache(1 << 30);
+            tokens_since_adapt = 0;
+            pairs_at_adapt = stats.expert_pairs;
+            hits_at_adapt = stats.expert_hits;
+        }
+    }
 };
 
 Engine::Engine(const GgufModel & model, EngineOptions options) : impl_(std::make_unique<Impl>(model, options)) {}
@@ -1379,8 +2266,15 @@ std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, boo
     const auto t0 = clk::now();
     std::vector<float> all, last;
     const std::size_t n = tokens.size();
+    // the MTP catch-up skips what no draft can attend to (NINFER_FN_MTP_FULL=1: every position, as before)
+    static const bool mtp_full = std::getenv("NINFER_FN_MTP_FULL") != nullptr;
+    impl_->mtp_skip_below = mtp_full ? 0 : std::max<std::int64_t>(0, impl_->n_past + std::int64_t(n) - cuda::kQsaWidth - 8);
+    // a long prompt borrows bigger chunk buffers from the expert cache (kept until a step that needs them back)
+    const bool lent = !all_logits && n > std::size_t(impl_->cap) && impl_->opt.prefill_lend;
+    if (lent) last = impl_->prompt(tokens.data(), std::int64_t(n));
+    if (last.empty()) impl_->end_prompt(true);
     const std::size_t chunk = all_logits ? cuda::kMaxTokens : std::size_t(impl_->cap);
-    for (std::size_t i = 0; i < n; i += chunk) {
+    for (std::size_t i = 0; i < n && last.empty(); i += chunk) {
         const int T = int(std::min(chunk, n - i));
         std::vector<float> lg = impl_->step(tokens.data() + i, T, all_logits);
         if (all_logits) all.insert(all.end(), lg.begin(), lg.end());
@@ -1396,13 +2290,16 @@ std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, boo
     I.tokens_since_adapt += std::int64_t(n);
     const std::int64_t pairs = I.stats.expert_pairs - I.pairs_at_adapt, hits = I.stats.expert_hits - I.hits_at_adapt;
     const bool lagging = pairs > 0 && double(hits) < 0.8 * double(pairs);
-    if (n >= 32 || I.tokens_since_adapt >= 256 || (lagging && I.tokens_since_adapt >= 64)) {
+    if (I.bound_T) {
+        // still borrowing the cache's tail: re-ranked when the prompt ends (end_prompt)
+    } else if (n >= 32 || I.tokens_since_adapt >= 256 || (lagging && I.tokens_since_adapt >= 64)) {
         I.adapt_cache(n >= 32 ? (1 << 30) : lagging ? 256 : 128);
         I.tokens_since_adapt = 0;
         I.pairs_at_adapt = I.stats.expert_pairs;
         I.hits_at_adapt = I.stats.expert_hits;
     }
     I.stats.step_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    if (n > std::size_t(cuda::kMaxTokens)) I.prof.report(stderr, ("prompt of " + std::to_string(n) + " tokens").c_str());
     return all_logits ? all : last;
 }
 
@@ -1416,6 +2313,12 @@ void Engine::restore(const EngineSnapshot & snapshot) { impl_->restore(snapshot)
 int Engine::n_vocab() const { return impl_->cfg.n_vocab; }
 void Engine::set_activation_hook(EngineHook hook) { impl_->hook = std::move(hook); }
 const EngineStats & Engine::stats() const { return impl_->stats; }
+void Engine::set_prefill(int chunk, bool stream) {
+    if (chunk < 0 || chunk > impl_->opt.prefill_chunk_max) throw std::runtime_error("engine: prefill chunk out of range");
+    if (!impl_->opt.prefill_lend && chunk > impl_->cap) throw std::runtime_error("engine: prefill chunk above the allocated buffers");
+    impl_->opt.prefill_chunk = chunk;
+    impl_->opt.prefill_stream = stream;
+}
 void Engine::save_routing_stats(const std::string & path) const { impl_->save_routing(path); }
 bool Engine::has_mtp() const { return impl_->mtp != nullptr; }
 std::vector<std::int32_t> Engine::draft(std::int32_t next, int k) { return impl_->draft(next, k); }
