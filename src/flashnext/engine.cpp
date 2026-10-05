@@ -1882,6 +1882,9 @@ struct Engine::Impl {
 
     // Swaps the activation buffers for views of a lent region sized for chunks of T tokens.
     void bind_prompt(int T, bool streaming, std::size_t ring_b, std::size_t kv_b) {
+        // The MTP layer consumes the previous step's hidden rows (in res) before res becomes a view of the lent
+        // region: read from there, they would be whatever the region held (NaN in the MTP K/V ring, invalid drafts).
+        mtp_catchup();
         std::vector<Act> acts = chunk_buffers(T);
         std::vector<std::size_t> offs;
         Carve c{chunk_layout(acts, &offs)};
