@@ -15,7 +15,8 @@ mishandles spaces in paths, so the checkout and the toolchain are reached throug
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param([switch]$Configure, [switch]$Install, [switch]$Test, [string[]]$Targets, [int]$Jobs = 16,
-      [string]$Tools = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) 'build-tools'))
+      [string]$Tools = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) 'build-tools'),
+      [string]$RootDrive = 'N', [string]$ToolsDrive = 'Q')
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Split-Path $PSScriptRoot)).Path
 $Tools = (Resolve-Path $Tools).Path
@@ -29,36 +30,37 @@ function Map-Drive([string]$letter, [string]$path) {
     if (-not $line.EndsWith("=> $path")) { throw "${letter}: is already mapped elsewhere: $line" }
 }
 try {
-    Map-Drive N $root
-    Map-Drive Q (Split-Path $Tools)
-    $t = "Q:/$(Split-Path $Tools -Leaf)"
-    New-Item -ItemType Directory -Force N:\build\tmp | Out-Null
-    $env:TEMP = 'N:\build\tmp'; $env:TMP = $env:TEMP
+    Map-Drive $RootDrive $root
+    $R = "${RootDrive}:"
+    Map-Drive $ToolsDrive (Split-Path $Tools)
+    $t = "${ToolsDrive}:/$(Split-Path $Tools -Leaf)"
+    New-Item -ItemType Directory -Force "$R\build\tmp" | Out-Null
+    $env:TEMP = "$R\build\tmp"; $env:TMP = $env:TEMP
     $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
     if (-not $ninja) { $ninja = (Get-ChildItem "$Tools" -Recurse -Filter ninja.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }
     if (-not $ninja) { throw 'ninja.exe not found (install it with: python -m pip install ninja)' }
 
-    if ($Configure -or -not (Test-Path N:\build\build.ninja)) {
-        cmake -S N:/ -B N:/build -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 `
+    if ($Configure -or -not (Test-Path "$R\build\build.ninja")) {
+        cmake -S $R/ -B $R/build -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 `
             "-DCMAKE_TOOLCHAIN_FILE=$t/vcpkg/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows `
             "-DVCPKG_INSTALLED_DIR=$t/vcpkg_installed-ninfer" -DVCPKG_MANIFEST_INSTALL=OFF `
             "-DCMAKE_CUDA_COMPILER=$t/cuda-13.3/bin/nvcc.exe" "-DCUDAToolkit_ROOT=$t/cuda-13.3" `
-            -DNINFER_WITH_FLASHNEXT=ON -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=OFF *> N:\build\configure.log
+            -DNINFER_WITH_FLASHNEXT=ON -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=OFF *> "$R\build\configure.log"
         $code = $LASTEXITCODE
-        Get-Content N:\build\configure.log | Select-Object -Last 8
+        Get-Content "$R\build\configure.log" | Select-Object -Last 8
         if ($code) { throw "configure failed ($code); see build\configure.log" }
     }
     $targetArgs = if ($Targets) { @('--target') + $Targets } else { @() }
-    cmake --build N:/build -j $Jobs @targetArgs *> N:\build\build.log
+    cmake --build $R/build -j $Jobs @targetArgs *> "$R\build\build.log"
     $code = $LASTEXITCODE
-    Get-Content N:\build\build.log | Select-String -Pattern ': error|error:|FAILED|fatal error|LNK[0-9]' | Select-Object -First 60 | ForEach-Object { $_.Line }
+    Get-Content "$R\build\build.log" | Select-String -Pattern ': error|error:|FAILED|fatal error|LNK[0-9]' | Select-Object -First 60 | ForEach-Object { $_.Line }
     if ($code) { throw "build failed ($code); see build\build.log" }
     'BUILD OK'
 
     if ($Test) {
-        ctest --test-dir N:/build --output-on-failure -j 1 *> N:\build\ctest.log
+        ctest --test-dir $R/build --output-on-failure -j 1 *> "$R\build\ctest.log"
         $code = $LASTEXITCODE
-        Get-Content N:\build\ctest.log | Select-Object -Last 15
+        Get-Content "$R\build\ctest.log" | Select-Object -Last 15
         if ($code) { throw "tests failed ($code); see build\ctest.log" }
     }
 
@@ -66,14 +68,14 @@ try {
         $app = Join-Path $root 'app'
         New-Item -ItemType Directory -Force $app, "$app\logs", "$app\templates" | Out-Null
         $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        foreach ($exe in 'ninfer-serve.exe', 'ninfer.exe', 'ninfer-perplexity.exe') { Copy-Item "N:\build\apps\$exe" $app -Force }
-        Copy-Item N:\build\apps\*.dll $app -Force
-        foreach ($s in 'Start-NInfer.ps1', 'Stop-NInfer.ps1', 'NInfer-Tray.ps1', 'Start-NInferTray.ps1') { Copy-Item "N:\windows\$s" $app -Force }
+        foreach ($exe in 'ninfer-serve.exe', 'ninfer.exe', 'ninfer-perplexity.exe') { Copy-Item "$R\build\apps\$exe" $app -Force }
+        Copy-Item "$R\build\apps\*.dll" $app -Force
+        foreach ($s in 'Start-NInfer.ps1', 'Stop-NInfer.ps1', 'NInfer-Tray.ps1', 'Start-NInferTray.ps1') { Copy-Item "$R\windows\$s" $app -Force }
         if (Test-Path "$app\ninfer-models.json") { Copy-Item "$app\ninfer-models.json" "$app\ninfer-models.json.bak_$stamp" }
-        Copy-Item N:\windows\ninfer-models.json $app -Force
-        if (-not (Test-Path "$app\templates\froggeric-v22.5")) { Copy-Item N:\third_party\froggeric "$app\templates\froggeric-v22.5" -Recurse }
+        Copy-Item "$R\windows\ninfer-models.json" $app -Force
+        if (-not (Test-Path "$app\templates\froggeric-v22.5")) { Copy-Item "$R\third_party\froggeric" "$app\templates\froggeric-v22.5" -Recurse }
         New-Item -ItemType Directory -Force "$app\tools" | Out-Null
-        Copy-Item N:\tools\upgrade_ninfer_v2_to_v3.py "$app\tools" -Force
+        Copy-Item "$R\tools\upgrade_ninfer_v2_to_v3.py" "$app\tools" -Force
         $info = [ordered]@{ built = (Get-Date -Format s); commit = (git -C $root rev-parse --short HEAD); flashnext = $true }
         $info | ConvertTo-Json | Set-Content "$app\BUILD-INFO.json"
         "INSTALLED into $app (previous profiles: ninfer-models.json.bak_$stamp)"
