@@ -7,11 +7,13 @@ add_library(ninfer_flashnext STATIC
   cpu_experts.cpp
   reference.cpp
   engine.cpp
+  kv_cache.cpp
   cuda/gemv.cu
   cuda/ops.cu
   cuda/experts.cu
   cuda/gemm.cu
   cuda/qsa.cu
+  cuda/kv_stream.cu
   cuda/experts_batch.cu)
 target_include_directories(ninfer_flashnext PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(ninfer_flashnext PUBLIC CUDA::cublas ${NINFER_CUDART_TARGET} Threads::Threads)

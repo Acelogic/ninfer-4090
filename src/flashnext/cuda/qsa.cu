@@ -523,9 +523,11 @@ std::size_t attn_sparse_work_floats(int T) {  // enough for any T' <= T (T' * sp
     return parts * kKvHeads * kGroup * kSpStride;
 }
 
+int attn_sparse_splits(int T) { return sparse_splits(T); }
+
 void attn_sparse(const float * q, const float * gate, const half * k_cache, const half * v_cache, const std::int32_t * cells,
-                 const std::int32_t * n_cells, int T, float scale, float * work, float * out, cudaStream_t s) {
-    const int n_split = sparse_splits(T);
+                 const std::int32_t * n_cells, int T, float scale, float * work, float * out, cudaStream_t s, int split_T) {
+    const int n_split = sparse_splits(split_T > 0 ? split_T : T);
     k_attn_sparse_partial<<<dim3(n_split, kKvHeads, T), kSpThreads, 0, s>>>(q, k_cache, v_cache, cells, n_cells, scale, n_split, work);
     launched("attn_sparse_partial");
     k_attn_sparse_combine<<<T * kHeads, kHeadDim, 0, s>>>(work, gate, n_split, out);

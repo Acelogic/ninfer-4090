@@ -10,6 +10,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "flashnext/cuda/kv_stream.h"
+
 namespace ninfer::flashnext::cuda {
 
 constexpr int kEmbd = 2560;
@@ -86,8 +88,10 @@ void ple_hist_rebuild(const float * prev, const float * normalized, float * hist
 void rms_norm_rows(const float * x, const float * w, float * y, int rows, int n, float eps, cudaStream_t s);
 // out[t][c] = [e[t] | h[t][c]] for the 4 hyper-connection streams: [T][4][2 * 2560]
 void mtp_concat(const float * e, const float * h, float * out, int T, cudaStream_t s);
-// cells[t] = the last min(p + 1, 2051) positions up to p = pos0 + t; n_cells[t] = their count
-void window_cells(const std::int64_t * pos0, int T, int width, std::int32_t * cells, std::int32_t * n_cells, cudaStream_t s);
+// cells[t] = the last min(p + 1, 2051) positions up to p = pos0 + t; n_cells[t] = their count. With ring > 0
+// the cells are rows of a ring of that many rows (position % ring), the MTP layer's K/V ring.
+void window_cells(const std::int64_t * pos0, int T, int width, std::int32_t * cells, std::int32_t * n_cells, cudaStream_t s,
+                  std::int64_t ring = 0);
 // index of the largest of n values (ties to the lower index)
 void argmax(const float * x, int n, std::int32_t * out, cudaStream_t s);
 
@@ -95,10 +99,14 @@ void argmax(const float * x, int n, std::int32_t * out, cudaStream_t s);
 // Positions are read from device memory (pos0: the first token's position) so that a decode step
 // can be replayed as a CUDA graph. rope_inv_freq: [kRot/2] doubles in device memory.
 // q_full [T][24][q 256 | gate 256] -> q [T][24][256] (normed, rotated), gate [T][24][256];
-// k, v [T][2][256] -> rows pos0.. of the fp16 caches [ctx][2][256] (k normed and rotated).
+// k, v [T][2][256] -> rows pos0.. of the fp16 caches [ctx][2][256] (k normed and rotated), or to the
+// targets of a KvStore (a ring, a host copy beside a staging pool, a page cache).
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
                const double * rope_inv_freq, float * q, float * gate, half * k_cache, half * v_cache, const std::int64_t * pos0, int T,
                float eps, cudaStream_t s);
+void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
+               const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0, int T, float eps,
+               cudaStream_t s);
 // Causal softmax attention of T queries over cells [0, pos0 + t] times sigmoid(gate). out [T][24][256].
 // Dense attention covers at most kAttnMaxCells cells (beyond that QSA selects 2051 of them), in up to
 // kAttnMaxChunks chunks; chunks past the context exit at once. work: attn_work_floats(T) floats.
