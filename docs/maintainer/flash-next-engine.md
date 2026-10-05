@@ -462,9 +462,24 @@ relative L2 error of the rows:
 | wallpaper | 1,024 | | | 5.6e-3 (0.9999827) |
 
 llama.cpp's error is its own (activations rounded to f16 for the F16 weights and in flash attention, a
-table GELU); the merger's GELU variant changes nothing at these digits. Encode time on the GPU
-(`fn_vision --repeat 3`, warm, with a build running on the CPU): 37 ms (196 tokens), 50 ms (300),
-59 ms (375), 203 ms (1,024); llama.cpp on the CPU (16 threads): 1.6, 2.7, 4.0 and 19.5 s.
+table GELU); the merger's GELU variant changes nothing at these digits.
+
+Encode time on the GPU (`fn_vision --repeat 3`, warm, idle machine; the stages from
+`NINFER_FN_VISION_PROFILE=1`), and llama.cpp on the CPU (16 threads) for comparison:
+
+| Image | Patches | Tokens | Encode | Attention | Other layers (QKV, MLP, merger) | Workspace lent | llama.cpp CPU |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 448 x 448 | 784 | 196 | 37 ms | 6 ms | 29 ms | 272 MiB | 1.6 s |
+| 640 x 480 | 1,200 | 300 | 52 ms | 11 ms | 39 ms | 283 MiB | 2.7 s |
+| 800 x 480 | 1,500 | 375 | 59 ms | 14 ms | 43 ms | 290 MiB | 4.0 s |
+| 1024 x 1024 | 4,096 | 1,024 | 204 ms | 100 ms | 100 ms | 356 MiB | 19.5 s |
+| 1920 x 1088 | 8,160 | 2,040 | 653 ms | 450 ms | 195 ms | 458 MiB | |
+| 2048 x 2048 | 16,384 | 4,096 (the most per image) | 2.07 s | 1.69 s | 0.37 s | 666 MiB | |
+
+Small images are bound by the weights' copy (0.9 GB per image over PCIe, hidden behind the layers from
+about 1,000 patches on); large ones by the attention (quadratic in the patches, about 18 TFLOPS on the
+CUDA cores; the GEMMs run at about 35 TFLOPS). The first encode after the server starts adds about
+40 ms (cuBLAS set-up).
 
 The whole model on image prompts, against llama.cpp on the CPU (`vision_ref case`, then
 `fn_vision --case`; first next-token logits and 24 greedy tokens; "llama rows" feeds llama.cpp's image
@@ -479,7 +494,30 @@ rows to our engine, isolating the language model):
 
 Top-1 agrees everywhere. With images the logits sit further from llama.cpp's than with text; our rows
 and llama.cpp's give the same continuations, so the differences come from the language model's rounding,
-not from the encoder or the positions (see the FP32 reference below).
+not from the encoder or the positions. Against the FP32 reference model on the same inputs
+(`fn_vision --compare-ref`, chart prompt): rel L2 3.4e-2 with top-10 identical (0.15 and 9 of the top 10
+with llama.cpp's rows in both), in line with text prompts of that length (section 4.2: expert selections
+that flip at near-ties).
+
+Text-only work is unchanged. `fn_generate --hash` with a pinned cache gives bitwise the same prompt, decode,
+verify and draft hashes as main for the oracle prompts p1 (with the snapshot test), p2 and p3, the
+2,600-token prompt at 262K with MTP 3 and a 7,800-token prompt fed in pieces of 1,536 with MTP. Decode,
+`fn_generate -n 256` at 64K, three alternating runs each: code without MTP 53.5 tok/s (main) and 53.7 (this
+tree), chat with MTP 2 89.8 and 90.1. The server with `--flashnext-vision` keeps 3 experts fewer in its
+cache (11.16 against 11.17 GiB: the cuBLAS handle) and the encoder's 0.9 GB in pinned RAM; text requests
+decode and prefill as before (23.6K-token prompt: 2,759 tok/s with the encoder loaded, 2,763 on main).
+
+Through the server (`ninfer-serve --flashnext-vision`, 262K window, MTP 3, temperature 0): a photograph
+described, an error screenshot read verbatim (port, exception, quoted value), a chart's values, a follow-up
+turn reusing 595 of 628 tokens, an image in the middle of a conversation (402 of 436 reused), two images
+told apart, a 1920 x 1080 screenshot resized to 60 x 34 tokens (encode 0.66 s, TTFT 3.5 s), the Anthropic
+endpoint, a 66,652-token prompt with an image at its end (both the planted codename and the chart value;
+TTFT 24.9 s, decode 44 tok/s), an image across the boundary of the server's 8,192-token prompt pieces, and
+a six-turn conversation fed piecewise with images in two turns (MTP on, no invalid drafts): all correct on
+the base model and on Huihui. In `fn_vision`, the chart prompt fed in pieces of 100 tokens (the image split
+three times) and the 3,288-token prompt in pieces of 1,000 keep all 24 greedy tokens equal to llama.cpp's. An image that a conversation resends is
+neither encoded nor computed again: its turn reuses the cached prompt (TTFT 0.3 s) and the encoded-image
+cache serves new prompts with it.
 
 ## 5. Next
 
