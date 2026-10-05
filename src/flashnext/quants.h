@@ -51,9 +51,23 @@ struct BlockQ4L {
     std::uint8_t scales[4];
     std::uint8_t qs[128];
 };
+// Q4X: an IQ4_XS block in the Q4L nibble layout with plain 8-bit block scales (ls - 32) (CpuExperts' gate/up
+// format for IQ4_XS layers).
+struct BlockQ4X {
+    std::uint16_t d;
+    std::int8_t scales[8];
+    std::uint8_t qs[128];
+};
+// IQ4L: one 640-wide IQ4_NL row (20 blocks): the 20 fp16 scales, then ten 64-weight chunks of nibbles in the Q4L
+// layout (CpuExperts' down format for IQ4_NL layers).
+struct RowIQ4L {
+    std::uint16_t d[20];
+    std::uint8_t qs[320];
+};
 #pragma pack(pop)
 static_assert(sizeof(BlockQ8_0) == 34 && sizeof(BlockQ6_K) == 210 && sizeof(BlockIQ4_NL) == 18 &&
-              sizeof(BlockIQ4_XS) == 136 && sizeof(BlockIQ3_S) == 110 && sizeof(BlockQ4L) == 134,
+              sizeof(BlockIQ4_XS) == 136 && sizeof(BlockIQ3_S) == 110 && sizeof(BlockQ4L) == 134 && sizeof(BlockQ4X) == 138 &&
+                  sizeof(RowIQ4L) == 360,
               "block sizes match ggml");
 
 extern const std::int8_t kIQ4NLValues[16];

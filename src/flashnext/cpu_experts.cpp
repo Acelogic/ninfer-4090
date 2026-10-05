@@ -25,20 +25,6 @@ namespace ninfer::flashnext {
 
 namespace {
 
-#pragma pack(push, 1)
-// IQ4_XS block in the Q4L nibble layout with plain 8-bit block scales (ls - 32).
-struct BlockQ4X {
-    std::uint16_t d;
-    std::int8_t scales[8];
-    std::uint8_t qs[128];
-};
-// One 640-wide IQ4_NL row (20 blocks): the 20 fp16 scales, then ten 64-weight chunks of nibbles.
-struct RowIQ4L {
-    std::uint16_t d[20];
-    std::uint8_t qs[320];
-};
-#pragma pack(pop)
-static_assert(sizeof(BlockQ4X) == 138 && sizeof(RowIQ4L) == 360, "layouts");
 
 enum class GateUp { Q4L, Q4X };
 enum class Down { IQ4L, Q8_0 };
@@ -49,12 +35,13 @@ struct Buffer {
     Buffer() = default;
     Buffer(const Buffer &) = delete;
     Buffer & operator=(const Buffer &) = delete;
-    void alloc(std::size_t bytes) {
+    // align: a power of two; page-aligned (4096) buffers can be registered with the CUDA driver as a whole
+    void alloc(std::size_t bytes, std::size_t align = 64) {
         release();
 #if defined(_WIN32)
-        p = static_cast<std::uint8_t *>(_aligned_malloc(bytes, 64));
+        p = static_cast<std::uint8_t *>(_aligned_malloc((bytes + align - 1) / align * align, align));
 #else
-        p = static_cast<std::uint8_t *>(std::aligned_alloc(64, (bytes + 63) / 64 * 64));
+        p = static_cast<std::uint8_t *>(std::aligned_alloc(align, (bytes + align - 1) / align * align));
 #endif
         if (!p) throw std::bad_alloc();
         n = bytes;
@@ -269,10 +256,14 @@ struct alignas(64) HAct16 {
     float d[20];
 };
 
+// Every expert's matrices are stored together, [gate | up | down] at e * stride, so that one expert (or a run of
+// experts with consecutive ids) is one contiguous range: the GPU streams them with one copy each (prefill).
 struct CpuExperts::Layer {
     GateUp gu{};
     Down dn{};
-    Buffer gate, up, down;
+    Buffer blob;  // [kExperts][stride], page-aligned
+    std::uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;  // expert 0's matrices; expert e's at + e * stride
+    std::size_t stride = 0;
     std::size_t gu_row_bytes = 0, gu_expert_bytes = 0, dn_row_bytes = 0, dn_expert_bytes = 0;
 };
 
@@ -559,9 +550,11 @@ CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
         }
         L->gu_expert_bytes = L->gu_row_bytes * kFF;
         L->dn_expert_bytes = L->dn_row_bytes * kEmbd;
-        L->gate.alloc(L->gu_expert_bytes * kExperts);
-        L->up.alloc(L->gu_expert_bytes * kExperts);
-        L->down.alloc(L->dn_expert_bytes * kExperts);
+        L->stride = 2 * L->gu_expert_bytes + L->dn_expert_bytes;
+        L->blob.alloc(L->stride * kExperts, 4096);
+        L->gate = L->blob.p;
+        L->up = L->blob.p + L->gu_expert_bytes;
+        L->down = L->blob.p + 2 * L->gu_expert_bytes;
         Layer * Lp = L.get();
         const int nt = pool_.size();
         pool_.run([&](int t) {
@@ -569,29 +562,29 @@ CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
                 if (Lp->gu == GateUp::Q4L) {
                     const std::size_t src_bytes = std::size_t(kFF) * 10 * sizeof(BlockIQ3_S);
                     repack_iq3s_to_q4l(reinterpret_cast<const BlockIQ3_S *>(tg.data + e * src_bytes),
-                                       reinterpret_cast<BlockQ4L *>(Lp->gate.p + e * Lp->gu_expert_bytes), kFF * 10);
+                                       reinterpret_cast<BlockQ4L *>(Lp->gate + e * Lp->stride), kFF * 10);
                     repack_iq3s_to_q4l(reinterpret_cast<const BlockIQ3_S *>(tu.data + e * src_bytes),
-                                       reinterpret_cast<BlockQ4L *>(Lp->up.p + e * Lp->gu_expert_bytes), kFF * 10);
+                                       reinterpret_cast<BlockQ4L *>(Lp->up + e * Lp->stride), kFF * 10);
                 } else {
                     const std::size_t src_bytes = std::size_t(kFF) * 10 * sizeof(BlockIQ4_XS);
                     for (int i = 0; i < kFF * 10; ++i) {
                         repack_iq4xs_block(reinterpret_cast<const BlockIQ4_XS *>(tg.data + e * src_bytes)[i],
-                                           reinterpret_cast<BlockQ4X *>(Lp->gate.p + e * Lp->gu_expert_bytes)[i]);
+                                           reinterpret_cast<BlockQ4X *>(Lp->gate + e * Lp->stride)[i]);
                         repack_iq4xs_block(reinterpret_cast<const BlockIQ4_XS *>(tu.data + e * src_bytes)[i],
-                                           reinterpret_cast<BlockQ4X *>(Lp->up.p + e * Lp->gu_expert_bytes)[i]);
+                                           reinterpret_cast<BlockQ4X *>(Lp->up + e * Lp->stride)[i]);
                     }
                 }
                 if (Lp->dn == Down::IQ4L) {
                     const std::size_t src_row = 20 * sizeof(BlockIQ4_NL);
                     for (int r = 0; r < kEmbd; ++r)
                         repack_iq4nl_row(reinterpret_cast<const BlockIQ4_NL *>(td.data + (std::size_t(e) * kEmbd + r) * src_row),
-                                         reinterpret_cast<RowIQ4L *>(Lp->down.p + e * Lp->dn_expert_bytes)[r]);
+                                         reinterpret_cast<RowIQ4L *>(Lp->down + e * Lp->stride)[r]);
                 } else {
-                    std::memcpy(Lp->down.p + e * Lp->dn_expert_bytes, td.data + e * Lp->dn_expert_bytes, Lp->dn_expert_bytes);
+                    std::memcpy(Lp->down + e * Lp->stride, td.data + e * Lp->dn_expert_bytes, Lp->dn_expert_bytes);
                 }
             }
         });
-        resident_bytes_ += L->gate.n + L->up.n + L->down.n;
+        resident_bytes_ += L->blob.n;
         layers_[std::size_t(il)] = std::move(L);
     }
 }
@@ -605,6 +598,20 @@ bool CpuExperts::has_layer(int layer) const {
 std::size_t CpuExperts::expert_bytes(int layer) const {
     const Layer & L = *layers_.at(std::size_t(layer));
     return 2 * L.gu_expert_bytes + L.dn_expert_bytes;
+}
+
+CpuExperts::HostLayer CpuExperts::host_layer(int layer) const {
+    if (!has_layer(layer)) throw std::runtime_error("CpuExperts: layer " + std::to_string(layer) + " is not loaded");
+    const Layer & L = *layers_[std::size_t(layer)];
+    HostLayer h;
+    h.base = L.blob.p;
+    h.stride = L.stride;
+    h.gate_bytes = L.gu_expert_bytes;
+    h.down_bytes = L.dn_expert_bytes;
+    h.bytes = (L.stride * kExperts + 4095) / 4096 * 4096;
+    h.gate_q4x = L.gu == GateUp::Q4X;
+    h.down_q8 = L.dn == Down::Q8_0;
+    return h;
 }
 
 const char * CpuExperts::format_name(int layer) const {
@@ -663,8 +670,8 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
         const int r0 = gu_rows * th / nt, r1 = gu_rows * (th + 1) / nt;
         for (int r = r0; r < r1; ++r) {
             const int u = r / kFF, row = r % kFF;
-            const std::uint8_t * gp = L.gate.p + std::size_t(experts[u]) * L.gu_expert_bytes + std::size_t(row) * L.gu_row_bytes;
-            const std::uint8_t * up = L.up.p + std::size_t(experts[u]) * L.gu_expert_bytes + std::size_t(row) * L.gu_row_bytes;
+            const std::uint8_t * gp = L.gate + std::size_t(experts[u]) * L.stride + std::size_t(row) * L.gu_row_bytes;
+            const std::uint8_t * up = L.up + std::size_t(experts[u]) * L.stride + std::size_t(row) * L.gu_row_bytes;
             for (int p0 = pair_start[u]; p0 < pair_start[u + 1]; p0 += 4) {
                 const int n = std::min(4, pair_start[u + 1] - p0);
                 const XAct * xs[4];
@@ -732,7 +739,7 @@ void CpuExperts::run(int layer, int n_tokens, const float * x, const std::int32_
         for (int r = r0; r < r1; ++r) {
             float acc[kMaxTokens] = {};
             for (int u = 0; u < n_experts; ++u) {
-                const std::uint8_t * row = L.down.p + std::size_t(experts[u]) * L.dn_expert_bytes + std::size_t(r) * L.dn_row_bytes;
+                const std::uint8_t * row = L.down + std::size_t(experts[u]) * L.stride + std::size_t(r) * L.dn_row_bytes;
                 for (int p0 = pair_start[u]; p0 < pair_start[u + 1]; p0 += 4) {
                     const int n = std::min(4, pair_start[u + 1] - p0);
                     const HAct * hs[4];
@@ -1409,7 +1416,7 @@ void CpuExperts::run_batch_impl(int layer, int n_tokens, const float * x, const 
     auto slot = [&](int task) { return task % 2 == 0 ? task / 2 : n_tasks - 1 - task / 2; };
     auto panel_at = [&](const std::uint8_t * mat, int task) {
         const int k = slot(task);
-        return mat + std::size_t(B.experts[std::size_t(k / (kFF / 32))]) * L.gu_expert_bytes + std::size_t(k % (kFF / 32)) * panel;
+        return mat + std::size_t(B.experts[std::size_t(k / (kFF / 32))]) * L.stride + std::size_t(k % (kFF / 32)) * panel;
     };
     std::atomic<int> next_task{0};
     pool_.run([&](int th) {
@@ -1426,10 +1433,10 @@ void CpuExperts::run_batch_impl(int layer, int n_tokens, const float * x, const 
             const int next = next_task.fetch_add(1, std::memory_order_relaxed);
             const int u = slot(task) / (kFF / 32), j = slot(task) % (kFF / 32);
             const int pb = B.start[std::size_t(u)], pe = B.start[std::size_t(u) + 1];
-            if (next < n_tasks) pf.start(panel_at(L.gate.p, next), panel, panel_at(L.up.p, next), panel, 4 + 10 * ((pe - pb + kNtGU - 1) / kNtGU));
+            if (next < n_tasks) pf.start(panel_at(L.gate, next), panel, panel_at(L.up, next), panel, 4 + 10 * ((pe - pb + kNtGU - 1) / kNtGU));
             for (int rv = 0; rv < 4; ++rv) {
                 pf.step();
-                const std::uint8_t * rows = panel_at(rv < 2 ? L.gate.p : L.up.p, task) + std::size_t(16 * (rv & 1)) * L.gu_row_bytes;
+                const std::uint8_t * rows = panel_at(rv < 2 ? L.gate : L.up, task) + std::size_t(16 * (rv & 1)) * L.gu_row_bytes;
                 if constexpr (P) decode_gu16_p(L.gu, rows, L.gu_row_bytes, W, SD, rv);
                 else decode_gu16(L.gu, rows, L.gu_row_bytes, W, S, D, rv);
             }
@@ -1489,7 +1496,7 @@ void CpuExperts::run_batch_impl(int layer, int n_tokens, const float * x, const 
         // streaming of the small ones around it. All threads use the same order, so each expert's h is read by all of
         // them at about the same time, mostly from the L3.
         auto rank = [&](int u) { return u % 2 == 0 ? u / 2 : n_experts - 1 - u / 2; };
-        auto slice_at = [&](int u) { return L.down.p + std::size_t(B.experts[std::size_t(rank(u))]) * L.dn_expert_bytes + std::size_t(r0) * L.dn_row_bytes; };
+        auto slice_at = [&](int u) { return L.down + std::size_t(B.experts[std::size_t(rank(u))]) * L.stride + std::size_t(r0) * L.dn_row_bytes; };
         // weights two experts ahead: one expert's kernels can be shorter than the time its successor takes to stream in
         Prefetcher pf;
         pf.start(slice_at(0), slice, n_experts > 1 ? slice_at(1) : nullptr, n_experts > 1 ? slice : 0, 1);
@@ -1640,7 +1647,7 @@ void CpuExperts::export_expert(int layer, int e, std::uint8_t * gate, std::uint8
     if (!has_layer(layer)) throw std::runtime_error("CpuExperts: layer " + std::to_string(layer) + " is not loaded");
     if (e < 0 || e >= kExperts) throw std::runtime_error("CpuExperts: expert id out of range");
     const Layer & L = *layers_[std::size_t(layer)];
-    const std::uint8_t * src[2] = {L.gate.p + std::size_t(e) * L.gu_expert_bytes, L.up.p + std::size_t(e) * L.gu_expert_bytes};
+    const std::uint8_t * src[2] = {L.gate + std::size_t(e) * L.stride, L.up + std::size_t(e) * L.stride};
     std::uint8_t * dst[2] = {gate, up};
     for (int k = 0; k < 2; ++k) {
         if (!dst[k]) continue;
@@ -1656,7 +1663,7 @@ void CpuExperts::export_expert(int layer, int e, std::uint8_t * gate, std::uint8
         }
     }
     if (!down) return;
-    const std::uint8_t * ds = L.down.p + std::size_t(e) * L.dn_expert_bytes;
+    const std::uint8_t * ds = L.down + std::size_t(e) * L.stride;
     if (L.dn == Down::IQ4L) {
         for (int r = 0; r < kEmbd; ++r) export_iq4nl_row(reinterpret_cast<const RowIQ4L *>(ds)[r], reinterpret_cast<BlockIQ4_NL *>(down) + 20 * r);
     } else {

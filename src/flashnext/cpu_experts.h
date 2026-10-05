@@ -76,6 +76,18 @@ public:
     };
     ExportSizes export_sizes(int layer) const;
 
+    // A layer's resident copy as raw bytes, for streaming experts to the GPU: expert e is the range
+    // [base + e * stride, + stride) holding gate (gate_bytes), up (gate_bytes) and down (down_bytes) in this class's
+    // lossless repacks (gate/up Q4L or Q4X, down IQ4L or Q8_0; quants.h). base is page-aligned; the layer spans
+    // `bytes` (kExperts * stride rounded up to a page). Valid for the lifetime of this object.
+    struct HostLayer {
+        const std::uint8_t * base = nullptr;
+        std::size_t stride = 0, gate_bytes = 0, down_bytes = 0, bytes = 0;
+        bool gate_q4x = false;  // gate/up: Q4X (from IQ4_XS), else Q4L (from IQ3_S)
+        bool down_q8 = false;   // down: Q8_0 as in the GGUF, else IQ4L (from IQ4_NL)
+    };
+    HostLayer host_layer(int layer) const;
+
     bool precise_activations() const { return precise_; }
     bool has_layer(int layer) const;
     std::size_t resident_bytes() const { return resident_bytes_; }
