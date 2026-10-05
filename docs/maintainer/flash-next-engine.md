@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next in NInfer Extreme
 
-Status: the engine runs end to end at full context with speculative decoding and KV streaming, 2026-10-05.
+Status: the engine runs end to end at full context with speculative decoding, KV streaming and image
+input, 2026-10-05.
 
 This document plans a Flash-Next runtime tailored to one machine: an RTX 4090 that also drives the
 desktop (about 22.5 GiB usable), a Ryzen 9 7950X (16 cores, AVX-512 with VNNI), and 192 GiB of
