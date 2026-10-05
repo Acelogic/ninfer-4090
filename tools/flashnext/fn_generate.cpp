@@ -3,7 +3,7 @@
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
-//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot] [--mtp mtp.gguf [--draft K]]
+//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot] [--mtp mtp.gguf [--draft K]] [--hash]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
@@ -11,6 +11,8 @@
 // relative error of every intermediate both produce, then the agreement of the prompt's logits.
 // --routing-stats loads expert routing counts to choose the experts kept in VRAM, and saves the
 // updated counts at the end.
+// --hash prints 64-bit FNV-1a hashes of the prompt's logits, of every later forward()'s logits and of
+// the MTP drafts, so that two builds or configurations can be checked for bitwise identical results.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -89,6 +91,13 @@ std::int32_t argmax(const float * x, std::size_t n) {
     return std::int32_t(std::max_element(x, x + n) - x);  // first of equal maxima, like top_k
 }
 
+// FNV-1a over raw bytes, chained through h
+std::uint64_t fnv1a(const void * data, std::size_t n, std::uint64_t h = 1469598103934665603ull) {
+    const unsigned char * p = static_cast<const unsigned char *>(data);
+    for (std::size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
 double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -125,7 +134,8 @@ int main(int argc, char ** argv) {
 static int run(int argc, char ** argv) {
     std::string model_path, tokens_arg, tokens_file, json_path, dump_dir;
     int n_gen = 16;
-    bool compare_ref = false, test_snapshot = false;
+    bool compare_ref = false, test_snapshot = false, hash = false;
+    std::uint64_t h_decode = fnv1a(nullptr, 0), h_drafts = fnv1a(nullptr, 0);
     int n_draft = 2;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
@@ -155,6 +165,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--pin") opt.pin_cpu_threads = true;
         else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--gpu-miss-permille") opt.gpu_miss_permille = std::stoi(next());
+        else if (a == "--hash") hash = true;
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -189,6 +200,7 @@ static int run(int argc, char ** argv) {
     std::vector<float> logits = engine.forward(prompt);
     const double t_prefill = seconds_since(t0);
     engine.set_activation_hook(nullptr);
+    if (hash) std::printf("hash prompt logits: %016llx\n", (unsigned long long) fnv1a(logits.data(), logits.size() * sizeof(float)));
     std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s; %lld cached experts swapped (%.2f s); CPU experts %.2f s\n", prompt.size(),
                 t_prefill, double(prompt.size()) / t_prefill, capture ? " with intermediates captured" : "", (long long) engine.stats().cache_swaps,
                 engine.stats().cache_swap_ms / 1e3, engine.stats().cpu_experts_ms / 1e3);
@@ -316,10 +328,12 @@ static int run(int argc, char ** argv) {
             auto td = std::chrono::steady_clock::now();
             const std::vector<std::int32_t> d = engine.draft(tok, n_draft);
             draft_s += seconds_since(td);
+            h_drafts = fnv1a(d.data(), d.size() * sizeof(std::int32_t), h_drafts);
             seq.insert(seq.end(), d.begin(), d.end());
             auto tv = std::chrono::steady_clock::now();
             const std::vector<float> lg = engine.forward(seq, true);
             verify_s += seconds_since(tv);
+            h_decode = fnv1a(lg.data(), lg.size() * sizeof(float), h_decode);
             int keep = 1;
             std::int32_t next = argmax(lg.data(), V);
             for (std::size_t i = 0; i < d.size() && next == d[i]; ++i) {
@@ -342,6 +356,8 @@ static int run(int argc, char ** argv) {
                     100.0 * accepted / std::max(1, drafted), double(generated.size()) / std::max(1, steps));
         std::printf("per step: draft %.2f ms, verify %.2f ms (CPU experts %.2f ms), other %.2f ms\n", 1e3 * draft_s / steps, 1e3 * verify_s / steps,
                     (engine.stats().cpu_experts_ms - cpu0) / steps, 1e3 * (total - draft_s - verify_s) / steps);
+        if (hash)
+            std::printf("hash verify logits: %016llx; hash drafts: %016llx\n", (unsigned long long) h_decode, (unsigned long long) h_drafts);
         if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
         if (!json_path.empty()) {
             std::ofstream f(json_path);
@@ -363,10 +379,12 @@ static int run(int argc, char ** argv) {
         auto ts = std::chrono::steady_clock::now();
         logits = engine.forward({next});
         step_times.push_back(seconds_since(ts));
+        h_decode = fnv1a(logits.data(), logits.size() * sizeof(float), h_decode);
     }
     std::printf("generated:");
     for (std::int32_t id : generated) std::printf(" %d", id);
     std::printf("\n");
+    if (hash) std::printf("hash decode logits: %016llx\n", (unsigned long long) h_decode);
     if (!step_times.empty()) {
         const double total = std::accumulate(step_times.begin(), step_times.end(), 0.0);
         const EngineStats & st = engine.stats();
