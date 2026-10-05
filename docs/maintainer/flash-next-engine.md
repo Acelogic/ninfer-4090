@@ -99,15 +99,76 @@ routing predicts its continuation well: on a 2,000-token code prompt, decode hit
 
 ### 3.5 Prompts
 
-Chunks of 512 to 2,048 tokens (`prefill_chunk`):
-- dense layers as exact FP32 GEMMs (each matrix dequantized into a scratch buffer, cuBLAS SGEMM
-  without TF32);
-- the DeltaNet recurrence over the whole chunk;
-- cached experts as tensor-core GEMMs grouped by expert (`experts_gpu_batch`: exact weights,
-  activations as two fp16 terms, 4e-7 relative error, bitwise reproducible);
-- the other experts on the CPU (`CpuExperts::run_batch`: each expert read from RAM once per chunk,
-  register-tiled VNNI micro-kernels), concurrently;
-- the expert cache re-ranked between chunks, since a chunk's routing predicts the rest of the prompt.
+A prompt of more than 512 tokens runs in big chunks with every routed expert on the GPU (code:
+`engine.cpp` "Prompt processing", `prefill.{h,cpp}`, `cuda/expert_stream.cu`, the phased API of
+`cuda/experts_batch.cu`). Per chunk:
+
+- **Buffers borrowed from the expert cache.** The cache is one VRAM arena (each layer's pool a part of
+  it). A prompt lends the arena's tail to the chunk's activations, the experts' workspace, the
+  streaming ring and the conversion slots, and the experts that lived there leave the cache. The
+  activation buffers overlay each other by stage (the hyper-connection mixer, PLE, DeltaNet,
+  attention and FFN never hold live data at the same time; about 235 KiB per token, the experts'
+  workspace included; 3.5 GiB for 8,192 tokens with the 1.5 GiB ring and the conversion slots, 4 GiB
+  at 250K depth with the KV staging pool). The buffers stay lent across consecutive prompt
+  calls (the server feeds long prompts in pieces of 8,192) and come back at the next decode step or
+  draft (`end_prompt`): the lent slots are refilled with the uncached experts that rank highest for
+  the cache, copied from pinned RAM and converted on the GPU (about 0.1 ms per expert), then the cache
+  is re-ranked as after any prompt.
+- **Chunk size.** `prefill_chunk = 0` (the default) takes per prompt the largest chunk on a 256-token
+  grid, up to 8,192 (`prefill_chunk_max`), whose buffers, a ring of up to 1.5 GiB (at least 256 MiB)
+  and, when KV streaming stages the prompt's chunks (section 3.9), the staging pool (2 KiB per
+  context token, 512 MiB at 262K; `kv_stage_borrow`) fit in 90% of the cache; the last chunk takes
+  the rest. A prompt that stages is lent even when it fits the permanent buffers. A ring of about a layer's
+  streamed experts lets the copy engine run on through a layer's dense part (24K at 262K: a 640 MiB
+  ring 2,593 tok/s, 1.5 GiB 2,797).
+- **Every expert on the GPU.** At load, every layer's CPU copy (`CpuExperts`, now one contiguous,
+  page-aligned blob per expert: gate, up, down) is registered with the driver (`cudaHostRegister`,
+  per layer; about 0.7 s for 48 layers). A chunk's plan gives each layer's cached experts keys
+  0.. (their pool slots) and the others the following keys in expert-id order, in groups of 32 (64 for
+  chunks under 4,096 tokens). A copy stream fills the ring with the groups' blobs in that order (one
+  DMA per run of consecutive ids; 26.7 GB/s measured), as far ahead as the ring allows, with no host
+  waits: the order is known before routing. A conversion stream turns each group's blobs into the
+  cache's slot layout (the GPU version of `export_expert` + `pack_expert_rows`, byte-identical; about
+  6-8 us per expert) in one of two sets of conversion slots, which frees its ring bytes; so a group
+  converts while the previous one computes. Per layer the compute stream groups the pairs by key
+  (`experts_phased_begin`), computes the cached experts in one launch, then per group waits for its
+  conversion and computes it (`experts_phased_run`); one reduction per layer adds every token's pairs
+  in k order. A few event operations per group of 32 experts (WDDM charges about 10 us each). Since
+  each pair's result does not depend on its key, launch or where its weights came from, a streamed
+  chunk gives bitwise the same output whatever the cache holds or lends.
+- **CPU share of small chunks** (optional, `prefill_cpu_share_max`, off by default). In small chunks PCIe is
+  the bottleneck, so the experts predicted (from the decayed recent routing) to get the fewest tokens can go
+  to the CPU instead: as many as the CPU can finish (60 us per expert plus 10 us per pair) by the time the
+  copy engine has delivered the layer's other experts, counting from the end of the layer's dense
+  part. A worker thread runs them (`CpuExperts::run_batch`) as soon as the layer's routing reaches the
+  host; the stream waits for it in a host function and reads its sums straight from pinned memory (a
+  copy would queue behind the ring's). Those pairs carry the CPU's
+  numerics (16-bit activations) and the split depends on history, so such chunks are reproducible only
+  for the same history. Measured, it helped only 2K chunks at a 262K window (+14%) and slowed 3-4K chunks
+  and the 64K window by 6-11%, so it is off.
+- **Smaller chunks** (under 1,024 tokens, `prefill_stream_min`) and layers whose RAM could not be
+  pinned keep the hybrid path: cached experts on the GPU (`experts_gpu_batch`), the others on the CPU.
+- **Dense layers** (Q8_0) on the tensor cores (`cuda/gemm_tc.cu`, `prefill_dense_tc`): the int8 codes
+  enter exactly as fp16, each 32-block's scale multiplies the block's partial sum in FP32, and each
+  activation enters as two fp16 terms (hi, lo) after a per-row power-of-two scale, with FP32
+  accumulation of the hi products; the experts' Fp16x2 arithmetic. On the model's matrices it is 1.6x
+  faster than dequantizing for cuBLAS SGEMM and closer to double precision (1-4e-7 relative against
+  SGEMM's 3e-7 to 1.3e-6, `test_gemm_tc`); SGEMM stays for long narrow products with few tiles and for
+  F32/BF16 weights. DeltaNet's conv runs in parallel tiles of tokens and its delta rule spreads each v
+  head's 128 state rows over 16 blocks (a warp per 2 rows, the next token's inputs prefetched; the
+  RMSNorm runs afterwards), bitwise the same as the single-block kernels that decode steps use
+  (`NINFER_FN_SERIAL_DN=1` forces those).
+- **QSA** stores raw keys and selects cells 256 queries at a time, so the raw-key ring is 264 rows and
+  the selection scratch 64 MiB at 262K whatever the chunk.
+- **Host work** for chunk c+1 (embeddings, the 16 PLE rows per token) runs on a thread during chunk c.
+- **MTP.** The MTP layer's catch-up skips the prompt positions that no draft can attend to (all but
+  the last 2,051 + 8), in passes of at most 512 tokens, so its K/V ring of 512 + 2,051 rows (section
+  3.9) holds whatever the chunk size.
+
+`prefill_lend = false` restores the old scheme (buffers for `prefill_chunk` tokens allocated for good,
+experts split between the GPU cache and the CPU). `fn_generate --profile` (or `NINFER_FN_PROFILE=1`)
+prints the time per stage of every prompt from CUDA events; `--prefill-runs`, `--pieces`, `--hash-state`
+help compare schedules.
 
 ### 3.6 Long context: QSA
 
@@ -115,7 +176,8 @@ Every attention layer keeps pooled indexer keys for blocks of 4 tokens; each que
 cells (the best blocks by the indexer score, ties to the lower block, plus its own incomplete block)
 and attention is gathered over them (`cuda/qsa.cu`). Given the same inputs, selections are identical to
 the FP32 reference. Decode costs 0.05 to 0.1 ms per attention layer even at 262K context. Raw indexer
-keys live in a ring of a step's worth (a block needs them only until it is complete).
+keys live in a ring of 264 rows (a block needs them only until it is complete; prompt chunks store and
+select 256 tokens at a time).
 
 ### 3.7 Speculative decoding (MTP)
 
@@ -172,9 +234,10 @@ MIT):
 - **Switches.** `EngineOptions::kv_stream` (-1, the default: on when the window exceeds
   `kv_resident`; 0 off; 1 on), `kv_resident`, `kv_group_tokens`; `fn_generate --kv-stream 0|1
   --kv-resident N --kv-group-tokens N`, which also prints the page counters. The staging pool is the
-  only VRAM cost that grows with the window (2 KiB per token, needed during prompts only):
-  `kv_stage_bytes()` / `kv_stage_borrow()` let the prompt planner lend it from the expert cache;
-  without that the engine keeps a pool of its own (`kv_stage_cells`, default the window).
+  only VRAM cost that grows with the window (2 KiB per token, needed during prompts only): the prompt
+  planner lends it from the expert cache with the chunk's other buffers (`kv_stage_bytes()`,
+  `kv_stage_borrow()`, section 3.5); only with `prefill_lend = false` does the engine keep a pool of
+  its own (`kv_stage_cells`, default the window).
 
 ## 4. Measurements (RTX 4090 + Ryzen 9 7950X)
 
@@ -186,8 +249,9 @@ MIT):
 | This engine: decode, 15 GiB expert cache, one CUDA graph per step (code prompt, 66 to 69% hits) | 54 to 56 tok/s |
 | This engine: decode after a 2,600-token prompt (cache re-ranked, 85 to 92% hits) | 63 to 69 tok/s |
 | This engine: greedy decode with MTP, 2 to 3 drafts (chat prompt, 72 to 84% accepted) | **78 tok/s** |
-| This engine: prompt processing, 2,600 tokens, 512- and 1,024-token chunks | 427 and 512 tok/s |
-| This engine: prompt processing, 7,800 tokens, 2,048-token chunks | **757 tok/s** |
+| This engine: prompt processing, 2,600 tokens (first version: 512- and 1,024-token chunks) | 427 and 512 tok/s |
+| This engine: prompt processing, 2,600 tokens, every expert on the GPU (section 3.5) | 1,115 tok/s |
+| This engine: prompt processing, 8,192 / 24,576 / 32,768 tokens (section 4.2) | 2,783 / **3,055** / **3,058** tok/s |
 
 Profile of one decode token at about 66% cache hits (Nsight Systems): about 9.3 ms waiting for the
 CPU's experts and about 10 ms of GPU kernels (5.1 ms dense GEMVs at about 850 GB/s, 1.9 ms cached
@@ -248,13 +312,91 @@ Earlier measurement, through the server before KV streaming (256,125-token promp
 50% and 90%): prefill 412 tok/s (512-token chunks; 10 min 21 s cold); all three facts retrieved;
 decode 33 to 36 tok/s at that depth; a follow-up turn reused all 256K tokens and started in 1.0 s.
 
+With the streamed prompt path (section 3.5) the same 250,139-token prompt prefills in 85.6 s (2,922
+tok/s, default cache, 31 chunks of 8,192) and the answer still names all three facts. With the cache
+pinned to 4 GiB: 2,837 tok/s with the K/V streamed (27 chunks staged, 86 GiB of staging DMA over the
+prompt) and 2,905 tok/s with `--kv-stream 0`, so staging costs the prompt 2.3% of its time; the prompt
+and decode logits are bitwise the same all three ways, and the prompt logits the same as before KV
+streaming was merged.
+
+### 4.2 Prompt processing
+
+`fn_generate -n 2`, one run each, idle machine (2026-10-05). Before: the engine before the streamed
+prompt path (cached experts on the GPU, the rest on the CPU, cache re-ranked between chunks). After:
+the default (`prefill_chunk = 0`, section 3.5). Tokens per second:
+
+| Prompt | Window | Before, 512-token chunks (the default) | Before, other chunks | After |
+|---:|---|---:|---:|---:|
+| 600 | 262K, MTP | 199 | | 315 |
+| 2,048 | 262K, MTP | 337 | | 847 |
+| 3,072 | 262K, MTP | 315 | | 1,213 |
+| 6,144 | 262K, MTP | 390 | | 2,366 |
+| 8,192 | 262K, MTP | 408 | 496 (2,048) | 2,689 |
+| 24,576 | 262K, MTP | 419 | 527 (2,048) | **2,988** |
+| 32,768 | 262K, MTP | 412 | | **3,046** |
+| 2,048 | 64K | 349 | 347 (2,048) | 890 |
+| 8,192 | 64K | 463 | 613 (2,048), 605 (4,096) | 2,783 |
+| 24,576 | 64K | | 653 (8,192) | **3,055** |
+| 32,768 | 64K | | 825 (2,048) | **3,058** |
+| 250,139 | 262K | 412 (server, 256K prompt) | 677 (2,048, K/V streamed) | 2,922 |
+
+Fixed chunk sizes after the change (64K window): 2,048 tokens 1,343 tok/s on 8K and 4,096 tokens 1,748
+(with the CPU share then on); a 262K window with MTP: 4,096 tokens 1,581 on 8K. Feeding 24K in pieces of
+8,192 (as the server does): 2,737 against 2,988 in one call, and 2,957 against 3,004 at 64K without
+MTP (the lent buffers stay bound between calls, but a call cannot prepare host data or stream experts
+ahead into the next one).
+
+Through the server (`ninfer-serve`, 262K window, MTP 3; the long-context client of section 4.1): a
+255,686-token prompt with three planted codenames took 96.7 s to the first token (2.65K tok/s, against
+10 min 21 s before), all three codenames retrieved, decode 44.2 tok/s at that depth; the follow-up
+turn reused all 255,731 cached tokens and started in 0.8 s; a short request decoded at 55.7 tok/s.
+
+Decode is not slower. With the expert cache pinned to the same size (so the same experts are cached;
+64K window, K/V in VRAM, three alternating runs each): code prompt without MTP 52.2 tok/s against 48.5
+before (median step 17.7 against 17.9 ms), chat prompt with MTP 2 78.7 against 73.4 tok/s. At the
+default size the cache is also a little bigger, since prompt buffers above 512 tokens no longer take
+VRAM for good: 14.58 / 11.50 GiB (without / with MTP) at 64K and 14.24 / 11.17 GiB at 262K, against
+14.43 / 11.36 and 13.68 / 10.61 with KV streaming alone (section 4.1).
+
+Where a chunk's time goes (`--profile`, 24K at 262K with MTP, 8.2 s on the GPU timeline): routed
+experts 26% (22.9% streamed, 2.7% cached; the copy engine moved 161 GiB, 19.5 GiB/s over the prompt, and
+the compute stream waited for it 0.3% of the time), DeltaNet layers 25% (input projections 11.5%,
+conv 1%, recurrence 8%, output projection 4.3%), attention layers 17% (projections, QSA selection,
+attention), hyper-connection mixers 18% (combine and norm 5.7%, down 7.2%, up 2.4%, gate 3%),
+embedding upload and PLE 6%, shared expert, router and combine 8%. On the 250K prompt the attention
+layers grow to 23% and streamed experts are 21%.
+
+Checks on the merged tree:
+
+- Bitwise: a streamed chunk's output does not depend on the cache. The 250K prompt gives the same
+  logits hash with a 14.2 GiB and a 4 GiB cache, K/V streamed or resident, and before and after the
+  merge; the 60K needle prompt (128K window, 4 GiB cache) the same state, prompt and decode hashes
+  with `--kv-stream 0` and `1`; the 24K prompt at 262K with MTP the same logits hash in one call, in
+  pieces of 8,192, with the serial DeltaNet kernels, and before the merge.
+- Against the FP32 reference (`--compare-ref`): the 2,600-token prompt's logits differ by 3.9e-2 to
+  6.4e-2 relative in every configuration measured, the old engine's included (4.8e-2 with 2,048-token
+  chunks): layer 0 agrees to about 1e-6, and the error grows through the layers as expert selections
+  at near-ties go the other way (about 5% of the last layers' selections differ); top-1 the same, top-5
+  log-probabilities within 0.4. Short prompts: 1.2e-4 (p1) and 8.0e-3 (p3), as before. Greedy decoding
+  after the 2,600-token prompt: the same 32 tokens as the old engine.
+- Kernels: `test_expert_stream` (GPU conversion byte-identical to `export_expert` + `pack_expert_rows`
+  for every format), `test_gemm_tc`, `test_gpu_experts_batch`, `test_qsa --kv-only`.
+- Snapshot and restore after a streamed prompt (`--test-snapshot`: 24K at 262K with MTP, in pieces
+  of 8,192 and with a 4 GiB cache: identical continuations), and with a 5,000-token detour between the
+  snapshot and the restore without an expert cache, K/V resident and streamed (identical, and the same
+  verify and draft hashes both ways). With a cache a detour changes which experts are cached (the
+  prompt re-ranks it; a lent prompt refills the lent slots with the best-ranked experts) and CPU
+  experts round activations to 8 bits, so the continuation differs in the last bits, as it did before
+  this work. Follow-ups of 3,072, 6,144 and 500 tokens after 24K: 1,396, 2,555 and 327 tok/s.
+
 ## 5. Next
 
-1. Lend the KV staging pool from the expert cache during prompts (the prompt planner), so that a
-   262K window costs no expert-cache VRAM beyond the 0.75 GiB page cache and the indexer keys. Then
-   measure deep prompt chunks with `--kv-stream 0` and `1`: staging (6 GB of DMA per chunk at 250K
-   depth) competes with streamed experts for PCIe; if it shows, stage only the blocks the chunk's
-   selections name.
+1. Prompts: the streamed experts are now about a quarter of a chunk's GPU time and overlap their
+   copies; what is left is dense work (DeltaNet and attention projections, the hyper-connection
+   mixers) and, at depth, QSA selection. Staging deep chunks' K/V costs 2.3% at 250K (section 4.1);
+   staging only the blocks a chunk's selections name would save most of that. Small prompts (600 to
+   2,048 tokens) are bound by PCIe (a whole layer's non-cached experts for few tokens): a cache that
+   keeps more of the experts a prompt needs, or a CPU share that pays off, would help them.
 2. Find why a short request through the server decodes slower than `fn_generate` with the same
    window (46 against 77 tok/s; different prompts, so measure like for like first).
 3. Higher-precision expert quantizations within the RAM budget, and an evaluation through Pi.
