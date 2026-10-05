@@ -1,4 +1,4 @@
-// Minimal CUDA helpers for the Flash-Next engine: error checks and an owning device allocation.
+// Minimal CUDA helpers for the Flash-Next engine: error checks and a device allocation (owning, or a view).
 #pragma once
 #include <cstddef>
 #include <stdexcept>
@@ -19,13 +19,23 @@ public:
     explicit DeviceBuffer(std::size_t bytes) : bytes_(bytes) {
         if (bytes) check(cudaMalloc(&ptr_, bytes), "cudaMalloc");
     }
-    ~DeviceBuffer() { if (ptr_) cudaFree(ptr_); }
-    DeviceBuffer(DeviceBuffer && o) noexcept : ptr_(std::exchange(o.ptr_, nullptr)), bytes_(std::exchange(o.bytes_, 0)) {}
+    // A non-owning view of bytes at p (part of a larger allocation); never freed by this object.
+    static DeviceBuffer view(void * p, std::size_t bytes) {
+        DeviceBuffer b;
+        b.ptr_ = p;
+        b.bytes_ = bytes;
+        b.owned_ = false;
+        return b;
+    }
+    ~DeviceBuffer() { if (ptr_ && owned_) cudaFree(ptr_); }
+    DeviceBuffer(DeviceBuffer && o) noexcept
+        : ptr_(std::exchange(o.ptr_, nullptr)), bytes_(std::exchange(o.bytes_, 0)), owned_(std::exchange(o.owned_, true)) {}
     DeviceBuffer & operator=(DeviceBuffer && o) noexcept {
         if (this != &o) {
-            if (ptr_) cudaFree(ptr_);
+            if (ptr_ && owned_) cudaFree(ptr_);
             ptr_ = std::exchange(o.ptr_, nullptr);
             bytes_ = std::exchange(o.bytes_, 0);
+            owned_ = std::exchange(o.owned_, true);
         }
         return *this;
     }
@@ -39,6 +49,7 @@ public:
 private:
     void * ptr_ = nullptr;
     std::size_t bytes_ = 0;
+    bool owned_ = true;
 };
 
 }  // namespace ninfer::flashnext::cuda

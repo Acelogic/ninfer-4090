@@ -125,7 +125,7 @@ void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t 
 // expert id, else -1) and the others go to the CPU (on_cpu[i] = 1).
 void moe_plan(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, std::int32_t * host_slots, std::uint8_t * on_cpu,
               int T, int zc_permille, cudaStream_t s);
-// out = (gpu + cpu) + shared * sigmoid(shared_gate_logit[t]), with gpu already summed per token
+// out = (gpu + cpu) + shared * sigmoid(shared_gate_logit[t]), with gpu already summed per token (cpu may be null: zeros)
 void moe_combine_sum(const float * gpu, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,
                      cudaStream_t s);
 // out[t] = sum_k gpu_pairs[t*10+k] (+ host_pairs[t*10+k]) + cpu[t] + shared[t] * sigmoid(shared_gate_logit[t]);

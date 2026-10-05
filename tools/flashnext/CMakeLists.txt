@@ -7,6 +7,8 @@ set(NINFER_FLASHNEXT_TOOLS
   test_gpu_gemv:test_gpu_gemv.cu
   test_gpu_experts:test_gpu_experts.cu
   test_gpu_experts_batch:test_gpu_experts_batch.cu
+  test_expert_stream:test_expert_stream.cu
+  test_gemm_tc:test_gemm_tc.cu
   test_qsa:test_qsa.cu)
 foreach(entry IN LISTS NINFER_FLASHNEXT_TOOLS)
   string(REPLACE ":" ";" parts "${entry}")

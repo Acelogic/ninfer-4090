@@ -24,11 +24,15 @@ public:
 
     // x: device FP32 [T][K], y: device FP32 [T][N]. Asynchronous on the stream given at construction.
     void run(const GpuWeight & w, const float * x, float * y, int T);
+    // Q8_0 weights through gemm_q8_tc (tensor cores, two-term fp16 activations) instead of SGEMM.
+    void set_tensor_cores(bool on) { tc_ = on; }
 
 private:
     cublasHandle_t handle_ = nullptr;
     cudaStream_t stream_ = nullptr;
     DeviceBuffer scratch_;
+    DeviceBuffer row_scales_;
+    bool tc_ = false;
 };
 
 }  // namespace ninfer::flashnext::cuda

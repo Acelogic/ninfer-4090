@@ -11,8 +11,10 @@ add_library(ninfer_flashnext STATIC
   cuda/ops.cu
   cuda/experts.cu
   cuda/gemm.cu
+  cuda/gemm_tc.cu
   cuda/qsa.cu
-  cuda/experts_batch.cu)
+  cuda/experts_batch.cu
+  cuda/expert_stream.cu)
 target_include_directories(ninfer_flashnext PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(ninfer_flashnext PUBLIC CUDA::cublas ${NINFER_CUDART_TARGET} Threads::Threads)
 ninfer_cuda_non_rdc_archive(ninfer_flashnext)

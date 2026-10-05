@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "flashnext/cuda/device.h"
@@ -237,6 +238,105 @@ __global__ void __launch_bounds__(kDnThreads) k_dn_recurrence(const float * __re
     }
 #pragma unroll
     for (int r = 0; r < kDnRowsPerWarp; ++r) Sh[(warp * kDnRowsPerWarp + r) * (kDnState / 4) + lane] = st[r];
+}
+
+// Prompt chunks (no per-token snapshots): the same arithmetic as k_dn_conv and k_dn_recurrence, bitwise,
+// with more of the GPU at work. The conv has no recurrence (each output reads the last 4 inputs), so tiles of
+// tokens run in parallel; the delta rule is independent per state row, so a v head's 128 rows are spread
+// over 16 blocks (a warp per 2 rows) and the RMSNorm of the head's outputs runs afterwards per token, over
+// the same 128 values with the same reduction tree (the 512-thread block of k_dn_recurrence only adds zeros).
+constexpr int kDnConvTile = 32;  // tokens per block
+// NINFER_FN_SERIAL_DN=1 keeps the one-block-per-head kernels for prompts too (to check that both agree bitwise)
+bool serial_dn() {
+    static const bool v = std::getenv("NINFER_FN_SERIAL_DN") != nullptr;
+    return v;
+}
+
+__global__ void __launch_bounds__(kDnState) k_dn_conv_tiles(const float * __restrict__ qkv, const float * __restrict__ state,
+                                                            const float * __restrict__ w, float * __restrict__ out, int T, float eps) {
+    __shared__ float sh[32];
+    const int c = blockIdx.x * kDnState + threadIdx.x;
+    const bool qk = blockIdx.x < 2 * kDnKHeads;
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    auto in = [&](int t) { return t >= 0 ? qkv[std::size_t(t) * kDnConvDim + c] : state[std::size_t(3 + t) * kDnConvDim + c]; };
+    const int t0 = blockIdx.y * kDnConvTile, t1 = min(T, t0 + kDnConvTile);
+    float s0 = in(t0 - 3), s1 = in(t0 - 2), s2 = in(t0 - 1);
+    for (int t = t0; t < t1; ++t) {
+        const float x = qkv[std::size_t(t) * kDnConvDim + c];
+        float sum = 0.0f;
+        sum += s0 * w0;
+        sum += s1 * w1;
+        sum += s2 * w2;
+        sum += x * w3;
+        float y = siluf_(sum);
+        if (qk) y *= 1.0f / fmaxf(sqrtf(block_sum(y * y, sh)), eps);
+        out[std::size_t(t) * kDnConvDim + c] = y;
+        s0 = s1;
+        s1 = s2;
+        s2 = x;
+    }
+}
+
+// the conv state after the chunk: its last three inputs (from the old state when T < 3); after every reader
+__global__ void k_dn_conv_state(const float * __restrict__ qkv, float * __restrict__ state, int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= kDnConvDim) return;
+    float v[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int t = T - 3 + j;
+        v[j] = t >= 0 ? qkv[std::size_t(t) * kDnConvDim + c] : state[std::size_t(3 + t) * kDnConvDim + c];
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) state[std::size_t(j) * kDnConvDim + c] = v[j];
+}
+
+constexpr int kDnRowWarpRows = 2, kDnRowWarps = 4;
+constexpr int kDnRowBlocks = kDnState / (kDnRowWarpRows * kDnRowWarps);  // per v head
+
+// out[t][h][j] = the raw output row j of head h (normalized by k_dn_norm_gate)
+__global__ void __launch_bounds__(32 * kDnRowWarps) k_dn_rows(const float * __restrict__ conv, const float * __restrict__ beta,
+                                                              const float * __restrict__ alpha, const float * __restrict__ dt,
+                                                              const float * __restrict__ a, float * __restrict__ S, float * __restrict__ out, int T) {
+    const int h = blockIdx.x, hk = h % kDnKHeads;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int j0 = (blockIdx.y * kDnRowWarps + warp) * kDnRowWarpRows;
+    float4 * Sh = reinterpret_cast<float4 *>(S + std::size_t(h) * kDnState * kDnState);
+    float4 st[kDnRowWarpRows];
+#pragma unroll
+    for (int r = 0; r < kDnRowWarpRows; ++r) st[r] = Sh[(j0 + r) * (kDnState / 4) + lane];
+    const float scale = 1.0f / sqrtf(float(kDnState));
+    for (int t = 0; t < T; ++t) {
+        const float * row = conv + std::size_t(t) * kDnConvDim;
+        const float4 q = reinterpret_cast<const float4 *>(row + hk * kDnState)[lane];
+        const float4 k = reinterpret_cast<const float4 *>(row + kDnKeyDim + hk * kDnState)[lane];
+        const float * v = row + 2 * kDnKeyDim + h * kDnState;
+        const float b = sigmoidf_(beta[t * kDnVHeads + h]);
+        const float decay = expf(softplusf_(alpha[t * kDnVHeads + h] + dt[h]) * a[h]);
+#pragma unroll
+        for (int r = 0; r < kDnRowWarpRows; ++r) {
+            float4 & s = st[r];
+            s.x *= decay; s.y *= decay; s.z *= decay; s.w *= decay;
+            const float sk = warp_sum(s.x * k.x + s.y * k.y + s.z * k.z + s.w * k.w);
+            const int j = j0 + r;
+            const float d = (v[j] - sk) * b;
+            s.x += k.x * d; s.y += k.y * d; s.z += k.z * d; s.w += k.w * d;
+            const float o = warp_sum(s.x * q.x + s.y * q.y + s.z * q.z + s.w * q.w) * scale;
+            if (lane == 0) out[std::size_t(t) * kDnVDim + h * kDnState + j] = o;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kDnRowWarpRows; ++r) Sh[(j0 + r) * (kDnState / 4) + lane] = st[r];
+}
+
+// out = RMSNorm(o) * norm_w * sigmoid(z) in place, per (token, v head)
+__global__ void __launch_bounds__(kDnState) k_dn_norm_gate(const float * __restrict__ z, const float * __restrict__ norm_w,
+                                                           float * __restrict__ out, float eps) {
+    __shared__ float sh[32];
+    const std::size_t i = std::size_t(blockIdx.x) * kDnVDim + blockIdx.y * kDnState + threadIdx.x;
+    const float o = out[i];
+    const float rs = 1.0f / sqrtf(block_sum(o * o, sh) / float(kDnState) + eps);
+    out[i] = ((o * rs) * norm_w[threadIdx.x]) * sigmoidf_(z[i]);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -592,7 +692,7 @@ __global__ void k_moe_plan(const std::int32_t * __restrict__ ids, const std::int
 __global__ void k_moe_combine_sum(const float * __restrict__ gpu, const float * __restrict__ cpu, const float * __restrict__ shared,
                                   const float * __restrict__ sg, float * __restrict__ out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = (gpu[i] + cpu[i]) + shared[i] * sigmoidf_(sg[i / kEmbd]);
+    if (i < n) out[i] = (gpu[i] + (cpu ? cpu[i] : 0.0f)) + shared[i] * sigmoidf_(sg[i / kEmbd]);
 }
 
 __global__ void k_moe_combine(const float * __restrict__ pairs, const float * __restrict__ hpairs, const float * __restrict__ cpu,
@@ -647,11 +747,26 @@ void ple_conv_add(float * res, const float * gated, const float * normalized, co
 }
 
 void dn_conv(const float * qkv, float * conv_state, const float * conv_w, float * out, int T, float eps, cudaStream_t s, float * snap) {
+    if (!snap && T > kDnConvTile && !serial_dn()) {  // prompt chunks: tiles of tokens in parallel (bitwise the same)
+        k_dn_conv_tiles<<<dim3(kDnConvDim / kDnState, unsigned((T + kDnConvTile - 1) / kDnConvTile)), kDnState, 0, s>>>(qkv, conv_state, conv_w,
+                                                                                                                 out, T, eps);
+        launched("dn_conv_tiles");
+        k_dn_conv_state<<<blocks(kDnConvDim, 256), 256, 0, s>>>(qkv, conv_state, T);
+        launched("dn_conv_state");
+        return;
+    }
     k_dn_conv<<<kDnConvDim / kDnState, kDnState, 0, s>>>(qkv, conv_state, conv_w, out, T, eps, snap);
     launched("dn_conv");
 }
 void dn_recurrence(const float * conv_out, const float * z, const float * beta, const float * alpha, const float * dt_bias,
                    const float * a, const float * norm_w, float * S, float * out, int T, float eps, cudaStream_t s, float * snap) {
+    if (!snap && T > kMaxTokens && !serial_dn()) {  // prompt chunks: state rows in parallel, then the norm (bitwise the same)
+        k_dn_rows<<<dim3(kDnVHeads, kDnRowBlocks), 32 * kDnRowWarps, 0, s>>>(conv_out, beta, alpha, dt_bias, a, S, out, T);
+        launched("dn_rows");
+        k_dn_norm_gate<<<dim3(unsigned(T), kDnVHeads), kDnState, 0, s>>>(z, norm_w, out, eps);
+        launched("dn_norm_gate");
+        return;
+    }
     k_dn_recurrence<<<kDnVHeads, kDnThreads, 0, s>>>(conv_out, z, beta, alpha, dt_bias, a, norm_w, S, out, T, eps, snap);
     launched("dn_recurrence");
 }

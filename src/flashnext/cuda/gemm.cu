@@ -1,8 +1,11 @@
 #include "flashnext/cuda/gemm.h"
 
+#include "flashnext/cuda/gemm_tc.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -31,7 +34,8 @@ __global__ void k_dequant_bf16(const __nv_bfloat16 * __restrict__ w, float * __r
 
 }  // namespace
 
-Gemm::Gemm(std::size_t max_weight_elems, cudaStream_t stream) : stream_(stream), scratch_(max_weight_elems * sizeof(float)) {
+Gemm::Gemm(std::size_t max_weight_elems, cudaStream_t stream)
+    : stream_(stream), scratch_(max_weight_elems * sizeof(float)), row_scales_(std::size_t(16384) * 2 * sizeof(float)) {
     cublas_check(cublasCreate(&handle_), "cublasCreate");
     cublas_check(cublasSetStream(handle_, stream_), "cublasSetStream");
     // FP32 SGEMM; the default math mode never rounds the inputs to TF32 (that needs CUBLAS_TF32_TENSOR_OP_MATH)
@@ -43,6 +47,11 @@ Gemm::~Gemm() {
 }
 
 void Gemm::run(const GpuWeight & w, const float * x, float * y, int T) {
+    if (tc_ && w.format == WeightFormat::Q8_SPLIT && gemm_q8_tc_supported(w.n, w.k)) {
+        if (row_scales_.bytes() < std::size_t(T) * 2 * sizeof(float)) throw std::runtime_error("gemm: too many tokens for the tensor-core path");
+        gemm_q8_tc(static_cast<const std::int8_t *>(w.data), w.scales, w.n, w.k, x, y, T, row_scales_.as<float>(), stream_);
+        return;
+    }
     const std::size_t n = std::size_t(w.n) * w.k;
     const float * wf = nullptr;
     switch (w.format) {

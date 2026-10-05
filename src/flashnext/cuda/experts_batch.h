@@ -45,4 +45,19 @@ void experts_gpu_batch(const ExpertLayout & layout, const std::uint8_t * pool, i
                        const std::int32_t * slots, const float * weights, float * out, void * workspace, cudaStream_t stream,
                        BatchMath math = BatchMath::Fp16x2);
 
+// The same computation in three phases, for weights that arrive while a layer runs (prompt chunks that
+// stream experts from host memory). Pairs are grouped by key: keys[t*10+k] in [0, 512), or < 0 for a
+// pair computed elsewhere. experts_phased_run computes the pairs whose key is in [key0, key1), reading
+// key k's weights from ptrs[k] (a device array of slot addresses in `layout`; only the entries of the
+// range are read, when the kernels run). Call begin once, run for disjoint key ranges in any order (each
+// pair is computed once), then end. A pair's result does not depend on its key, on the ranges or on
+// where its weights live, so out is bitwise the same as experts_gpu_batch's for the same pairs.
+// workspace: experts_phased_workspace_bytes(m) bytes, m >= n_tokens (about 136 KiB per token).
+std::size_t experts_phased_workspace_bytes(int max_tokens);
+void experts_phased_begin(int n_tokens, const float * x, const std::int32_t * keys, void * workspace, cudaStream_t stream,
+                          BatchMath math = BatchMath::Fp16x2);
+void experts_phased_run(const ExpertLayout & layout, const std::uint8_t * const * ptrs, int key0, int key1, int n_tokens, const float * x,
+                        void * workspace, cudaStream_t stream, BatchMath math = BatchMath::Fp16x2);
+void experts_phased_end(int n_tokens, const std::int32_t * keys, const float * weights, float * out, void * workspace, cudaStream_t stream);
+
 }  // namespace ninfer::flashnext::cuda

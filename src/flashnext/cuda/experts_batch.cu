@@ -43,11 +43,14 @@ int max_tiles(int pairs) { return pairs / kBM + std::min(pairs, kExperts) + 1; }
 
 // The fp16 terms of the tensor-core modes reuse memory: those of h overwrite h in place (a row of 640
 // floats holds its 640 hi and 640 lo halves), those of x sit at the start of y, which the down GEMM
-// writes only after gate/up has read them.
+// writes only after gate/up has read them (in the phased API, where down runs between gate/up calls,
+// they get their own space).
 struct Workspace {
     int * counts = nullptr;  // [0]: tiles, [1]: cached pairs
     int4 * tiles = nullptr;  // {slot, first sorted position, rows, 0}
     int * order = nullptr;   // sorted position -> pair index
+    int * key_tile = nullptr;  // [kExperts + 1]: first tile of each slot (key), then the tile count
+    int * key_pos = nullptr;   // [kExperts + 1]: first sorted position of each slot, then the pair count
     float * xinv = nullptr;  // per token: 1 / the power-of-two scale of its fp16 terms
     float * hinv = nullptr;  // per sorted position: the same for h
     float * h = nullptr;     // [pairs][640] SwiGLU activations by sorted position; then [pairs][hi 640 | lo 640] fp16
@@ -57,13 +60,15 @@ struct Workspace {
     std::size_t bytes = 0;
 };
 
-Workspace carve(void * base, int n_tokens) {
+Workspace carve(void * base, int n_tokens, bool phased = false) {
     const std::size_t pairs = std::size_t(n_tokens) * kUsed, tokens = std::size_t(n_tokens);
     std::size_t at = 0;
     auto take = [&](std::size_t bytes) { const std::size_t o = at; at += align256(bytes); return o; };
     const std::size_t o_c = take(2 * sizeof(int)), o_t = take(sizeof(int4) * std::size_t(max_tiles(int(pairs)))), o_o = take(sizeof(int) * pairs),
                       o_xi = take(sizeof(float) * tokens), o_hi = take(sizeof(float) * pairs), o_h = take(sizeof(float) * pairs * kExpertFF),
                       o_y = take(sizeof(float) * pairs * kEmbd);
+    const std::size_t o_kt = phased ? take(sizeof(int) * (kExperts + 1)) : 0, o_kp = phased ? take(sizeof(int) * (kExperts + 1)) : 0,
+                      o_xs = phased ? take(2 * sizeof(__half) * tokens * kEmbd) : 0;
     static_assert(2 * sizeof(__half) * kEmbd <= sizeof(float) * kUsed * kEmbd, "x terms must fit in y");
     Workspace w;
     w.bytes = at;
@@ -76,8 +81,12 @@ Workspace carve(void * base, int n_tokens) {
     w.hinv = reinterpret_cast<float *>(b + o_hi);
     w.h = reinterpret_cast<float *>(b + o_h);
     w.y = reinterpret_cast<float *>(b + o_y);
-    w.xs = reinterpret_cast<__half *>(w.y);
+    w.xs = reinterpret_cast<__half *>(phased ? b + o_xs : reinterpret_cast<std::uint8_t *>(w.y));
     w.hs = reinterpret_cast<__half *>(w.h);
+    if (phased) {
+        w.key_tile = reinterpret_cast<int *>(b + o_kt);
+        w.key_pos = reinterpret_cast<int *>(b + o_kp);
+    }
     return w;
 }
 
@@ -102,7 +111,8 @@ __device__ __forceinline__ void load_slots(const std::int32_t * __restrict__ slo
 }
 
 __global__ void __launch_bounds__(kExperts) k_group(const std::int32_t * __restrict__ slots, int pairs, int * __restrict__ counts,
-                                                   int4 * __restrict__ tiles, int * __restrict__ order) {
+                                                   int4 * __restrict__ tiles, int * __restrict__ order, int * __restrict__ key_tile,
+                                                   int * __restrict__ key_pos) {
     __shared__ int before[kGroupWarps][kExperts];  // pairs of slot s in earlier ranges, then: placed so far
     __shared__ int start[kExperts];
     __shared__ int part[2][32];
@@ -156,6 +166,11 @@ __global__ void __launch_bounds__(kExperts) k_group(const std::int32_t * __restr
     start[tid] = first;
     for (int i = 0; i < tcount; ++i) tiles[tfirst + i] = make_int4(tid, first + i * kBM, min(kBM, count - i * kBM), 0);
     if (tid == kExperts - 1) counts[0] = tfirst + tcount, counts[1] = first + count;
+    if (key_tile) {
+        key_tile[tid] = tfirst;
+        key_pos[tid] = first;
+        if (tid == kExperts - 1) key_tile[kExperts] = tfirst + tcount, key_pos[kExperts] = first + count;
+    }
     __syncthreads();
     for (int b = lo; b < hi; b += 32 * kGroupUnroll) {
         int sv[kGroupUnroll];
@@ -384,6 +399,12 @@ template <> struct SubOf<GgufType::Q8_0> { using T = SubQ8; };
 struct Params {
     const std::uint8_t * pool;
     std::size_t slot_bytes, gate_row, up_off, down_off, scale_off;
+    // phased API: the weights of slot (key) k at ptrs[k] instead of pool + k * slot_bytes, and only the tiles of
+    // keys [key0, key1): blockIdx.y counts from key_tile[key0]
+    const std::uint8_t * const * ptrs;
+    const int * key_tile;
+    const int * key_pos;
+    int key0, key1;
     const int * counts;
     const int4 * tiles;
     const int * order;
@@ -401,7 +422,7 @@ struct Params {
 // or up row of FF column blockIdx.x * 128 + tid % 128, for down output row blockIdx.x * 256 + tid.
 template <bool kDown, GgufType W>
 __device__ __forceinline__ void weight_row(const Params & P, int slot, int tid, const std::uint8_t *& codes, const std::uint8_t *& scales) {
-    const std::uint8_t * base = P.pool + std::size_t(slot) * P.slot_bytes;
+    const std::uint8_t * base = P.ptrs ? P.ptrs[slot] : P.pool + std::size_t(slot) * P.slot_bytes;
     if constexpr (kDown) {
         constexpr std::size_t code_row = W == GgufType::IQ4_NL ? kExpertFF / 2 : kExpertFF;
         const int n = blockIdx.x * kBN + tid;
@@ -439,8 +460,14 @@ __global__ void __launch_bounds__(kThreads, 1) k_f32(const Params P) {
     constexpr int K = kDown ? kExpertFF : kEmbd, ST = K / kBKF;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto & S = *reinterpret_cast<F32Smem<W> *>(smem_raw);
-    if (int(blockIdx.y) >= P.counts[0]) return;
-    const int4 tile = P.tiles[blockIdx.y];
+    int ty = int(blockIdx.y);
+    if (P.key_tile) {
+        ty += P.key_tile[P.key0];
+        if (ty >= P.key_tile[P.key1]) return;
+    } else if (ty >= P.counts[0]) {
+        return;
+    }
+    const int4 tile = P.tiles[ty];
     const int tid = threadIdx.x;
     if constexpr (W == GgufType::IQ3_S)
         for (int i = tid; i < 512; i += kThreads) {
@@ -595,26 +622,12 @@ __device__ __forceinline__ float row_scale(float m) {
     return ldexpf(1.0f, min(max(15 - e, -100), 100));
 }
 
+// One tile of k_tc: grid-wide tables are in shared memory already.
 template <bool kDown, GgufType W, int LIMBS>
-__global__ void __launch_bounds__(kThreads, 1) k_tc(const Params P) {
+__device__ __forceinline__ void tc_tile(const Params & P, TcSmem<W, LIMBS> & S, const int4 tile) {
     using Sub = typename SubOf<W>::T;
     constexpr int K = kDown ? kExpertFF : kEmbd, KT = K / kBK;
-    extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto & S = *reinterpret_cast<TcSmem<W, LIMBS> *>(smem_raw);
-    if (int(blockIdx.y) >= P.counts[0]) return;
-    const int4 tile = P.tiles[blockIdx.y];
     const int tid = threadIdx.x;
-    if constexpr (W == GgufType::IQ3_S) {
-        for (int i = tid; i < 512; i += kThreads) {
-            const std::uint32_t g = d_grid_b[i];
-            S.grid[i] = make_uint2(pack_half2(float(g & 0xFF), float((g >> 8) & 0xFF)), pack_half2(float((g >> 16) & 0xFF), float(g >> 24)));
-        }
-        if (tid < 16)
-            S.signs[tid] = make_uint2((tid & 1 ? 0x8000u : 0u) | (tid & 2 ? 0x80000000u : 0u),
-                                      (tid & 4 ? 0x8000u : 0u) | (tid & 8 ? 0x80000000u : 0u));
-    } else if constexpr (W != GgufType::Q8_0) {
-        S.lut2[tid] = pack_half2(float(c_iq4nl_b[tid & 0xF]), float(c_iq4nl_b[tid >> 4]));
-    }
     const __half * planes = kDown ? P.hs : P.xs;
     const std::size_t limb = kDown ? std::size_t(kExpertFF) : P.xs_limb;
     if (tid < kBM) {
@@ -724,7 +737,7 @@ __global__ void __launch_bounds__(kThreads, 1) k_tc(const Params P) {
         step(kt, rb1, rb0);
         step(kt + 1, rb0, rb1);
     }
-    if (mrows <= 0) return;
+    if (mrows <= 0) return;  // (this tile only)
     // C fragment: c[0], c[1] at row lane / 4, columns 2 (lane % 4) + {0, 1}; c[2], c[3] eight rows lower
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -751,6 +764,39 @@ __global__ void __launch_bounds__(kThreads, 1) k_tc(const Params P) {
                                     silu_mul(acc[i][jn][2 * half + 1] * inv, acc[i][jn + 4][2 * half + 1] * inv));
             }
         }
+    }
+}
+
+// Tiles of the block: blockIdx.y, then every gridDim.y-th after it (the phased API launches fewer blocks
+// than its tile bound, which only the device knows exactly); the tiles of keys [key0, key1) in the
+// phased API, else all of them.
+template <bool kDown, GgufType W, int LIMBS>
+__global__ void __launch_bounds__(kThreads, 1) k_tc(const Params P) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto & S = *reinterpret_cast<TcSmem<W, LIMBS> *>(smem_raw);
+    int first = int(blockIdx.y), last;
+    if (P.key_tile) {
+        first += P.key_tile[P.key0];
+        last = P.key_tile[P.key1];
+    } else {
+        last = P.counts[0];
+    }
+    if (first >= last) return;
+    const int tid = threadIdx.x;
+    if constexpr (W == GgufType::IQ3_S) {
+        for (int i = tid; i < 512; i += kThreads) {
+            const std::uint32_t g = d_grid_b[i];
+            S.grid[i] = make_uint2(pack_half2(float(g & 0xFF), float((g >> 8) & 0xFF)), pack_half2(float((g >> 16) & 0xFF), float(g >> 24)));
+        }
+        if (tid < 16)
+            S.signs[tid] = make_uint2((tid & 1 ? 0x8000u : 0u) | (tid & 2 ? 0x80000000u : 0u),
+                                      (tid & 4 ? 0x8000u : 0u) | (tid & 8 ? 0x80000000u : 0u));
+    } else if constexpr (W != GgufType::Q8_0) {
+        S.lut2[tid] = pack_half2(float(c_iq4nl_b[tid & 0xF]), float(c_iq4nl_b[tid >> 4]));
+    }
+    for (int ty = first; ty < last; ty += int(gridDim.y)) {
+        __syncthreads();  // the previous tile is done with the shared buffers
+        tc_tile<kDown, W, LIMBS>(P, S, P.tiles[ty]);
     }
 }
 
@@ -796,11 +842,13 @@ __global__ void __launch_bounds__(256) k_split_x(const float * __restrict__ x, i
 // Tensor-core modes, between gate/up and down: h -> fp16 terms in place ([pos][limb][640]), a warp per
 // cached position.
 template <int LIMBS>
-__global__ void __launch_bounds__(256) k_split_h(float * h, const int * __restrict__ counts, float * __restrict__ hinv) {
-    const int pos = blockIdx.x * 8 + (threadIdx.x >> 5);
-    if (pos >= counts[1]) return;
-    float * row = h + std::size_t(pos) * kExpertFF;
-    split_row<kExpertFF, LIMBS>(row, reinterpret_cast<__half *>(row), kExpertFF, hinv + pos);
+__global__ void __launch_bounds__(256) k_split_h(float * h, const int * __restrict__ counts, float * __restrict__ hinv, const int * __restrict__ key_pos,
+                                                 int key0, int key1) {
+    const int lo = key_pos ? key_pos[key0] : 0, hi = key_pos ? key_pos[key1] : counts[1];
+    for (int pos = lo + int(blockIdx.x) * 8 + int(threadIdx.x >> 5); pos < hi; pos += int(gridDim.x) * 8) {
+        float * row = h + std::size_t(pos) * kExpertFF;
+        split_row<kExpertFF, LIMBS>(row, reinterpret_cast<__half *>(row), kExpertFF, hinv + pos);
+    }
 }
 
 // out[t] = sum over k = 0..9 of the cached pairs' weight * y, in that order.
@@ -874,10 +922,10 @@ void experts_gpu_batch(const ExpertLayout & l, const std::uint8_t * pool, int n_
     experts_batch_init();
     const Workspace w = carve(workspace, n_tokens);
     const int pairs = n_tokens * kUsed;
-    const Params P{pool, l.slot_bytes, l.gate_row, l.up_off, l.down_off, l.scale_off, w.counts, w.tiles, w.order, x, w.h, w.y,
-                   w.xs, w.hs,         w.xinv,     w.hinv,   std::size_t(n_tokens) * kEmbd};
+    const Params P{pool, l.slot_bytes, l.gate_row, l.up_off, l.down_off, l.scale_off, nullptr, nullptr, nullptr, 0, 0, w.counts, w.tiles,
+                   w.order, x, w.h, w.y, w.xs, w.hs, w.xinv, w.hinv, std::size_t(n_tokens) * kEmbd};
     const bool two = math == BatchMath::Fp16x2;
-    k_group<<<1, kExperts, 0, stream>>>(slots, pairs, w.counts, w.tiles, w.order);
+    k_group<<<1, kExperts, 0, stream>>>(slots, pairs, w.counts, w.tiles, w.order, nullptr, nullptr);
     check(cudaGetLastError(), "experts_batch group");
     if (math != BatchMath::Fp32) {
         if (two) k_split_x<2><<<(n_tokens + 7) / 8, 256, 0, stream>>>(x, n_tokens, w.xs, P.xs_limb, w.xinv);
@@ -890,8 +938,8 @@ void experts_gpu_batch(const ExpertLayout & l, const std::uint8_t * pool, int n_
     else launch<false, GgufType::IQ4_XS>(math, gu, P, stream);
     check(cudaGetLastError(), "experts_batch gate/up");
     if (math != BatchMath::Fp32) {
-        if (two) k_split_h<2><<<(pairs + 7) / 8, 256, 0, stream>>>(w.h, w.counts, w.hinv);
-        else k_split_h<1><<<(pairs + 7) / 8, 256, 0, stream>>>(w.h, w.counts, w.hinv);
+        if (two) k_split_h<2><<<(pairs + 7) / 8, 256, 0, stream>>>(w.h, w.counts, w.hinv, nullptr, 0, 0);
+        else k_split_h<1><<<(pairs + 7) / 8, 256, 0, stream>>>(w.h, w.counts, w.hinv, nullptr, 0, 0);
         check(cudaGetLastError(), "experts_batch split h");
     }
     if (l.down_type == GgufType::IQ4_NL) launch<true, GgufType::IQ4_NL>(math, dn, P, stream);
@@ -899,6 +947,65 @@ void experts_gpu_batch(const ExpertLayout & l, const std::uint8_t * pool, int n_
     check(cudaGetLastError(), "experts_batch down");
     k_reduce<<<n_tokens, kEmbd / 4, 0, stream>>>(slots, weights, w.y, out);
     check(cudaGetLastError(), "experts_batch reduce");
+}
+
+std::size_t experts_phased_workspace_bytes(int max_tokens) {
+    if (max_tokens < 1 || max_tokens > kMaxBatchTokens) throw std::runtime_error("experts_phased: max_tokens out of range");
+    return carve(nullptr, max_tokens, true).bytes;
+}
+
+void experts_phased_begin(int n_tokens, const float * x, const std::int32_t * keys, void * workspace, cudaStream_t stream, BatchMath math) {
+    if (n_tokens <= 0) return;
+    if (n_tokens > kMaxBatchTokens) throw std::runtime_error("experts_phased_begin: too many tokens");
+    experts_batch_init();
+    const Workspace w = carve(workspace, n_tokens, true);
+    k_group<<<1, kExperts, 0, stream>>>(keys, n_tokens * kUsed, w.counts, w.tiles, w.order, w.key_tile, w.key_pos);
+    check(cudaGetLastError(), "experts_phased group");
+    if (math != BatchMath::Fp32) {
+        const std::size_t limb = std::size_t(n_tokens) * kEmbd;
+        if (math == BatchMath::Fp16x2) k_split_x<2><<<(n_tokens + 7) / 8, 256, 0, stream>>>(x, n_tokens, w.xs, limb, w.xinv);
+        else k_split_x<1><<<(n_tokens + 7) / 8, 256, 0, stream>>>(x, n_tokens, w.xs, limb, w.xinv);
+        check(cudaGetLastError(), "experts_phased split x");
+    }
+}
+
+void experts_phased_run(const ExpertLayout & l, const std::uint8_t * const * ptrs, int key0, int key1, int n_tokens, const float * x,
+                        void * workspace, cudaStream_t stream, BatchMath math) {
+    if (n_tokens <= 0 || key1 <= key0) return;
+    if (key0 < 0 || key1 > kExperts) throw std::runtime_error("experts_phased_run: key range");
+    if (l.gate_type != GgufType::IQ3_S && l.gate_type != GgufType::IQ4_XS) throw std::runtime_error("experts_phased_run: gate/up type");
+    if (l.down_type != GgufType::IQ4_NL && l.down_type != GgufType::Q8_0) throw std::runtime_error("experts_phased_run: down type");
+    const Workspace w = carve(workspace, n_tokens, true);
+    const Params P{nullptr, l.slot_bytes, l.gate_row, l.up_off, l.down_off, l.scale_off, ptrs, w.key_tile, w.key_pos, key0, key1, w.counts,
+                   w.tiles, w.order, x, w.h, w.y, w.xs, w.hs, w.xinv, w.hinv, std::size_t(n_tokens) * kEmbd};
+    // bounds: a key has at most n_tokens pairs, and all keys together at most n_tokens * 10
+    const int keys = key1 - key0;
+    const std::int64_t pairs = std::min<std::int64_t>(std::int64_t(n_tokens) * kUsed, std::int64_t(n_tokens) * keys);
+    const unsigned tiles = unsigned(pairs / kBM + keys + 1);
+    // the tensor-core kernels loop over their tiles: about two blocks per SM instead of one block per possible
+    // tile (most of which would find nothing to do); the FP32 kernel takes one tile per block
+    const unsigned gy = math == BatchMath::Fp32 ? tiles : std::min(tiles, 2u * 128u);
+    const dim3 gu(kExpertFF / kHalfN, math == BatchMath::Fp32 ? gy : std::max(1u, std::min(gy, 256u / unsigned(kExpertFF / kHalfN)))),
+        dn(kEmbd / kBN, math == BatchMath::Fp32 ? gy : std::max(1u, std::min(gy, 256u / unsigned(kEmbd / kBN))));
+    if (l.gate_type == GgufType::IQ3_S) launch<false, GgufType::IQ3_S>(math, gu, P, stream);
+    else launch<false, GgufType::IQ4_XS>(math, gu, P, stream);
+    check(cudaGetLastError(), "experts_phased gate/up");
+    if (math != BatchMath::Fp32) {
+        const unsigned blocks = unsigned(std::min<std::int64_t>((pairs + 7) / 8, 1024));
+        if (math == BatchMath::Fp16x2) k_split_h<2><<<blocks, 256, 0, stream>>>(w.h, w.counts, w.hinv, w.key_pos, key0, key1);
+        else k_split_h<1><<<blocks, 256, 0, stream>>>(w.h, w.counts, w.hinv, w.key_pos, key0, key1);
+        check(cudaGetLastError(), "experts_phased split h");
+    }
+    if (l.down_type == GgufType::IQ4_NL) launch<true, GgufType::IQ4_NL>(math, dn, P, stream);
+    else launch<true, GgufType::Q8_0>(math, dn, P, stream);
+    check(cudaGetLastError(), "experts_phased down");
+}
+
+void experts_phased_end(int n_tokens, const std::int32_t * keys, const float * weights, float * out, void * workspace, cudaStream_t stream) {
+    if (n_tokens <= 0) return;
+    const Workspace w = carve(workspace, n_tokens, true);
+    k_reduce<<<n_tokens, kEmbd / 4, 0, stream>>>(keys, weights, w.y, out);
+    check(cudaGetLastError(), "experts_phased reduce");
 }
 
 }  // namespace ninfer::flashnext::cuda
