@@ -1,5 +1,6 @@
 #include "flashnext/cuda/ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -883,6 +884,26 @@ void swiglu(const float * g, const float * u, float * h, int n, cudaStream_t s) 
 void ffn_combine(const float * moe, const float * shared, const float * shared_gate, float * out, int T, cudaStream_t s) {
     k_ffn_combine<<<blocks(std::size_t(T) * kEmbd, 256), 256, 0, s>>>(moe, shared, shared_gate, out, T * kEmbd);
     launched("ffn_combine");
+}
+
+// unit-sized words over the grid, then the tail bytes
+template <class U>
+__global__ void k_copy_sm(std::uint8_t * __restrict__ dst, const std::uint8_t * __restrict__ src, std::size_t words, std::size_t bytes) {
+    const std::size_t stride = std::size_t(gridDim.x) * blockDim.x, first = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (std::size_t i = first; i < words; i += stride) reinterpret_cast<U *>(dst)[i] = reinterpret_cast<const U *>(src)[i];
+    for (std::size_t i = words * sizeof(U) + first; i < bytes; i += stride) dst[i] = src[i];
+}
+
+void copy_sm(void * dst, const void * src, std::size_t bytes, cudaStream_t s) {
+    if (!bytes) return;
+    const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(dst) | reinterpret_cast<std::uintptr_t>(src);
+    auto * d = static_cast<std::uint8_t *>(dst);
+    const auto * sp = static_cast<const std::uint8_t *>(src);
+    auto grid = [](std::size_t words) { return unsigned(std::min<std::size_t>(std::max<std::size_t>(1, (words + 255) / 256), 1024)); };
+    if (a % 16 == 0) k_copy_sm<uint4><<<grid(bytes / 16), 256, 0, s>>>(d, sp, bytes / 16, bytes);
+    else if (a % 4 == 0) k_copy_sm<std::uint32_t><<<grid(bytes / 4), 256, 0, s>>>(d, sp, bytes / 4, bytes);
+    else k_copy_sm<std::uint8_t><<<grid(bytes), 256, 0, s>>>(d, sp, bytes, bytes);
+    launched("copy_sm");
 }
 
 void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, int T, cudaStream_t s) {

@@ -155,6 +155,11 @@ void link_signal(const std::int32_t * ids, const float * weights, const std::uin
 // answer it gives up, writes zeros and sets *error (Windows resets a GPU after 2 s).
 void link_wait(ExpertLink * link, const std::int64_t * seq, float * out, int T, int * error, cudaStream_t s);
 
+// Copies bytes with the SMs instead of a copy engine: for transfers to or from mapped pinned host memory
+// that must not queue behind long DMA transfers (a prompt chunk's expert streaming). dst and src are
+// device-accessible addresses (cudaHostGetDevicePointer for host memory).
+void copy_sm(void * dst, const void * src, std::size_t bytes, cudaStream_t s);
+
 // Lazy kernel setup (tables, shared-memory limits); call once before capturing a graph.
 void init_kernels();
 

@@ -1086,7 +1086,7 @@ struct Engine::Impl {
     void run_ple(const Layer & L, int il, int T) {
         if (mtp && T <= fc::kMaxTokens)  // for rollback(): the history before this step
             check(cudaMemcpyAsync(ple_hist_prev.get(), ple_hist.get(), ple_hist.bytes(), cudaMemcpyDeviceToDevice, stream), "ple history");
-        check(cudaMemcpyAsync(ple_emb.get(), h_ple->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "ple");
+        to_device(ple_emb.get(), h_ple->get(), std::size_t(T) * fc::kEmbd * sizeof(float));
         emit("ple_embd", il, ple_emb.get(), n_past, T, fc::kEmbd);
         linear(L.ple_key, ple_emb, ple_key_out, T);
         linear(L.ple_value, ple_emb, ple_val_out, T);
@@ -1302,8 +1302,11 @@ struct Engine::Impl {
     void enqueue(int T, int head_rows) {
         const std::int64_t pos0 = n_past;
         check(cudaMemcpyAsync(d_step.get(), h_step.get(), 2 * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "step");
-        check(cudaMemcpyAsync(x.get(), h_x->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "embed");
+        to_device(x.get(), h_x->get(), std::size_t(T) * fc::kEmbd * sizeof(float));
         if (!graph_mode) upload_batch_positions(T);
+        // the first layers' experts copy and convert while the GPU starts on the chunk (after this step's small
+        // uploads, which would wait behind the ring's DMAs otherwise)
+        if (stream_chunk && !graph_mode) queue_conversions(1);
         emit("model.input_embed", -1, x.get(), pos0, T, fc::kEmbd);
         fc::hc_expand(x.as<float>(), res.as<float>(), T, stream);
         prof_mark("embed");
@@ -1384,10 +1387,7 @@ struct Engine::Impl {
             check(cudaMemcpy(&err, d_error.get(), sizeof(int), cudaMemcpyDeviceToHost), "error flag");
             if (err) throw std::runtime_error("engine: the GPU timed out waiting for the CPU experts");
         } else {
-            if (stream_chunk) {
-                plan_stream(T);
-                queue_conversions(1);  // the first layers' experts copy and convert while the GPU starts on the chunk
-            }
+            if (stream_chunk) plan_stream(T);
             enqueue(T, head_rows);
             check(cudaStreamSynchronize(stream), "step");
             if (profiled) prof.end_chunk();
@@ -1484,6 +1484,24 @@ struct Engine::Impl {
     std::unique_ptr<Pinned<float>> h_x_alt, h_ple_alt;
     bool prepared_ahead = false;
     StageProfile prof;
+
+    // The device address of pinned (mapped) host memory.
+    template <class P>
+    static P * mapped(P * host) {
+        void * d = nullptr;
+        check(cudaHostGetDevicePointer(&d, const_cast<void *>(static_cast<const void *>(host)), 0), "mapped host memory");
+        return static_cast<P *>(d);
+    }
+    // Host <-> device transfers of a streamed chunk go through the SMs: on a copy engine they would queue
+    // behind the ring's DMAs (up to 1.5 GiB in flight).
+    void to_device(void * dst, const void * host_src, std::size_t bytes) {
+        if (stream_chunk && !graph_mode) fc::copy_sm(dst, mapped(host_src), bytes, stream);
+        else check(cudaMemcpyAsync(dst, host_src, bytes, cudaMemcpyHostToDevice, stream), "upload");
+    }
+    void to_host(void * host_dst, const void * src, std::size_t bytes) {
+        if (stream_chunk && !graph_mode) fc::copy_sm(mapped(host_dst), src, bytes, stream);
+        else check(cudaMemcpyAsync(host_dst, src, bytes, cudaMemcpyDeviceToHost, stream), "download");
+    }
 
     void prof_mark(const char * stage) {
         if (prof.on() && !graph_mode) prof.mark(stage, stream);
@@ -1998,13 +2016,11 @@ struct Engine::Impl {
         linear(L.router, mixed, rlogits, T);
         emit("ffn_moe_logits", il, rlogits.get(), n_past, T, fc::kExperts);
         fc::router_topk(rlogits.as<float>(), ids.as<std::int32_t>(), wts.as<float>(), T, stream);
-        check(cudaMemcpyAsync(h_ids_all->get() + std::size_t(il) * ke, ids.get(), ke * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream),
-              "routing");
+        to_host(h_ids_all->get() + std::size_t(il) * ke, ids.get(), ke * sizeof(std::int32_t));
         const bool share = !SL.cpu.empty();
         if (share) {  // the CPU's part starts as soon as the routing and the FFN input are on the host
-            check(cudaMemcpyAsync(h_w->get(), wts.get(), ke * sizeof(float), cudaMemcpyDeviceToHost, stream), "weights");
-            check(cudaMemcpyAsync(h_mixed->get(), mixed.get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyDeviceToHost, stream),
-                  "ffn input");
+            to_host(h_w->get(), wts.get(), ke * sizeof(float));
+            to_host(h_mixed->get(), mixed.get(), std::size_t(T) * fc::kEmbd * sizeof(float));
             check(cudaEventRecord(ev_route[std::size_t(il)], stream), "event");
             start_share_worker();
             {
