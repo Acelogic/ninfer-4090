@@ -63,11 +63,18 @@ __global__ void __launch_bounds__(256) k_hc_norm(const float * __restrict__ res,
     const float * x = res + std::size_t(blockIdx.x) * kEmbd;
     const float * wc = w + (blockIdx.x % kHc) * kEmbd;
     float * y = xn + std::size_t(blockIdx.x) * kEmbd;
+    constexpr int kPer = kEmbd / 256;  // the row stays in registers: one read
+    float v[kPer];
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < kEmbd; i += 256) ss += x[i] * x[i];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        v[j] = x[threadIdx.x + 256 * j];
+        ss += v[j] * v[j];
+    }
     ss = block_sum(ss, sh);
     const float scale = 1.0f / sqrtf(ss / float(kEmbd) + eps);
-    for (int i = threadIdx.x; i < kEmbd; i += 256) y[i] = (x[i] * scale) * wc[i];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) y[threadIdx.x + 256 * j] = (v[j] * scale) * wc[threadIdx.x + 256 * j];
 }
 
 __global__ void k_hc_lowrank_act(float * lo, int n) {
@@ -306,24 +313,41 @@ __global__ void __launch_bounds__(32 * kDnRowWarps) k_dn_rows(const float * __re
 #pragma unroll
     for (int r = 0; r < kDnRowWarpRows; ++r) st[r] = Sh[(j0 + r) * (kDnState / 4) + lane];
     const float scale = 1.0f / sqrtf(float(kDnState));
-    for (int t = 0; t < T; ++t) {
+    const float dth = dt[h], ah = a[h];
+    // the next token's inputs load while this one's dependent chain runs
+    auto load = [&](int t, float4 & q, float4 & k, float (&v)[kDnRowWarpRows], float & be, float & al) {
         const float * row = conv + std::size_t(t) * kDnConvDim;
-        const float4 q = reinterpret_cast<const float4 *>(row + hk * kDnState)[lane];
-        const float4 k = reinterpret_cast<const float4 *>(row + kDnKeyDim + hk * kDnState)[lane];
-        const float * v = row + 2 * kDnKeyDim + h * kDnState;
-        const float b = sigmoidf_(beta[t * kDnVHeads + h]);
-        const float decay = expf(softplusf_(alpha[t * kDnVHeads + h] + dt[h]) * a[h]);
+        q = reinterpret_cast<const float4 *>(row + hk * kDnState)[lane];
+        k = reinterpret_cast<const float4 *>(row + kDnKeyDim + hk * kDnState)[lane];
+#pragma unroll
+        for (int r = 0; r < kDnRowWarpRows; ++r) v[r] = row[2 * kDnKeyDim + h * kDnState + j0 + r];
+        be = beta[t * kDnVHeads + h];
+        al = alpha[t * kDnVHeads + h];
+    };
+    float4 q, k, qn, kn;
+    float v[kDnRowWarpRows], vn[kDnRowWarpRows], be, al, ben = 0.f, aln = 0.f;
+    load(0, q, k, v, be, al);
+    for (int t = 0; t < T; ++t) {
+        if (t + 1 < T) load(t + 1, qn, kn, vn, ben, aln);
+        const float b = sigmoidf_(be);
+        const float decay = expf(softplusf_(al + dth) * ah);
 #pragma unroll
         for (int r = 0; r < kDnRowWarpRows; ++r) {
             float4 & s = st[r];
             s.x *= decay; s.y *= decay; s.z *= decay; s.w *= decay;
             const float sk = warp_sum(s.x * k.x + s.y * k.y + s.z * k.z + s.w * k.w);
             const int j = j0 + r;
-            const float d = (v[j] - sk) * b;
+            const float d = (v[r] - sk) * b;
             s.x += k.x * d; s.y += k.y * d; s.z += k.z * d; s.w += k.w * d;
             const float o = warp_sum(s.x * q.x + s.y * q.y + s.z * q.z + s.w * q.w) * scale;
             if (lane == 0) out[std::size_t(t) * kDnVDim + h * kDnState + j] = o;
         }
+        q = qn;
+        k = kn;
+#pragma unroll
+        for (int r = 0; r < kDnRowWarpRows; ++r) v[r] = vn[r];
+        be = ben;
+        al = aln;
     }
 #pragma unroll
     for (int r = 0; r < kDnRowWarpRows; ++r) Sh[(j0 + r) * (kDnState / 4) + lane] = st[r];
