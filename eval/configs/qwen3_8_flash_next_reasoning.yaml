@@ -1,0 +1,118 @@
+schema_version: 1
+
+# Qwen3.8-Flash-Next (Unsloth UD-IQ4_XS) on the Flash-Next engine: the text protocol of
+# qwen3_8_27b_nvfp4_reasoning.yaml (IFBench, AIME 2025, AIME 2026, GPQA-Diamond), served by the
+# installed `qwen3.8-flash-next` profile (windows/ninfer-models.json: 262,144-token context, MTP,
+# --max-concurrency 1). Sampling is Qwen's recommendation for thinking mode. Run it with
+# eval/run_qwen3_8_flash_next_reasoning.ps1.
+
+targets:
+  flash_next_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18085/v1
+    model: qwen3.8-flash-next
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  text_full:
+    jobs:
+      - id: ifbench
+        backend: evalscope
+        dataset: ifbench
+        target: flash_next_api
+        max_concurrency: 1
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 65536
+          seed: 42
+          extra_body: &thinking_extra_body
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: flash_next_api
+        max_concurrency: 1
+        generation: &aime_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 122880
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args: &aime_backend
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: flash_next_api
+        max_concurrency: 1
+        generation: *aime_generation
+        backend_args: *aime_backend
+
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: flash_next_api
+        max_concurrency: 1
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # The 262,144-token context holds this budget plus GPQA's prompts (at most ~2,850 tokens).
+          max_tokens: 245760
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+  # A few samples of each job with the same settings: checks scoring and the server before the full run.
+  smoke:
+    jobs:
+      - {id: ifbench_smoke, backend: evalscope, dataset: ifbench, target: flash_next_api, limit: 2,
+         generation: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, frequency_penalty: 0.0,
+                      max_tokens: 65536, seed: 42, extra_body: {enable_thinking: true, min_p: 0.0}},
+         backend_args: {few_shot_num: 0, judge_strategy: rule, dataset_hub: modelscope}}
+      - {id: aime25_smoke, backend: evalscope, dataset: aime25, target: flash_next_api, limit: 1,
+         generation: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, frequency_penalty: 0.0,
+                      max_tokens: 122880, seed: 42, extra_body: {enable_thinking: true, min_p: 0.0}},
+         backend_args: {judge_strategy: rule, dataset_hub: modelscope}}
+      - {id: aime26_smoke, backend: evalscope, dataset: aime26, target: flash_next_api, limit: 1,
+         generation: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, frequency_penalty: 0.0,
+                      max_tokens: 122880, seed: 42, extra_body: {enable_thinking: true, min_p: 0.0}},
+         backend_args: {judge_strategy: rule, dataset_hub: modelscope}}
+      - {id: gpqa_diamond_smoke, backend: evalscope, dataset: gpqa_diamond, target: flash_next_api, limit: 2,
+         generation: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 0.0, frequency_penalty: 0.0,
+                      max_tokens: 245760, seed: 42, extra_body: {enable_thinking: true, min_p: 0.0}},
+         backend_args: {few_shot_num: 0, judge_strategy: rule, dataset_hub: modelscope}}
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 5
+    heartbeat_seconds: 900
+  samples:
+    retention: all
