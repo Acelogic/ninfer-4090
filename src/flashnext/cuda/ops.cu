@@ -246,8 +246,8 @@ __global__ void __launch_bounds__(kDnThreads) k_dn_recurrence(const float * __re
 __global__ void __launch_bounds__(kHeadDim) k_attn_prep(const float * __restrict__ q_full, const float * __restrict__ k,
                                                         const float * __restrict__ v, const float * __restrict__ q_norm,
                                                         const float * __restrict__ k_norm, const double * __restrict__ inv_freq,
-                                                        float * __restrict__ q, float * __restrict__ gate, half * __restrict__ k_cache,
-                                                        half * __restrict__ v_cache, const std::int64_t * __restrict__ pos0p, float eps) {
+                                                        float * __restrict__ q, float * __restrict__ gate, const KvStore st,
+                                                        const std::int64_t * __restrict__ pos0p, float eps) {
     __shared__ float ys[kHeadDim];
     __shared__ float sh[32];
     const int t = blockIdx.x, hh = blockIdx.y, d = threadIdx.x;
@@ -277,9 +277,11 @@ __global__ void __launch_bounds__(kHeadDim) k_attn_prep(const float * __restrict
         q[o] = ys[d];
         gate[o] = q_full[(std::size_t(t) * kHeads + hh) * 2 * kHeadDim + kHeadDim + d];
     } else {
-        const std::size_t o = (std::size_t(pos) * kKvHeads + hk) * kHeadDim + d;
-        k_cache[o] = __float2half_rn(ys[d]);
-        v_cache[o] = __float2half_rn(v[(std::size_t(t) * kKvHeads + hk) * kHeadDim + d]);
+        const half kh = __float2half_rn(ys[d]), vh = __float2half_rn(v[(std::size_t(t) * kKvHeads + hk) * kHeadDim + d]);
+        const std::size_t col = std::size_t(hk) * kHeadDim + d;
+        const std::size_t o = std::size_t(st.ring ? pos % st.ring : pos) * kKvHeads * kHeadDim + col;
+        st.k[o] = kh;
+        st.v[o] = vh;
     }
 }
 
@@ -483,10 +485,11 @@ __global__ void k_mtp_concat(const float * __restrict__ e, const float * __restr
 }
 
 __global__ void k_window_cells(const std::int64_t * __restrict__ pos0p, int width, std::int32_t * __restrict__ cells,
-                               std::int32_t * __restrict__ n_cells) {
+                               std::int32_t * __restrict__ n_cells, std::int64_t ring) {
     const std::int64_t p = *pos0p + blockIdx.x;
     const std::int64_t n = p + 1 < width ? p + 1 : width, first = p + 1 - n;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) cells[std::size_t(blockIdx.x) * width + i] = std::int32_t(first + i);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        cells[std::size_t(blockIdx.x) * width + i] = std::int32_t(ring ? (first + i) % ring : first + i);
     if (threadIdx.x == 0) n_cells[blockIdx.x] = std::int32_t(n);
 }
 
@@ -657,11 +660,20 @@ void dn_recurrence(const float * conv_out, const float * z, const float * beta, 
 }
 
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
+               const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0, int T, float eps,
+               cudaStream_t s) {
+    if (!store.k || !store.v) throw std::runtime_error("attn_prep: incomplete K/V store");
+    k_attn_prep<<<dim3(T, kHeads + kKvHeads), kHeadDim, 0, s>>>(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, store, pos0, eps);
+    launched("attn_prep");
+}
+
+void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
                const double * rope_inv_freq, float * q, float * gate, half * k_cache, half * v_cache, const std::int64_t * pos0, int T,
                float eps, cudaStream_t s) {
-    k_attn_prep<<<dim3(T, kHeads + kKvHeads), kHeadDim, 0, s>>>(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, k_cache, v_cache,
-                                                                 pos0, eps);
-    launched("attn_prep");
+    KvStore st;
+    st.k = k_cache;
+    st.v = v_cache;
+    attn_prep(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, st, pos0, T, eps, s);
 }
 
 std::size_t attn_work_floats(int T) { return std::size_t(kAttnMaxChunks) * kKvHeads * kGroup * T * kAttnStride; }
@@ -716,8 +728,9 @@ void mtp_concat(const float * e, const float * h, float * out, int T, cudaStream
     k_mtp_concat<<<blocks(n, 256), 256, 0, s>>>(e, h, out, n);
     launched("mtp_concat");
 }
-void window_cells(const std::int64_t * pos0, int T, int width, std::int32_t * cells, std::int32_t * n_cells, cudaStream_t s) {
-    k_window_cells<<<T, 256, 0, s>>>(pos0, width, cells, n_cells);
+void window_cells(const std::int64_t * pos0, int T, int width, std::int32_t * cells, std::int32_t * n_cells, cudaStream_t s,
+                  std::int64_t ring) {
+    k_window_cells<<<T, 256, 0, s>>>(pos0, width, cells, n_cells, ring);
     launched("window_cells");
 }
 void argmax(const float * x, int n, std::int32_t * out, cudaStream_t s) {

@@ -166,6 +166,8 @@ struct Engine::Impl {
     // MTP head: one more layer (attention + MoE, every expert in VRAM) fed with the main model's last
     // hidden streams and the next token's embedding. Its KV cache holds positions [0, pos) computed
     // from the main model's hidden states; draft positions beyond are scratch, overwritten later.
+    // The layer attends to its last 2051 positions only, so its K/V is a ring of `ring` rows (position
+    // p at row p % ring) rather than max_ctx rows.
     struct Mtp {
         std::unique_ptr<GgufModel> gguf;
         Layer L;
@@ -177,6 +179,7 @@ struct Engine::Impl {
         Pinned<std::int64_t> h_step{1};
         Pinned<std::int32_t> h_tok{1};
         std::int64_t pos = 0;
+        std::int64_t ring = 0;
         cudaGraphExec_t graph = nullptr;  // the single-token draft pass
         ~Mtp() {
             if (graph) cudaGraphExecDestroy(graph);
@@ -414,7 +417,10 @@ struct Engine::Impl {
         M.head_norm = V(b + "nextn.hc_head_norm.weight", HCD);
         M.head_down = W(b + "nextn.hc_head_down.weight", HCD, R);
         M.head_up = W(b + "nextn.hc_head_up.weight", R, HCD);
-        const std::size_t kv = std::size_t(opt.max_ctx) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
+        // A pass of T <= cap tokens writes rows pos0 .. pos0+T-1 and reads the 2050 before each: with cap + 2051
+        // rows no two of those positions share a row.
+        M.ring = (std::int64_t(cap) + fc::kQsaWidth + 255) / 256 * 256;
+        const std::size_t kv = std::size_t(M.ring) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
         L.k_cache = zeros(kv);
         L.v_cache = zeros(kv);
         // every expert in VRAM: the MTP layer has no CPU path
@@ -505,10 +511,14 @@ struct Engine::Impl {
 
         hc_mix(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, &L.hc_attn_inject, T, 0, M.res.as<float>());
         linear_multi({{&L.wq, &qfull}, {&L.wk, &k}, {&L.wv, &v}}, mixed, T);
+        fc::KvStore ring;
+        ring.k = L.k_cache.as<half>();
+        ring.v = L.v_cache.as<half>();
+        ring.ring = M.ring;
         fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
-                      q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), pos, T, cfg.rms_eps, stream);
-        // the most recent 2051 positions (llama.cpp attends densely; drafts are verified either way)
-        fc::window_cells(pos, T, fc::kQsaWidth, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), stream);
+                      q.as<float>(), qgate.as<float>(), ring, pos, T, cfg.rms_eps, stream);
+        // the most recent 2051 positions (llama.cpp attends densely; drafts are verified either way), as ring rows
+        fc::window_cells(pos, T, fc::kQsaWidth, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), stream, M.ring);
         fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
                         n_cells.as<std::int32_t>(), T, cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
         linear(L.wo, att, out, T);
@@ -951,8 +961,20 @@ struct Engine::Impl {
             }
         }
         v.push_back(&ple_hist);
-        if (mtp) v.push_back(&mtp->pending_h);
+        if (mtp) {
+            v.push_back(&mtp->pending_h);
+            // the MTP K/V ring holds only the last positions, which later positions overwrite: it travels with
+            // the snapshot (with M.pos, appended after the buffers)
+            v.push_back(&mtp->L.k_cache);
+            v.push_back(&mtp->L.v_cache);
+        }
         return v;
+    }
+
+    std::size_t state_bytes() {
+        std::size_t bytes = mtp ? sizeof(std::int64_t) : 0;
+        for (fc::DeviceBuffer * b : state_buffers()) bytes += b->bytes();
+        return bytes;
     }
 
     EngineSnapshot snapshot() {
@@ -960,14 +982,13 @@ struct Engine::Impl {
         check(cudaStreamSynchronize(stream), "snapshot");
         EngineSnapshot snap;
         snap.tokens.assign(history.begin(), history.begin() + n_past);
-        std::size_t bytes = 0;
-        for (fc::DeviceBuffer * b : state_buffers()) bytes += b->bytes();
-        snap.state.resize(bytes);
+        snap.state.resize(state_bytes());
         std::size_t off = 0;
         for (fc::DeviceBuffer * b : state_buffers()) {
             check(cudaMemcpy(snap.state.data() + off, b->get(), b->bytes(), cudaMemcpyDeviceToHost), "snapshot");
             off += b->bytes();
         }
+        if (mtp) std::memcpy(snap.state.data() + off, &mtp->pos, sizeof(std::int64_t));
         return snap;
     }
 
@@ -975,9 +996,7 @@ struct Engine::Impl {
         const std::size_t n = snap.tokens.size();
         if (n > history.size() || !std::equal(snap.tokens.begin(), snap.tokens.end(), history.begin()))
             throw std::runtime_error("engine: the caches no longer hold this snapshot's tokens");
-        std::size_t bytes = 0;
-        for (fc::DeviceBuffer * b : state_buffers()) bytes += b->bytes();
-        if (snap.state.size() != bytes) throw std::runtime_error("engine: snapshot from a different model");
+        if (snap.state.size() != state_bytes()) throw std::runtime_error("engine: snapshot from a different model");
         check(cudaStreamSynchronize(stream), "restore");
         std::size_t off = 0;
         for (fc::DeviceBuffer * b : state_buffers()) {
@@ -988,7 +1007,11 @@ struct Engine::Impl {
         rows_pos0 = n_past;
         rows_valid = 0;
         snaps_valid = false;
-        if (mtp) mtp->pos = std::min(mtp->pos, n_past);  // pending_h came back with the snapshot
+        if (mtp) {  // pending_h and the K/V ring came back with the snapshot, so did its position
+            std::int64_t pos = 0;
+            std::memcpy(&pos, snap.state.data() + off, sizeof(std::int64_t));
+            mtp->pos = std::min(pos, n_past);
+        }
     }
 
     // ---------------------------------------------------------------------------------------------

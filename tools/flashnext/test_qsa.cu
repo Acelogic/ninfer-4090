@@ -8,6 +8,7 @@
 //      decode steps): blocks, queries and selections must equal the reference's; attention error is
 //      reported against the reference (FP32 K/V) and against the double port on the fp16 cache
 //   3. timings at contexts of 2K, 32K and 262K tokens (synthetic data), decode and prefill
+//   4. the MTP layer's K/V ring against a full cache (synthetic data): bit-identical attention
 //
 // Usage: test_qsa [-m <GGUF shard 1> --dumps <dir> [--layers 3,23,47]] [--no-timing | --timing-only]
 #include <algorithm>
@@ -672,6 +673,64 @@ void test_timing() {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// 4. MTP K/V ring
+
+// The MTP layer's K/V ring: attention over the last 2051 positions read from a ring of R rows must equal
+// the same attention over a full cache, for passes of up to `cap` tokens.
+void test_mtp_ring() {
+    std::printf("== MTP K/V ring parity (synthetic data)\n");
+    const int cap = 512;
+    const std::int64_t ctx = 12000, ring = (cap + kW + 255) / 256 * 256;
+    Rng rng(99);
+    const std::size_t qf = std::size_t(kHeads) * 2 * kHeadDim, kvw = std::size_t(kKvHeads) * kHeadDim, qo = std::size_t(kHeads) * kHeadDim;
+    DeviceBuffer pos(8), inv(kRot / 2 * sizeof(double)), qn(kHeadDim * 4), kn(kHeadDim * 4);
+    DeviceBuffer q_full(cap * qf * 4), k_in(cap * kvw * 4), v_in(cap * kvw * 4), cells(std::size_t(cap) * kW * 4), n_cells(cap * 4);
+    DeviceBuffer q(cap * qo * 4), g(cap * qo * 4), o_a(cap * qo * 4), o_b(cap * qo * 4), work(attn_sparse_work_floats(cap) * 4);
+    DeviceBuffer kc(std::size_t(ctx) * kvw * 2), vc(std::size_t(ctx) * kvw * 2), kr(std::size_t(ring) * kvw * 2), vr(std::size_t(ring) * kvw * 2);
+    std::vector<double> f(kRot / 2);
+    for (int i = 0; i < kRot / 2; ++i) f[std::size_t(i)] = std::pow(kRopeBase, -2.0 * i / kRot);
+    upload(inv, f.data(), f.size());
+    std::vector<float> w(kHeadDim, 1.0f);
+    upload(qn, w.data(), w.size());
+    upload(kn, w.data(), w.size());
+    std::vector<float> h(std::size_t(cap) * qf);
+    int bad = 0, n = 0;
+    std::int64_t p = 0;
+    while (p < ctx - cap) {
+        const int T = std::min<int>(cap, 1 + int(rng.uniform(0.0f, 1.0f) * float(rng.uniform(0.0f, 1.0f) < 0.3f ? cap : 4)));
+        set_pos(pos, p);
+        for (DeviceBuffer * b : {&q_full, &k_in, &v_in}) {
+            const std::size_t m = std::size_t(T) * (b == &q_full ? qf : kvw);
+            for (std::size_t i = 0; i < m; ++i) h[i] = rng.normal();
+            upload(*b, h.data(), m);
+        }
+        attn_prep(q_full.as<float>(), k_in.as<float>(), v_in.as<float>(), qn.as<float>(), kn.as<float>(), inv.as<double>(), q.as<float>(),
+                  g.as<float>(), kc.as<half>(), vc.as<half>(), pos.as<std::int64_t>(), T, kEps, 0);
+        window_cells(pos.as<std::int64_t>(), T, kW, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), 0);
+        attn_sparse(q.as<float>(), g.as<float>(), kc.as<half>(), vc.as<half>(), cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), T, kScale,
+                    work.as<float>(), o_a.as<float>(), 0);
+        KvStore st;
+        st.k = kr.as<half>();
+        st.v = vr.as<half>();
+        st.ring = ring;
+        attn_prep(q_full.as<float>(), k_in.as<float>(), v_in.as<float>(), qn.as<float>(), kn.as<float>(), inv.as<double>(), q.as<float>(),
+                  g.as<float>(), st, pos.as<std::int64_t>(), T, kEps, 0);
+        window_cells(pos.as<std::int64_t>(), T, kW, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), 0, ring);
+        attn_sparse(q.as<float>(), g.as<float>(), kr.as<half>(), vr.as<half>(), cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), T, kScale,
+                    work.as<float>(), o_b.as<float>(), 0);
+        std::vector<float> a(std::size_t(T) * qo), b(std::size_t(T) * qo);
+        download(a.data(), o_a, a.size());
+        download(b.data(), o_b, b.size());
+        bad += !same_bits(a.data(), b.data(), a.size());
+        ++n;
+        p += T;
+    }
+    std::printf("  %d passes up to %lld positions with a %lld-row ring: bit-identical to the full cache %d/%d\n", n, (long long) p,
+                (long long) ring, n - bad, n);
+    expect(bad == 0, "MTP ring attention bit-identical");
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -706,6 +765,7 @@ int main(int argc, char ** argv) {
         if (random) test_random();
         if (!model.empty() && !dumps.empty()) test_real(model, dumps, layers);
         if (timing) test_timing();
+        if (random) test_mtp_ring();
     } catch (const std::exception & e) {
         std::printf("error: %s\n", e.what());
         return 1;
