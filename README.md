@@ -17,8 +17,8 @@ Each row is a ready-made profile. The profile name is also the model id that cli
 
 | Profile | Model | Context | Writes | Reads prompts |
 |---|---|---|---:|---:|
-| `qwen3.8-flash-next` | Qwen3.8-Flash-Next, Unsloth UD-IQ4_XS (94 GB) | 262K, text | 50-60 tok/s; ~44 at 256K deep | 2,500-3,000 tok/s |
-| `qwen3.8-flash-next-huihui` | Qwen3.8-Flash-Next, abliterated (Huihui), same recipe | 262K, text | same as above | same |
+| `qwen3.8-flash-next` | Qwen3.8-Flash-Next, Unsloth UD-IQ4_XS (94 GB) | 262K, text + images | 50-60 tok/s; ~44 at 256K deep | 2,500-3,000 tok/s |
+| `qwen3.8-flash-next-huihui` | Qwen3.8-Flash-Next, abliterated (Huihui), same recipe | 262K, text + images | same as above | same |
 | `qwen3.8-27b-fast` | Qwen3.8 27B | 131K, text | ~225 tok/s, up to 400 on edits | ~3,600 tok/s |
 | `qwen3.8-27b` | Qwen3.8 27B | 208K, text + images | ~160 tok/s | ~3,600 tok/s |
 | `qwen3.8-27b-huihui` | Qwen3.8 27B, abliterated (Huihui) | 208K, text + images | same as `qwen3.8-27b` | |
@@ -33,6 +33,9 @@ Each row is a ready-made profile. The profile name is also the model id that cli
   conversation's state is reused.
 - **No quality cost from speculation:** speculative decoding drafts several tokens ahead and has the full model
   check them, so the output is what the model would have written anyway.
+- **Images:** both Flash-Next profiles load the vision encoder (`mmproj-F16.gguf`). A typical image is encoded on
+  the GPU in 40-200 ms (a 1080p screenshot in ~0.65 s), and paste-an-image works in Pi. The encoder's rows match a
+  double-precision reference to ~5e-6, closer than llama.cpp's own encoder gets.
 - **Exact numerics:** the Flash-Next engine keeps FP32 activations and the file's exact weights. Its logits match an
   FP32 reference forward pass to a relative 1.6e-4.
 - **Bonsai** is a ternary-compressed Qwen3.8 27B: 6.4 GB instead of 19 GB, keeping about 98% of the full model's
@@ -78,7 +81,7 @@ Developer\
     build\             build output                                                             (not in git)
     work\              local tools, test data, comparisons                                      (not in git)
   models\              every model file; app\models points here
-    qwen3.8-flash-next\UD-IQ4_XS\...gguf, qwen3.8-flash-next\MTP\...gguf
+    qwen3.8-flash-next\UD-IQ4_XS\...gguf, qwen3.8-flash-next\MTP\...gguf, qwen3.8-flash-next\mmproj-F16.gguf
     qwen3.8-flash-next-huihui\UD-IQ4_XS\...gguf
     qwen3_8_27b_a8.ninfer, qwen3_8_27b_huihui_v3.ninfer, bonsai2_27b_*.ninfer
   build-tools\         CUDA 13.3, vcpkg and its packages
@@ -119,7 +122,7 @@ The API is at `http://127.0.0.1:18085/v1`. A tray icon shows the loaded model an
                  "maxTokensField": "max_tokens", "thinkingFormat": "qwen", "supportsStrictMode": false },
      "models": [
        { "id": "qwen3.8-flash-next", "name": "Qwen3.8 Flash-Next (NInfer Extreme)", "reasoning": true,
-         "contextWindow": 262144, "maxTokens": 32768 }
+         "input": ["text", "image"], "contextWindow": 262144, "maxTokens": 32768 }
      ]
    }
    ```
