@@ -724,6 +724,7 @@ struct Engine::Impl {
     ~Impl() {
         if (stream) cudaStreamSynchronize(stream);
         if (copy_stream) cudaStreamSynchronize(copy_stream);
+        if (conv_stream) cudaStreamSynchronize(conv_stream);
         if (bound_T) {  // give the permanent buffers back (no refill: everything goes)
             std::vector<Act> acts = chunk_buffers(bound_T);
             for (std::size_t i = 0; i < acts.size() && i < saved_acts.size(); ++i) *acts[i].b = std::move(saved_acts[i]);
@@ -1385,7 +1386,7 @@ struct Engine::Impl {
         } else {
             if (stream_chunk) {
                 plan_stream(T);
-                issue_copies();  // the first layers' experts copy while the GPU starts on the chunk
+                queue_conversions(1);  // the first layers' experts copy and convert while the GPU starts on the chunk
             }
             enqueue(T, head_rows);
             check(cudaStreamSynchronize(stream), "step");
@@ -1412,7 +1413,9 @@ struct Engine::Impl {
 
     static constexpr int kBaseCap = 512;  // permanent activation buffers hold this many tokens; bigger chunks borrow
     static constexpr int kEvents = 256;   // ring events, reused round robin (far fewer groups are ever in flight)
-    std::size_t ring_target = std::size_t(640) << 20;  // bytes of the streaming ring (NINFER_FN_RING_MB)
+    // bytes of the streaming ring (NINFER_FN_RING_MB): enough for about a layer's streamed experts, so that the
+    // copy engine keeps going through a layer's dense part (24K prompt at 262K: 640 MiB 2593 tok/s, 1.5 GiB 2797)
+    std::size_t ring_target = std::size_t(1536) << 20;
     int group_override = 0;                             // experts per streamed group (NINFER_FN_GROUP; 0: by chunk size)
     static constexpr int kRefillBatch = 8;                              // experts per refill/swap conversion batch
 
@@ -1434,8 +1437,10 @@ struct Engine::Impl {
     std::vector<fc::HostExpertFormat> host_fmt;
     std::vector<char> host_pinned;
     std::size_t blob_max = 0, slot_max = 0;
-    cudaStream_t copy_stream = nullptr;
-    std::vector<cudaEvent_t> ev_copied, ev_released;
+    cudaStream_t copy_stream = nullptr, conv_stream = nullptr;
+    // per streamed group: its blobs landed in the ring (copy stream); it is converted, so its ring bytes are free
+    // (conversion stream); the compute stream is done with its conversion slots
+    std::vector<cudaEvent_t> ev_copied, ev_released, ev_done;
     fc::DeviceBuffer d_keymap, d_ptrs, refill_staging, d_pos;
     std::unique_ptr<Pinned<std::int32_t>> h_keymap;
     std::unique_ptr<Pinned<std::uint64_t>> h_ptrs;
@@ -1443,11 +1448,12 @@ struct Engine::Impl {
     std::unique_ptr<Pinned<std::int32_t>> h_ids_all;  // [layer][T*10]: a streamed chunk's routing, for the cache's statistics
     std::size_t ids_all_cap = 0;
     std::size_t host_cap = 0;                          // tokens the step's pinned host buffers hold
+    float * h_moe_dev = nullptr;                       // h_moe's device address (zero-copy reads)
     // the current chunk's stream plan
     bool stream_chunk = false;
     std::vector<StreamLayer> s_layers;
     std::vector<StreamGroup> s_groups;
-    int s_next = 0, s_enqueued = 0;
+    int s_next = 0, s_enqueued = 0, s_computed = 0;  // groups whose copies / conversions / computations are queued
     std::deque<int> s_inflight;
     std::int64_t s_hits = 0;
     std::int64_t mtp_skip_below = 0;  // the MTP catch-up of a prompt starts here (drafts never look further back)
@@ -1503,6 +1509,7 @@ struct Engine::Impl {
         h_w = std::make_unique<Pinned<float>>(n * fc::kUsed);
         h_ids = std::make_unique<Pinned<std::int32_t>>(n * fc::kUsed);
         h_oncpu = std::make_unique<Pinned<std::uint8_t>>(n * fc::kUsed);
+        check(cudaHostGetDevicePointer(reinterpret_cast<void **>(&h_moe_dev), h_moe->get(), 0), "pinned moe");
         host_cap = n;
     }
 
@@ -1515,12 +1522,15 @@ struct Engine::Impl {
         host_pinned.assign(std::size_t(nl), 0);
         lent_slots.assign(std::size_t(nl), {});
         check(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking), "copy stream");
+        check(cudaStreamCreateWithFlags(&conv_stream, cudaStreamNonBlocking), "conversion stream");
         for (int i = 0; i < kEvents; ++i) {
-            cudaEvent_t a = nullptr, b = nullptr;
+            cudaEvent_t a = nullptr, b = nullptr, c = nullptr;
             check(cudaEventCreateWithFlags(&a, cudaEventDisableTiming), "event");
             check(cudaEventCreateWithFlags(&b, cudaEventDisableTiming), "event");
+            check(cudaEventCreateWithFlags(&c, cudaEventDisableTiming), "event");
             ev_copied.push_back(a);
             ev_released.push_back(b);
+            ev_done.push_back(c);
         }
         d_keymap = fc::DeviceBuffer(std::size_t(nl) * fc::kExperts * sizeof(std::int32_t));
         d_ptrs = fc::DeviceBuffer(std::size_t(nl) * fc::kExperts * sizeof(std::uint64_t));
@@ -1585,7 +1595,9 @@ struct Engine::Impl {
             if (host_pinned[il]) cudaHostUnregister(const_cast<std::uint8_t *>(host[il].base));
         for (cudaEvent_t e : ev_copied) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_released) cudaEventDestroy(e);
+        for (cudaEvent_t e : ev_done) cudaEventDestroy(e);
         if (copy_stream) cudaStreamDestroy(copy_stream);
+        if (conv_stream) cudaStreamDestroy(conv_stream);
     }
 
     struct SlotLoad {
@@ -1780,7 +1792,7 @@ struct Engine::Impl {
     // Bytes a prompt with chunks of T tokens borrows.
     std::size_t prompt_bytes(int T, bool streaming, std::size_t ring_b, std::size_t kv_b) {
         std::size_t b = chunk_layout(chunk_buffers(T), nullptr);
-        if (streaming) b += (ring_b + 255) / 256 * 256 + std::size_t(conv_count(T)) * slot_max;
+        if (streaming) b += (ring_b + 255) / 256 * 256 + 2 * std::size_t(conv_count(T)) * slot_max;
         return b + (kv_b + 255) / 256 * 256;
     }
 
@@ -1790,7 +1802,7 @@ struct Engine::Impl {
         std::vector<std::size_t> offs;
         Carve c{chunk_layout(acts, &offs)};
         const std::size_t ring_off = streaming ? c.take(ring_b) : 0;
-        const std::size_t conv_off = streaming ? c.take(std::size_t(conv_count(T)) * slot_max) : 0;
+        const std::size_t conv_off = streaming ? c.take(2 * std::size_t(conv_count(T)) * slot_max) : 0;
         const std::size_t kv_off = kv_b ? c.take(kv_b) : 0;
         std::uint8_t * base = lend(c.at);
         saved_acts.clear();
@@ -1817,6 +1829,7 @@ struct Engine::Impl {
         if (!bound_T) return;
         cudaStreamSynchronize(stream);
         cudaStreamSynchronize(copy_stream);
+        cudaStreamSynchronize(conv_stream);
         std::vector<Act> acts = chunk_buffers(bound_T);
         for (std::size_t i = 0; i < acts.size(); ++i) *acts[i].b = std::move(saved_acts[i]);
         saved_acts.clear();
@@ -1897,7 +1910,8 @@ struct Engine::Impl {
                 g.key0 = key;
                 for (std::size_t j = i0; j < rest.size() && j < i0 + std::size_t(G); ++j) {
                     km[rest[j]] = key;
-                    pp[key++] = std::uint64_t(reinterpret_cast<std::uintptr_t>(conv_area + (j - i0) * slot_max));
+                    const std::size_t set = s_groups.size() % 2;  // groups alternate between two sets of slots
+                    pp[key++] = std::uint64_t(reinterpret_cast<std::uintptr_t>(conv_area + (set * std::size_t(G) + (j - i0)) * slot_max));
                     g.experts.push_back(rest[j]);
                 }
                 g.key1 = key;
@@ -1911,6 +1925,7 @@ struct Engine::Impl {
         check(cudaMemcpyAsync(d_ptrs.get(), h_ptrs->get(), d_ptrs.bytes(), cudaMemcpyHostToDevice, stream), "stream plan");
         s_next = 0;
         s_enqueued = 0;
+        s_computed = 0;
         s_inflight.clear();
     }
 
@@ -1945,6 +1960,33 @@ struct Engine::Impl {
             ++issued;
         }
         if (issued) cudaStreamQuery(copy_stream);  // submit now (Windows batches work otherwise)
+    }
+
+    // Queues on the conversion stream the conversions of the groups up to `last`, as far as possible: group g
+    // needs its copies queued (it waits for them) and the computation of group g - 2, the last user of its
+    // conversion slots, queued (it waits for that too). Its event frees its ring bytes and releases it to the
+    // compute stream.
+    void queue_conversions(int last) {
+        last = std::min(last, int(s_groups.size()) - 1);
+        while (s_enqueued <= last) {
+            const int g = s_enqueued;
+            issue_copies();
+            if (s_next <= g || s_computed < g - 1) return;
+            const StreamGroup & G = s_groups[std::size_t(g)];
+            check(cudaStreamWaitEvent(conv_stream, ev_copied[std::size_t(g % kEvents)], 0), "copy wait");
+            if (g >= 2) check(cudaStreamWaitEvent(conv_stream, ev_done[std::size_t((g - 2) % kEvents)], 0), "slot wait");
+            fc::ConvertBatch cb;
+            cb.n = int(G.experts.size());
+            const std::size_t set = std::size_t(g % 2) * std::size_t(conv_slots);
+            for (int j = 0; j < cb.n; ++j) {
+                cb.src[j] = ring + G.ring_off + std::size_t(j) * host[std::size_t(G.layer)].stride;
+                cb.dst[j] = conv_area + (set + std::size_t(j)) * slot_max;
+            }
+            fc::convert_experts(host_fmt[std::size_t(G.layer)], cache[std::size_t(G.layer)].lay, cb, conv_stream);
+            check(cudaEventRecord(ev_released[std::size_t(g % kEvents)], conv_stream), "ring event");
+            ++s_enqueued;
+        }
+        cudaStreamQuery(conv_stream);
     }
 
     // FFN of a prompt chunk with every routed expert on the GPU: the cached ones from their pool slots, the
@@ -1992,23 +2034,16 @@ struct Engine::Impl {
             fc::experts_phased_run(C.lay, ptrs, 0, int(SL.resident.size()), T, mixed.as<float>(), batch_ws.get(), stream);
         prof_mark("experts_cached");
         for (int gi = SL.first_group; gi < SL.first_group + SL.n_groups; ++gi) {
-            issue_copies();
-            if (s_next <= gi) throw std::logic_error("engine: a streamed group was not queued before its use");
+            queue_conversions(gi);
+            if (s_enqueued <= gi) throw std::logic_error("engine: a streamed group was not converted before its use");
             const StreamGroup & g = s_groups[std::size_t(gi)];
-            check(cudaStreamWaitEvent(stream, ev_copied[std::size_t(gi % kEvents)], 0), "ring wait");
+            check(cudaStreamWaitEvent(stream, ev_released[std::size_t(gi % kEvents)], 0), "conversion wait");
             prof_mark("stream_wait");
-            fc::ConvertBatch cb;
-            cb.n = int(g.experts.size());
-            for (int j = 0; j < cb.n; ++j) {
-                cb.src[j] = ring + g.ring_off + std::size_t(j) * host[std::size_t(il)].stride;
-                cb.dst[j] = conv_area + std::size_t(j) * slot_max;
-            }
-            fc::convert_experts(host_fmt[std::size_t(il)], C.lay, cb, stream);
-            check(cudaEventRecord(ev_released[std::size_t(gi % kEvents)], stream), "ring event");
-            s_enqueued = gi + 1;
-            prof_mark("convert");
             fc::experts_phased_run(C.lay, ptrs, g.key0, g.key1, T, mixed.as<float>(), batch_ws.get(), stream);
+            check(cudaEventRecord(ev_done[std::size_t(gi % kEvents)], stream), "group event");
+            s_computed = gi + 1;
             prof_mark("experts_streamed");
+            queue_conversions(gi + 1);  // the next group (perhaps the next layer's) converts while this one computes
         }
         issue_copies();
         fc::experts_phased_end(T, slots.as<std::int32_t>(), wts.as<float>(), gpu_sum.as<float>(), batch_ws.get(), stream);
@@ -2016,9 +2051,9 @@ struct Engine::Impl {
             share_wait[std::size_t(il)] = {&share_done[std::size_t(il)], share_chunk};
             check(cudaLaunchHostFunc(stream, share_wait_fn, &share_wait[std::size_t(il)]), "cpu share wait");
             prof_mark("cpu_share_wait");
-            check(cudaMemcpyAsync(moe.get(), h_moe->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "moe");
         }
-        fc::moe_combine_sum(gpu_sum.as<float>(), share ? moe.as<float>() : nullptr, sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
+        // the CPU's sums are read straight from pinned host memory: a copy would queue behind the ring's
+        fc::moe_combine_sum(gpu_sum.as<float>(), share ? h_moe_dev : nullptr, sd.as<float>(), sg.as<float>(), out.as<float>(), T, stream);
         prof_mark("combine");
     }
 

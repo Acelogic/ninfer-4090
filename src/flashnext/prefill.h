@@ -81,10 +81,10 @@ struct StreamLayer {
 // layer's dense part) finishes them no later than the copy engine finishes the layer's other experts.
 // rest: the uncached experts; share[e]: predicted fraction of the layer's pairs routed to e; us_per_copy:
 // microseconds to copy one expert. Returns the chosen experts (ascending ids).
-struct ShareModel {
-    double us_per_expert = 50;  // CPU: reading an expert's weights
-    double us_per_pair = 5;     // CPU: one token through one expert
-    double us_dense = 7;        // GPU: a layer's dense part, per token
+struct ShareModel {           // fitted to measured prompt chunks of 2048 and 4096 tokens (fn_generate --profile)
+    double us_per_expert = 60;  // CPU: reading an expert's weights and setting it up
+    double us_per_pair = 10;    // CPU: one token through one expert (16-bit activations)
+    double us_dense = 5.5;      // GPU: a layer's dense part, per token
 };
 std::vector<int> pick_cpu_share(const std::vector<int> & rest, const std::vector<double> & share, int T, double us_per_copy, const ShareModel & m);
 
