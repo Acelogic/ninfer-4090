@@ -18,6 +18,7 @@ param([switch]$Configure, [switch]$Install, [switch]$Test, [string[]]$Targets, [
       [string]$Tools = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) 'build-tools'),
       [string]$RootDrive = 'N', [string]$ToolsDrive = 'Q')
 $ErrorActionPreference = 'Stop'
+$Targets = @($Targets | ForEach-Object { $_ -split ',' } | Where-Object { $_ })  # pwsh -File passes 'a,b' as one string
 $root = (Resolve-Path (Split-Path $PSScriptRoot)).Path
 $Tools = (Resolve-Path $Tools).Path
 $vcvars = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'

@@ -81,6 +81,7 @@ struct EngineStats {
     std::int64_t cached_experts = 0;
     double cache_gib = 0;
     std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed
+    std::int64_t invalid_drafts = 0;  // MTP drafts dropped because the head's output was not a valid token
     double cache_swap_ms = 0;      // time spent replacing them
     // prompts
     std::int64_t prompt_chunks = 0, streamed_chunks = 0;

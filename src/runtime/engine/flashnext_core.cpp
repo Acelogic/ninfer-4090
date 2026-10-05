@@ -1178,7 +1178,7 @@ private:
             // Never draft past the output or thinking budget: the step commits at most k+1 tokens.
             const std::uint32_t model_budget =
                 request.output.model_token_budget_remaining(budget.remaining());
-            const std::uint32_t k =
+            std::uint32_t k =
                 model_budget == 0 ? 0 : std::min(choose_drafts(), model_budget - 1);
             if (k == 0) {
                 logits   = forward(std::span<const TokenId>(&token, 1));
@@ -1188,9 +1188,21 @@ private:
                 continue;
             }
 
-            const std::uint32_t base                = live_tokens;
-            const std::vector<std::int32_t> drafted = engine->draft(token, static_cast<int>(k));
-            if (drafted.size() != k) { throw std::logic_error("MTP head drafted a wrong count"); }
+            const std::uint32_t base          = live_tokens;
+            std::vector<std::int32_t> drafted = engine->draft(token, static_cast<int>(k));
+            if (drafted.size() > k) { throw std::logic_error("MTP head drafted a wrong count"); }
+            // The engine stops drafting at an invalid draft (its output went non-finite); the step then
+            // verifies the drafts it has, or feeds the token alone.
+            if (drafted.size() < k) {
+                k = static_cast<std::uint32_t>(drafted.size());
+                if (k == 0) {
+                    logits   = forward(std::span<const TokenId>(&token, 1));
+                    position = static_cast<std::int32_t>(live_tokens) - 1;
+                    purpose  = HostSampler::Purpose::Decode;
+                    observe_step(0, Clock::now() - step_started);
+                    continue;
+                }
+            }
             std::vector<TokenId> step{token};
             step.insert(step.end(), drafted.begin(), drafted.end());
             const std::vector<float> rows = forward(step, true);

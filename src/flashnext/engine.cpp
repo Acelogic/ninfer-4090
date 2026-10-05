@@ -564,6 +564,7 @@ struct Engine::Impl {
                 mtp_embed(i, history[std::size_t(q)]);
             }
             mtp_pass(n, M.pos, false);
+            trace_mtp_pass("catch-up", n, M.pos);
             M.pos += n;
         }
         // the next pair starts from the hidden state of the last kept position
@@ -573,11 +574,53 @@ struct Engine::Impl {
         rows_valid = 0;
     }
 
+    // NINFER_FN_TRACE=1: one stderr line per engine call with the MTP bookkeeping (debugging aid)
+    const bool trace = std::getenv("NINFER_FN_TRACE") != nullptr;
+    void trace_state(const char * what, std::int64_t a = -1, std::int64_t b = -1) {
+        if (!trace) return;
+        std::fprintf(stderr, "[fn-trace] %s a=%lld b=%lld n_past=%lld mtp_pos=%lld rows_pos0=%lld rows_valid=%d bound_T=%d lent=%zu skip_below=%lld\n",
+                     what, (long long)a, (long long)b, (long long)n_past, (long long)(mtp ? mtp->pos : -1), (long long)rows_pos0, rows_valid,
+                     bound_T, lent_bytes, (long long)mtp_skip_below);
+        std::fflush(stderr);
+    }
+    std::int64_t nonfinite_half(const void * dev, std::size_t n) {
+        std::vector<std::uint16_t> h(n);
+        check(cudaMemcpy(h.data(), dev, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "diagnostics");
+        std::int64_t c = 0;
+        for (std::uint16_t v : h) c += (v & 0x7C00) == 0x7C00;
+        return c;
+    }
+    bool mtp_nan_reported = false;
+    // NINFER_FN_TRACE: the first MTP pass whose output is non-finite, with its inputs and the K/V ring
+    void trace_mtp_pass(const char * where, int n, std::int64_t pos0) {
+        if (!trace || mtp_nan_reported) return;
+        Mtp & M = *mtp;
+        const std::int64_t bad = nonfinite(M.res.get(), std::size_t(n) * fc::kHcd);
+        if (!bad) return;
+        mtp_nan_reported = true;
+        std::fprintf(stderr, "[fn-nan] first non-finite MTP output in %s: pass of %d at pos %lld (n_past=%lld bound_T=%d lent=%zu): res %lld, "
+                     "h_in %lld, e_in %lld, k ring %lld of %zu, v ring %lld of %zu\n",
+                     where, n, (long long)pos0, (long long)n_past, bound_T, lent_bytes, (long long)bad,
+                     (long long)nonfinite(M.h_in.get(), std::size_t(n) * fc::kHcd), (long long)nonfinite(M.e_in.get(), std::size_t(n) * fc::kEmbd),
+                     (long long)nonfinite_half(M.L.k_cache.get(), M.L.k_cache.bytes() / 2), M.L.k_cache.bytes() / 2,
+                     (long long)nonfinite_half(M.L.v_cache.get(), M.L.v_cache.bytes() / 2), M.L.v_cache.bytes() / 2);
+        std::fflush(stderr);
+    }
+    std::int64_t nonfinite(const void * dev, std::size_t n) {
+        std::vector<float> h(n);
+        check(cudaMemcpy(h.data(), dev, n * sizeof(float), cudaMemcpyDeviceToHost), "diagnostics");
+        std::int64_t c = 0;
+        for (float v : h) c += !std::isfinite(v);
+        return c;
+    }
+
     std::vector<std::int32_t> draft(std::int32_t next, int k) {
         if (!mtp) throw std::runtime_error("engine: no MTP head loaded");
         end_prompt(true);  // the draft pass (and its graph) uses the permanent buffers
         if (next < 0 || next >= cfg.n_vocab) throw std::runtime_error("engine: token id out of range");
+        trace_state("draft:before-catchup", next, k);
         mtp_catchup();
+        trace_state("draft:after-catchup", next, k);
         Mtp & M = *mtp;
         std::vector<std::int32_t> out;
         const std::size_t hb = fc::kHcd * sizeof(float);
@@ -588,6 +631,19 @@ struct Engine::Impl {
             check(cudaMemcpyAsync(M.h_in.get(), src, hb, cudaMemcpyDeviceToDevice, stream), "MTP h");
             mtp_embed(0, tok);
             tok = mtp_pass(1, n_past + i, true);
+            trace_mtp_pass("draft", 1, n_past + i);
+            if (tok < 0 || tok >= cfg.n_vocab) {
+                // A draft is only a guess that the full model verifies: an invalid one (the MTP head's output went
+                // non-finite) ends the drafts of this step instead of failing the request.
+                std::fprintf(stderr, "[fn-warn] MTP draft %d of %d invalid (%d) at n_past=%lld mtp_pos=%lld; non-finite: pending_h %lld, "
+                             "h_in %lld, res %lld, logits %lld\n",
+                             i, k, tok, (long long)n_past, (long long)M.pos, (long long)nonfinite(M.pending_h.get(), fc::kHcd),
+                             (long long)nonfinite(M.h_in.get(), fc::kHcd), (long long)nonfinite(M.res.get(), fc::kHcd),
+                             (long long)nonfinite(logits.get(), std::size_t(cfg.n_vocab)));
+                std::fflush(stderr);
+                ++stats.invalid_drafts;
+                break;
+            }
             out.push_back(tok);
         }
         // the entry at n_past (true hidden state, the token that will be fed) is final
@@ -596,6 +652,7 @@ struct Engine::Impl {
     }
 
     void rollback(int n_keep) {
+        trace_state("rollback", n_keep, last_T);
         if (!snaps_valid || n_keep < 1 || n_keep > last_T) throw std::runtime_error("engine: nothing to roll back to");
         if (n_keep < last_T) {
             for (Layer & L : layers) {
@@ -1006,6 +1063,7 @@ struct Engine::Impl {
     }
 
     EngineSnapshot snapshot() {
+        trace_state("snapshot");
         mtp_catchup();
         check(cudaStreamSynchronize(stream), "snapshot");
         EngineSnapshot snap;
@@ -1040,6 +1098,7 @@ struct Engine::Impl {
             std::memcpy(&pos, snap.state.data() + off, sizeof(std::int64_t));
             mtp->pos = std::min(pos, n_past);
         }
+        trace_state("restore", std::int64_t(n));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2390,6 +2449,7 @@ Engine::~Engine() = default;
 
 std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, bool all_logits) {
     if (tokens.empty()) throw std::runtime_error("engine: forward() needs at least one token");
+    impl_->trace_state("forward", std::int64_t(tokens.size()), all_logits);
     const auto t0 = clk::now();
     std::vector<float> all, last;
     const std::size_t n = tokens.size();
