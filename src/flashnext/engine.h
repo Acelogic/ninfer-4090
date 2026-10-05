@@ -51,6 +51,18 @@ struct EngineStats {
     double cache_swap_ms = 0;      // time spent replacing them
 };
 
+// KV streaming (kv_cache.h): its configuration and counters.
+struct KvStreamStats {
+    bool enabled = false;
+    std::int64_t resident_cells = 0;  // per layer
+    std::int64_t layers = 0;
+    double vram_gib = 0, host_gib = 0;
+    std::uint64_t misses = 0, lookups = 0, resolves = 0;  // pages, over all layers since load
+    std::uint64_t staged_chunks = 0, grouped_chunks = 0;  // prompt chunks beyond the page cache: staged, or in groups
+    double staged_gib = 0;  // DMA'd into the staging pool
+    bool overflow = false;
+};
+
 // The recurrent state after a sequence of tokens: DeltaNet recurrent and conv states, the PLE conv
 // history and the raw indexer keys of the incomplete QSA blocks, plus the tokens themselves. Attention keys and values (and indexer keys) stay in the
 // engine's caches, by position, so a snapshot is valid while those positions still hold its tokens.

@@ -8,9 +8,13 @@
 //      decode steps): blocks, queries and selections must equal the reference's; attention error is
 //      reported against the reference (FP32 K/V) and against the double port on the fp16 cache
 //   3. timings at contexts of 2K, 32K and 262K tokens (synthetic data), decode and prefill
-//   4. the MTP layer's K/V ring against a full cache (synthetic data): bit-identical attention
+//   4. KV streaming parity (synthetic data): two attention layers run side by side as fully resident caches
+//      and as KvStreamCache (host copy + a small page cache + staging), through prompt chunks that fit the
+//      page cache, chunks beyond it (staged, or in groups), decode steps of 1-4 tokens, rolled-back drafts and jumps back to earlier
+//      positions; every attention output must be bit-identical, the host copy must equal the resident cache,
+//      and the page cache must never overflow. Also the MTP layer's K/V ring against a full cache.
 //
-// Usage: test_qsa [-m <GGUF shard 1> --dumps <dir> [--layers 3,23,47]] [--no-timing | --timing-only]
+// Usage: test_qsa [-m <GGUF shard 1> --dumps <dir> [--layers 3,23,47]] [--no-timing | --timing-only | --kv-only]
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -34,6 +38,7 @@
 #include "flashnext/cuda/ops.h"
 #include "flashnext/cuda/qsa.h"
 #include "flashnext/gguf.h"
+#include "flashnext/kv_cache.h"
 #include "flashnext/quants.h"
 
 using namespace ninfer::flashnext;
@@ -674,7 +679,116 @@ void test_timing() {
 }
 
 // ------------------------------------------------------------------------------------------------
-// 4. MTP K/V ring
+// 4. KV streaming parity
+
+void test_kv_stream() {
+    std::printf("== KV streaming parity (synthetic data)\n");
+    const std::int64_t ctx = 49152, resident = KvStreamCache::kMinResident;  // the smallest page cache: most evictions
+    const int max_t = 2048, n_layers = 2;
+    cudaStream_t s = nullptr;
+    check(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+    Rng rng(1234);
+    const std::size_t qf = std::size_t(kHeads) * 2 * kHeadDim, kvw = std::size_t(kKvHeads) * kHeadDim, qo = std::size_t(kHeads) * kHeadDim;
+    DeviceBuffer pos(sizeof(std::int64_t)), inv(kRot / 2 * sizeof(double)), qn(kHeadDim * 4), kn(kHeadDim * 4);
+    DeviceBuffer q_full(max_t * qf * 4), k_in(max_t * kvw * 4), v_in(max_t * kvw * 4), qi(std::size_t(max_t) * kQsaHeads * kQsaDim * 4);
+    DeviceBuffer blocks(std::size_t(ctx / kQsaRatio + 1) * kQsaDim * 4), sel_work(qsa_select_work_bytes(max_t, ctx));
+    DeviceBuffer cells_a(std::size_t(max_t) * kW * 4), cells_b(std::size_t(max_t) * kW * 4), n_cells(max_t * 4);
+    DeviceBuffer q_a(max_t * qo * 4), g_a(max_t * qo * 4), q_b(max_t * qo * 4), g_b(max_t * qo * 4), o_a(max_t * qo * 4), o_b(max_t * qo * 4);
+    DeviceBuffer work(attn_sparse_work_floats(max_t) * 4);
+    std::vector<DeviceBuffer> kc, vc;
+    for (int l = 0; l < n_layers; ++l) {
+        kc.emplace_back(std::size_t(ctx) * kvw * 2);
+        vc.emplace_back(std::size_t(ctx) * kvw * 2);
+    }
+    {
+        std::vector<double> f(kRot / 2);
+        for (int i = 0; i < kRot / 2; ++i) f[std::size_t(i)] = std::pow(kRopeBase, -2.0 * i / kRot);
+        upload(inv, f.data(), f.size());
+        std::vector<float> w(kHeadDim);
+        for (auto & x : w) x = rng.uniform(0.5f, 1.5f);
+        upload(qn, w.data(), w.size());
+        for (auto & x : w) x = rng.uniform(0.5f, 1.5f);
+        upload(kn, w.data(), w.size());
+        std::vector<float> b(std::size_t(ctx / kQsaRatio + 1) * kQsaDim);
+        rng.fill_normal(b);
+        upload(blocks, b.data(), b.size());
+    }
+    KvStreamCache kvc(ctx, resident, 40, s);
+    for (int l = 0; l < n_layers; ++l) kvc.add_layer();
+    DeviceBuffer stage(kvc.stage_bytes(ctx));
+
+    std::vector<float> h(std::size_t(max_t) * qf);
+    int steps = 0, bad = 0, compared = 0;
+    // one step at p0: both layers through both paths
+    auto step = [&](std::int64_t p0, int T) {
+        check(cudaMemcpyAsync(pos.get(), &p0, sizeof(p0), cudaMemcpyHostToDevice, s), "pos");
+        check(cudaStreamSynchronize(s), "pos");
+        kvc.begin_step(p0, T, T > kMaxTokens ? stage.get() : nullptr);
+        for (int l = 0; l < n_layers; ++l) {
+            for (DeviceBuffer * b : {&q_full, &k_in, &v_in}) {
+                const std::size_t n = std::size_t(T) * (b == &q_full ? qf : kvw);
+                for (std::size_t i = 0; i < n; ++i) h[i] = rng.normal();
+                check(cudaMemcpyAsync(b->get(), h.data(), n * 4, cudaMemcpyHostToDevice, s), "upload");
+                check(cudaStreamSynchronize(s), "upload");
+            }
+            for (std::size_t i = 0; i < std::size_t(T) * kQsaHeads * kQsaDim; ++i) h[i] = rng.normal();
+            check(cudaMemcpyAsync(qi.get(), h.data(), std::size_t(T) * kQsaHeads * kQsaDim * 4, cudaMemcpyHostToDevice, s), "upload");
+            // resident
+            attn_prep(q_full.as<float>(), k_in.as<float>(), v_in.as<float>(), qn.as<float>(), kn.as<float>(), inv.as<double>(), q_a.as<float>(),
+                      g_a.as<float>(), kc[std::size_t(l)].as<half>(), vc[std::size_t(l)].as<half>(), pos.as<std::int64_t>(), T, kEps, s);
+            qsa_select(qi.as<float>(), blocks.as<float>(), pos.as<std::int64_t>(), T, ctx, sel_work.get(), cells_a.as<std::int32_t>(),
+                       n_cells.as<std::int32_t>(), s);
+            check(cudaMemcpyAsync(cells_b.get(), cells_a.get(), std::size_t(T) * kW * 4, cudaMemcpyDeviceToDevice, s), "cells");
+            attn_sparse(q_a.as<float>(), g_a.as<float>(), kc[std::size_t(l)].as<half>(), vc[std::size_t(l)].as<half>(), cells_a.as<std::int32_t>(),
+                        n_cells.as<std::int32_t>(), T, kScale, work.as<float>(), o_a.as<float>(), s);
+            // streamed
+            attn_prep(q_full.as<float>(), k_in.as<float>(), v_in.as<float>(), qn.as<float>(), kn.as<float>(), inv.as<double>(), q_b.as<float>(),
+                      g_b.as<float>(), kvc.store(l), pos.as<std::int64_t>(), T, kEps, s);
+            kvc.attend(l, q_b.as<float>(), g_b.as<float>(), cells_b.as<std::int32_t>(), n_cells.as<std::int32_t>(), pos.as<std::int64_t>(),
+                       kScale, work.as<float>(), o_b.as<float>());
+            std::vector<float> a(std::size_t(T) * qo), b(std::size_t(T) * qo);
+            check(cudaMemcpyAsync(a.data(), o_a.get(), a.size() * 4, cudaMemcpyDeviceToHost, s), "download");
+            check(cudaMemcpyAsync(b.data(), o_b.get(), b.size() * 4, cudaMemcpyDeviceToHost, s), "download");
+            check(cudaStreamSynchronize(s), "step");
+            ++compared;
+            if (!same_bits(a.data(), b.data(), a.size())) {
+                if (bad < 5) std::printf("  layer %d step at %lld (T %d): attention differs\n", l, (long long) p0, T);
+                ++bad;
+            }
+        }
+        ++steps;
+    };
+    std::int64_t p = 0;
+    for (int T : {1024, 1000, 2048, 2048, 1500}) { step(p, T); p += T; }        // chunks within the page cache (prefix)
+    for (int T : {2048, 700, 2048, 2048, 333}) { step(p, T); p += T; }          // chunks beyond it (staged)
+    for (int i = 0; i < 120; ++i) {                                             // decode, drafts rolled back
+        const int T = 1 + int(rng.uniform(0.0f, 3.999f));
+        step(p, T);
+        p += 1 + int(rng.uniform(0.0f, float(T) - 0.001f));
+    }
+    p = 20000;                                                                  // back to an earlier position, deep branch
+    step(p, 600); p += 600;
+    for (int i = 0; i < 40; ++i) { step(p, 4); p += 2; }
+    p = 5000;                                                                   // back within the page cache
+    step(p, 500); p += 500;
+    for (int i = 0; i < 40; ++i) { const int T = 1 + (i % 4); step(p, T); p += T; }
+    step(p, 37); p += 37;                                                       // a short prompt chunk (prefix)
+    p = 30000;
+    step(p, 9); p += 9;                                                         // short chunks deep: in groups of 4 queries
+    step(p, 40); p += 40;
+    step(p, 41); p += 41;                                                       // one token more: staged
+    for (int i = 0; i < 20; ++i) { step(p, 1); p += 1; }
+    // the host copy must equal the resident cache for every position written
+    const KvStreamStats st = kvc.stats();
+    std::printf("  %d steps, %d attention outputs bit-identical to the resident cache: %d; %llu page lookups, %llu misses, %llu staged chunks, "
+                "%llu grouped chunks%s\n",
+                steps, compared, compared - bad, (unsigned long long) st.lookups, (unsigned long long) st.misses,
+                (unsigned long long) st.staged_chunks, (unsigned long long) st.grouped_chunks, st.overflow ? ", OVERFLOW" : "");
+    expect(bad == 0, "streamed attention bit-identical to resident");
+    expect(!st.overflow, "no page cache overflow");
+    expect(st.misses > 0 && st.staged_chunks > 0 && st.grouped_chunks > 0, "the test exercised misses, staging and groups");
+    check(cudaStreamDestroy(s), "stream");
+}
 
 // The MTP layer's K/V ring: attention over the last 2051 positions read from a ring of R rows must equal
 // the same attention over a full cache, for passes of up to `cap` tokens.
@@ -737,7 +851,7 @@ int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string model, dumps;
     std::vector<int> layers = {3, 23, 47};
-    bool timing = true, random = true;
+    bool timing = true, random = true, kv_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -755,6 +869,7 @@ int main(int argc, char ** argv) {
             }
         } else if (a == "--no-timing") timing = false;
         else if (a == "--timing-only") random = false;
+        else if (a == "--kv-only") kv_only = true;
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -762,10 +877,15 @@ int main(int argc, char ** argv) {
     }
     try {
         qsa_init();
-        if (random) test_random();
-        if (!model.empty() && !dumps.empty()) test_real(model, dumps, layers);
-        if (timing) test_timing();
-        if (random) test_mtp_ring();
+        if (!kv_only) {
+            if (random) test_random();
+            if (!model.empty() && !dumps.empty()) test_real(model, dumps, layers);
+            if (timing) test_timing();
+        }
+        if (random) {
+            test_mtp_ring();
+            test_kv_stream();
+        }
     } catch (const std::exception & e) {
         std::printf("error: %s\n", e.what());
         return 1;

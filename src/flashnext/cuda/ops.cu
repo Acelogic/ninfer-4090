@@ -282,6 +282,19 @@ __global__ void __launch_bounds__(kHeadDim) k_attn_prep(const float * __restrict
         const std::size_t o = std::size_t(st.ring ? pos % st.ring : pos) * kKvHeads * kHeadDim + col;
         st.k[o] = kh;
         st.v[o] = vh;
+        if (st.k2) {
+            const std::size_t o2 = std::size_t(pos) * kKvHeads * kHeadDim + col;
+            st.k2[o2] = kh;
+            st.v2[o2] = vh;
+        }
+        if (st.page_table) {
+            const int sl = st.page_table[pos / kKvPage];
+            if (sl >= 0) {
+                const std::size_t op = (std::size_t(sl) * kKvPage + std::size_t(pos % kKvPage)) * kKvHeads * kHeadDim + col;
+                st.kp[op] = kh;
+                st.vp[op] = vh;
+            }
+        }
     }
 }
 
@@ -662,7 +675,8 @@ void dn_recurrence(const float * conv_out, const float * z, const float * beta, 
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
                const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0, int T, float eps,
                cudaStream_t s) {
-    if (!store.k || !store.v) throw std::runtime_error("attn_prep: incomplete K/V store");
+    if (!store.k || !store.v || (store.k2 && !store.v2) || (store.page_table && (!store.kp || !store.vp)))
+        throw std::runtime_error("attn_prep: incomplete K/V store");
     k_attn_prep<<<dim3(T, kHeads + kKvHeads), kHeadDim, 0, s>>>(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, store, pos0, eps);
     launched("attn_prep");
 }

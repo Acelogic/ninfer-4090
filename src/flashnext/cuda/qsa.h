@@ -61,9 +61,13 @@ void qsa_pick(const void * work, const std::int64_t * pos0, int T, std::int64_t 
 // out = softmax(scale * q . k[cells]) v[cells] * sigmoid(gate). q, gate, out: [T][24][256] f32;
 // k_cache, v_cache: [ctx][2][256] f16. work: attn_sparse_work_floats(T) floats, which also covers every
 // smaller T. Any T >= 1.
+// The cells are split into attn_sparse_splits(T) interleaved runs whose partial softmaxes are merged, so the
+// rounding of a token's result depends on T. split_T > 0 uses split_T's split count instead: T queries run in
+// groups (as KV streaming does) then round exactly like one call over split_T queries.
 std::size_t attn_sparse_work_floats(int T);
+int attn_sparse_splits(int T);
 void attn_sparse(const float * q, const float * gate, const half * k_cache, const half * v_cache, const std::int32_t * cells,
-                 const std::int32_t * n_cells, int T, float scale, float * work, float * out, cudaStream_t s);
+                 const std::int32_t * n_cells, int T, float scale, float * work, float * out, cudaStream_t s, int split_T = 0);
 
 // One-time kernel setup before capturing a graph (nothing to do at present; kept for the init sequence).
 void qsa_init();

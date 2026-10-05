@@ -27,12 +27,13 @@ try {
     $flags = @('-O3', '-std=c++20', '-arch=sm_89', '-lineinfo', '-Xcompiler=/O2,/EHsc,/arch:AVX512,/utf-8,/Zc:preprocessor', '-I', 'R:\src')
     $core = @('R:\src\flashnext\gguf.cpp', 'R:\src\flashnext\quants.cpp')
     $engine = @('R:\src\flashnext\cpu_experts.cpp', 'R:\src\flashnext\reference.cpp', 'R:\src\flashnext\engine.cpp',
-                'R:\src\flashnext\cuda\gemv.cu', 'R:\src\flashnext\cuda\ops.cu', 'R:\src\flashnext\cuda\experts.cu',
+                'R:\src\flashnext\kv_cache.cpp', 'R:\src\flashnext\cuda\kv_stream.cu', 'R:\src\flashnext\cuda\gemv.cu', 'R:\src\flashnext\cuda\ops.cu', 'R:\src\flashnext\cuda\experts.cu',
                 'R:\src\flashnext\cuda\gemm.cu', 'R:\src\flashnext\cuda\qsa.cu', 'R:\src\flashnext\cuda\experts_batch.cu',
                 'cublas.lib')
     $targets = [ordered]@{
         test_gpu_gemv = @('R:\src\flashnext\cuda\gemv.cu', 'R:\tools\flashnext\test_gpu_gemv.cu')
         test_qsa      = @('R:\src\flashnext\cuda\ops.cu', 'R:\src\flashnext\cuda\experts.cu', 'R:\src\flashnext\cuda\qsa.cu',
+                          'R:\src\flashnext\cuda\kv_stream.cu', 'R:\src\flashnext\kv_cache.cpp',
                           'R:\src\flashnext\reference.cpp', 'R:\tools\flashnext\test_qsa.cu')
         test_gpu_experts_batch = @('R:\src\flashnext\cuda\experts.cu', 'R:\src\flashnext\cuda\experts_batch.cu',
                                    'R:\tools\flashnext\test_gpu_experts_batch.cu')
