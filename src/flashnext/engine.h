@@ -54,6 +54,16 @@ struct EngineOptions {
     bool host_expert_images = false;
     int gpu_miss_permille = 0;            // share of each step's cache misses the GPU reads from host memory
     std::string mtp_path;                 // the MTP head's GGUF (shared-Q8_0 variant) for draft tokens; "" = none
+    // KV streaming (kv_cache.h): the attention layers' K/V live in pinned host memory and VRAM keeps a page
+    // cache of kv_resident cells per layer, so a long window costs little VRAM. -1: on when max_ctx exceeds
+    // kv_resident; 0: off (all of it in VRAM); 1: on.
+    int kv_stream = -1;
+    std::int64_t kv_resident = 32768;     // cells per attention layer kept in VRAM when streaming (>= 8448)
+    int kv_group_tokens = 64;             // prompt chunks beyond the page cache up to max(this, depth / 512) tokens attend in groups
+                                          // instead of staging (0: never)
+    // Cells of the dedicated staging pool for prompt chunks beyond the page cache (-1: max_ctx; 0: none, such
+    // chunks then fail). Used only while the engine cannot borrow that VRAM for the prompt instead.
+    std::int64_t kv_stage_cells = -1;
 };
 
 // Named intermediate activations, row-major [n_tokens][width], with the same names and layout as
@@ -80,6 +90,18 @@ struct EngineStats {
     double refill_ms = 0;              // putting experts back into the lent VRAM after prompts
     std::int64_t cpu_share_experts = 0; // experts of streamed chunks computed by the CPU instead
     int pinned_layers = 0;             // layers whose CPU copy is pinned (streamable)
+};
+
+// KV streaming (kv_cache.h): its configuration and counters.
+struct KvStreamStats {
+    bool enabled = false;
+    std::int64_t resident_cells = 0;  // per layer
+    std::int64_t layers = 0;
+    double vram_gib = 0, host_gib = 0;
+    std::uint64_t misses = 0, lookups = 0, resolves = 0;  // pages, over all layers since load
+    std::uint64_t staged_chunks = 0, grouped_chunks = 0;  // prompt chunks beyond the page cache: staged, or in groups
+    double staged_gib = 0;  // DMA'd into the staging pool
+    bool overflow = false;
 };
 
 // The recurrent state after a sequence of tokens: DeltaNet recurrent and conv states, the PLE conv
@@ -126,6 +148,8 @@ public:
     // forward({next, drafts...}, true) and keep the accepted prefix with rollback(n), where n counts
     // `next` itself. The MTP layer's own cache is kept in step with the main model automatically.
     bool has_mtp() const;
+    // KV streaming state and counters (synchronous; enabled = false when every layer's K/V is in VRAM)
+    KvStreamStats kv_stream_stats() const;
     std::vector<std::int32_t> draft(std::int32_t next, int k);
     // Undoes all but the first n_keep tokens of the last forward() call, which must have had at most
     // 4 tokens (1 <= n_keep <= that count). Needs MTP to be enabled (it keeps the per-token states).

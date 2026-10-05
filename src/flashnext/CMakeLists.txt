@@ -8,12 +8,14 @@ add_library(ninfer_flashnext STATIC
   reference.cpp
   engine.cpp
   prefill.cpp
+  kv_cache.cpp
   cuda/gemv.cu
   cuda/ops.cu
   cuda/experts.cu
   cuda/gemm.cu
   cuda/gemm_tc.cu
   cuda/qsa.cu
+  cuda/kv_stream.cu
   cuda/experts_batch.cu
   cuda/expert_stream.cu)
 target_include_directories(ninfer_flashnext PUBLIC ${PROJECT_SOURCE_DIR}/src)

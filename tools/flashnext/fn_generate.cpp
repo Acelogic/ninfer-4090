@@ -3,9 +3,10 @@
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
-//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot] [--mtp mtp.gguf [--draft K]]
-//                    [--no-lend] [--no-stream] [--stream-min N] [--chunk-max N] [--cpu-share-max N] [--dense-sgemm] [--profile] [--hash-state]
-//                    [--prefill-runs 0,2048:nostream,...]
+//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--mtp mtp.gguf [--draft K]] [--hash]
+//                    [--kv-stream 0|1] [--kv-resident CELLS] [--kv-stage-cells CELLS] [--kv-group-tokens N] [--followup N[,N...]]
+//                    [--no-lend] [--no-stream] [--stream-min N] [--chunk-max N] [--cpu-share-max N] [--dense-sgemm] [--profile]
+//                    [--hash-state] [--pieces N] [--prefill-runs 0,2048:nostream,...]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
@@ -16,6 +17,15 @@
 // prints hashes of the recurrent state and of the logits after the prompt (bitwise comparisons between
 // runs). --prefill-runs repeats the prompt (after a reset) once per entry, chunk[:nostream], and reports each
 // (the expert cache keeps what earlier runs taught it).
+// --test-snapshot continues 8 tokens past the prompt, returns to the snapshot and checks that the same 8
+// tokens follow; --snapshot-detour N also feeds N more tokens (the prompt's first ones) before returning, so
+// that ring buffers (the MTP layer's K/V) wrap past the snapshot's positions.
+// --kv-stream forces KV streaming off or on (default: on when --ctx exceeds --kv-resident, 32768 cells);
+// the KV counters are printed after the prompt and at the end. --followup feeds short prompts of N tokens
+// (the prompt's first ones) after the prompt and times them, like a conversation's next turn at that depth;
+// decoding then continues after them.
+// --hash prints 64-bit FNV-1a hashes of the prompt's logits, of every later forward()'s logits and of
+// the MTP drafts, so that two builds or configurations can be checked for bitwise identical results.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -95,10 +105,21 @@ std::int32_t argmax(const float * x, std::size_t n) {
     return std::int32_t(std::max_element(x, x + n) - x);  // first of equal maxima, like top_k
 }
 
+// FNV-1a over raw bytes, chained through h
 std::uint64_t fnv1a(const void * data, std::size_t n, std::uint64_t h = 1469598103934665603ull) {
-    const auto * p = static_cast<const unsigned char *>(data);
+    const unsigned char * p = static_cast<const unsigned char *>(data);
     for (std::size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
     return h;
+}
+
+void print_kv(const Engine & engine, const char * when) {
+    const KvStreamStats k = engine.kv_stream_stats();
+    if (!k.enabled) return;
+    std::printf("kv stream %s: %lld layers, %lld resident cells each (%.2f GiB VRAM, %.2f GiB pinned RAM); %llu resolves, %llu page lookups, "
+                "%llu misses (%.2f%%), prompt chunks beyond it: %llu staged (%.2f GiB), %llu in groups%s\n",
+                when, (long long) k.layers, (long long) k.resident_cells, k.vram_gib, k.host_gib, (unsigned long long) k.resolves,
+                (unsigned long long) k.lookups, (unsigned long long) k.misses, 100.0 * double(k.misses) / double(k.lookups ? k.lookups : 1),
+                (unsigned long long) k.staged_chunks, k.staged_gib, (unsigned long long) k.grouped_chunks, k.overflow ? "; OVERFLOW" : "");
 }
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
@@ -137,10 +158,12 @@ int main(int argc, char ** argv) {
 static int run(int argc, char ** argv) {
     std::string model_path, tokens_arg, tokens_file, json_path, dump_dir;
     int n_gen = 16;
-    bool compare_ref = false, test_snapshot = false, hash_state = false;
+    bool compare_ref = false, test_snapshot = false, hash = false, hash_state = false;
+    std::uint64_t h_decode = fnv1a(nullptr, 0), h_drafts = fnv1a(nullptr, 0);
+    int n_draft = 2, detour = 0;
+    std::vector<std::int32_t> followups;
     std::string prefill_runs;
     std::size_t pieces = 0;  // feed the prompt in forward() calls of this many tokens (as the server does), with a snapshot after each
-    int n_draft = 2;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -163,6 +186,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--no-graphs") opt.cuda_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--test-snapshot") test_snapshot = true;
+        else if (a == "--snapshot-detour") detour = std::stoi(next());
         else if (a == "--no-host-images") opt.host_expert_images = false;
         else if (a == "--mtp") opt.mtp_path = next();
         else if (a == "--int8-cpu-experts") opt.precise_cpu_experts = false;
@@ -180,6 +204,12 @@ static int run(int argc, char ** argv) {
         else if (a == "--hash-state") hash_state = true;
         else if (a == "--prefill-runs") prefill_runs = next();
         else if (a == "--pieces") pieces = std::stoul(next());
+        else if (a == "--hash") hash = true;
+        else if (a == "--kv-stream") opt.kv_stream = std::stoi(next());
+        else if (a == "--kv-resident") opt.kv_resident = std::stoll(next());
+        else if (a == "--kv-stage-cells") opt.kv_stage_cells = std::stoll(next());
+        else if (a == "--kv-group-tokens") opt.kv_group_tokens = std::stoi(next());
+        else if (a == "--followup") followups = parse_ids(next());
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -264,6 +294,19 @@ static int run(int argc, char ** argv) {
         std::printf("state hash %016llx (%zu bytes), logits hash %016llx\n", (unsigned long long) fnv1a(snap.state.data(), snap.state.size()),
                     snap.state.size(), (unsigned long long) fnv1a(logits.data(), logits.size() * sizeof(float)));
     }
+    if (hash) std::printf("hash prompt logits: %016llx\n", (unsigned long long) fnv1a(logits.data(), logits.size() * sizeof(float)));
+    print_kv(engine, "after the prompt");
+    for (std::int32_t n : followups) {
+        const std::vector<std::int32_t> extra(prompt.begin(), prompt.begin() + std::min<std::size_t>(prompt.size(), std::size_t(n)));
+        const std::int64_t at = engine.n_past();
+        const auto tf = std::chrono::steady_clock::now();
+        logits = engine.forward(extra);
+        const double sec = seconds_since(tf);
+        std::printf("follow-up: %zu tokens at depth %lld in %.3f s (%.1f tok/s)", extra.size(), (long long) at, sec, double(extra.size()) / sec);
+        if (hash) std::printf("; hash logits %016llx", (unsigned long long) fnv1a(logits.data(), logits.size() * sizeof(float)));
+        std::printf("\n");
+    }
+    if (!followups.empty()) print_kv(engine, "after the follow-ups");
 
     if (!dump_dir.empty()) {
         fs::create_directories(dump_dir);
@@ -358,6 +401,12 @@ static int run(int argc, char ** argv) {
             return std::make_pair(ids, lg);
         };
         const auto first = greedy(logits);
+        if (detour > 0) {
+            std::vector<std::int32_t> extra;
+            while (int(extra.size()) < detour) extra.insert(extra.end(), prompt.begin(), prompt.begin() + std::min<std::size_t>(prompt.size(), std::size_t(detour) - extra.size()));
+            engine.forward(extra);
+            std::printf("snapshot detour: %d more tokens fed before the restore\n", detour);
+        }
         t_snap = std::chrono::steady_clock::now();
         engine.restore(snap);
         const double restore_ms = 1e3 * seconds_since(t_snap);
@@ -388,10 +437,12 @@ static int run(int argc, char ** argv) {
             auto td = std::chrono::steady_clock::now();
             const std::vector<std::int32_t> d = engine.draft(tok, n_draft);
             draft_s += seconds_since(td);
+            h_drafts = fnv1a(d.data(), d.size() * sizeof(std::int32_t), h_drafts);
             seq.insert(seq.end(), d.begin(), d.end());
             auto tv = std::chrono::steady_clock::now();
             const std::vector<float> lg = engine.forward(seq, true);
             verify_s += seconds_since(tv);
+            h_decode = fnv1a(lg.data(), lg.size() * sizeof(float), h_decode);
             int keep = 1;
             std::int32_t next = argmax(lg.data(), V);
             for (std::size_t i = 0; i < d.size() && next == d[i]; ++i) {
@@ -414,6 +465,9 @@ static int run(int argc, char ** argv) {
                     100.0 * accepted / std::max(1, drafted), double(generated.size()) / std::max(1, steps));
         std::printf("per step: draft %.2f ms, verify %.2f ms (CPU experts %.2f ms), other %.2f ms\n", 1e3 * draft_s / steps, 1e3 * verify_s / steps,
                     (engine.stats().cpu_experts_ms - cpu0) / steps, 1e3 * (total - draft_s - verify_s) / steps);
+        if (hash)
+            std::printf("hash verify logits: %016llx; hash drafts: %016llx\n", (unsigned long long) h_decode, (unsigned long long) h_drafts);
+        print_kv(engine, "at the end");
         if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
         if (!json_path.empty()) {
             std::ofstream f(json_path);
@@ -435,10 +489,13 @@ static int run(int argc, char ** argv) {
         auto ts = std::chrono::steady_clock::now();
         logits = engine.forward({next});
         step_times.push_back(seconds_since(ts));
+        h_decode = fnv1a(logits.data(), logits.size() * sizeof(float), h_decode);
     }
     std::printf("generated:");
     for (std::int32_t id : generated) std::printf(" %d", id);
     std::printf("\n");
+    if (hash) std::printf("hash decode logits: %016llx\n", (unsigned long long) h_decode);
+    print_kv(engine, "at the end");
     if (!step_times.empty()) {
         const double total = std::accumulate(step_times.begin(), step_times.end(), 0.0);
         const EngineStats & st = engine.stats();
