@@ -96,7 +96,7 @@ int main(int argc, char ** argv) {
         else if (a == "--n-predict") n_predict = std::atoi(next().c_str());
         else return fail("unknown argument " + a);
     }
-    if (mmproj.empty() || model.empty() || images.empty()) return fail("--mmproj, --model and --image are required");
+    if (mmproj.empty() || model.empty() || (images.empty() && mode == "encode")) return fail("--mmproj, --model and --image are required");
     if (threads <= 0) threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
     // replace the literal "\n" of a command line by newlines
     for (size_t p; (p = prompt.find("\\n")) != std::string::npos;) prompt.replace(p, 2, "\n");
@@ -132,7 +132,8 @@ int main(int argc, char ** argv) {
     if (mode == "encode") prompt = mtmd_default_marker();
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
-    if (mtmd_tokenize(ctx, chunks, &txt, bp.data(), bp.size()) != 0) return fail("mtmd_tokenize failed (one <__media__> per image?)");
+    if (mtmd_tokenize(ctx, chunks, &txt, bp.empty() ? nullptr : bp.data(), bp.size()) != 0)
+        return fail("mtmd_tokenize failed (one <__media__> per image?)");
 
     // every image chunk: encode, write rows (and pixels)
     struct Img { int first, nx, ny; std::string ppm, sve; };

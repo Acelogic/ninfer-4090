@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -69,6 +72,37 @@ struct VisionEncoder::Impl {
     cudaEvent_t ev_copied[2] = {}, ev_done[2] = {}, ev_global = nullptr, ev_t0 = nullptr, ev_t1 = nullptr;
 
     static constexpr std::size_t kBlasWorkspace = std::size_t(32) << 20;
+
+    // NINFER_FN_VISION_PROFILE=1: GPU time per stage of every encode on stderr (event records between stages)
+    const bool profile = std::getenv("NINFER_FN_VISION_PROFILE") != nullptr;
+    std::vector<std::pair<const char *, cudaEvent_t>> marks;
+    std::vector<cudaEvent_t> spare;
+    void mark(const char * stage) {
+        if (!profile) return;
+        cudaEvent_t e = nullptr;
+        if (!spare.empty()) {
+            e = spare.back();
+            spare.pop_back();
+        } else {
+            check(cudaEventCreate(&e), "vision: event");
+        }
+        check(cudaEventRecord(e, stream), "vision: event");
+        marks.emplace_back(stage, e);
+    }
+    void report(int P) {
+        if (!profile || marks.size() < 2) return;
+        std::map<std::string, double> ms;
+        for (std::size_t i = 1; i < marks.size(); ++i) {
+            float t = 0;
+            check(cudaEventElapsedTime(&t, marks[i - 1].second, marks[i].second), "vision: event");
+            ms[marks[i].first] += t;
+        }
+        std::fprintf(stderr, "vision profile, %d patches:", P);
+        for (const auto & [k, v] : ms) std::fprintf(stderr, " %s %.1f ms;", k.c_str(), v);
+        std::fprintf(stderr, "\n");
+        for (auto & m : marks) spare.push_back(m.second);
+        marks.clear();
+    }
 
     std::size_t blob_offset(int b) const {  // b in 0..layers: a layer, then the merger
         return global_bytes + std::size_t(b) * layer_bytes;
@@ -215,6 +249,7 @@ struct VisionEncoder::Impl {
         if (blas) cublasDestroy(blas);
         for (cudaEvent_t e : {ev_copied[0], ev_copied[1], ev_done[0], ev_done[1], ev_global, ev_t0, ev_t1})
             if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : spare) cudaEventDestroy(e);
         if (copy) cudaStreamDestroy(copy);
         if (stream) cudaStreamDestroy(stream);
         if (host) cudaFreeHost(host);
@@ -274,20 +309,25 @@ struct VisionEncoder::Impl {
             check(cudaEventRecord(ev_copied[b], copy), "vision");
         }
         // patch embedding (+ bias, + the position embedding resized to the grid)
+        mark("start");
         check(cudaMemcpyAsync(w.a, patches, std::size_t(P) * fc::kVisPatchIn * sizeof(float), cudaMemcpyHostToDevice, stream), "vision: patches");
         check(cudaStreamWaitEvent(stream, ev_global, 0), "vision");
         linear(w.global + gl.patch_w, H, fc::kVisPatchIn, w.a, w.x, P, w.wf, 0.0f);
         fc::vis_embed_add(w.x, reinterpret_cast<const float *>(w.global + gl.patch_b), reinterpret_cast<const float *>(w.global + gl.pos), side,
                           gh, gw, stream);
+        mark("embed");
         for (int il = 0; il < L; ++il) {
             const int s = il & 1;
             check(cudaStreamWaitEvent(stream, ev_copied[s], 0), "vision");
+            mark("weight wait");
             const std::uint8_t * W = w.stage[s];
             auto vec = [&](std::size_t off) { return reinterpret_cast<const float *>(W + off); };
             fc::vis_layer_norm(w.x, vec(ll.ln1_w), vec(ll.ln1_b), w.b, P, H, cfg.eps, stream);
             linear(W + ll.qkv_w, 3 * H, H, w.b, w.a, P, w.wf, 0.0f);
             fc::vis_qkv_rope(w.a, vec(ll.qkv_b), gw, P, stream);
+            mark("qkv");
             fc::vis_attention(w.a, w.b, P, stream);
+            mark("attention");
             linear(W + ll.out_w, H, H, w.b, w.x, P, w.wf, 1.0f);  // the residual adds in the product
             fc::vis_bias_add(w.x, vec(ll.out_b), P, H, stream);
             fc::vis_layer_norm(w.x, vec(ll.ln2_w), vec(ll.ln2_b), w.b, P, H, cfg.eps, stream);
@@ -295,6 +335,7 @@ struct VisionEncoder::Impl {
             fc::vis_bias_gelu(w.a, vec(ll.up_b), P, cfg.ff, false, stream);
             linear(W + ll.down_w, H, cfg.ff, w.a, w.x, P, w.wf, 1.0f);
             fc::vis_bias_add(w.x, vec(ll.down_b), P, H, stream);
+            mark("out+mlp");
             check(cudaEventRecord(ev_done[s], stream), "vision");
             if (il + 2 <= L) {  // the stage this layer used takes blob il + 2 (a layer or the merger)
                 check(cudaStreamWaitEvent(copy, ev_done[s], 0), "vision");
@@ -314,11 +355,13 @@ struct VisionEncoder::Impl {
             fc::vis_bias_gelu(w.a, vec(ml.mm0_b), T, MW, exact_merger_gelu, stream);
             linear(W + ml.mm2_w, cfg.out_dim, MW, w.a, w.x, T, w.wf, 0.0f);
             fc::vis_bias_add(w.x, vec(ml.mm2_b), T, cfg.out_dim, stream);
+            mark("merger");
         }
         check(cudaEventRecord(ev_t1, stream), "vision");
         check(cudaMemcpyAsync(out, w.x, std::size_t(T) * cfg.out_dim * sizeof(float), cudaMemcpyDeviceToHost, stream), "vision: output");
         check(cudaStreamSynchronize(stream), "vision");
         check(cudaStreamSynchronize(copy), "vision");
+        report(P);
         VisionTiming t;
         float ms = 0;
         check(cudaEventElapsedTime(&ms, ev_t0, ev_t1), "vision");
