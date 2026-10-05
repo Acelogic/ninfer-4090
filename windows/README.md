@@ -27,9 +27,10 @@ All figures were measured on one RTX 4090 that also drives the Windows desktop.
 | `qwen3.8-27b-huihui` | Huihui abliterated Qwen3.8 27B | MTP 5 + n-gram | 229K, vision | Same weights format as `qwen3.8-27b`, with BF16 prefill |
 | `bonsai2-27b` | Ternary Bonsai 2 27B (Prism ML) | MTP 2 + n-gram | 262K, vision | ~247 tok/s mean (~180 on prose); 145 tok/s after a 90K-token prompt |
 | `bonsai2-27b-heretic` | Bonsai 2 27B with the Heretic abliteration | MTP 2 + n-gram | 262K, vision | Same as `bonsai2-27b` |
-| `flash-next` | Qwen3.8-Flash-Next (UD-IQ4_XS GGUF), experts in a VRAM cache and on the CPU | MTP up to 3, adaptive | 262K, no vision | ~46 tok/s on a short reply, 33–36 tok/s at 256K tokens deep; prompts prefilled at ~410 tok/s at any depth; a follow-up turn reuses the conversation (TTFT ~1 s) |
+| `qwen3.8-flash-next` | Qwen3.8-Flash-Next (UD-IQ4_XS GGUF), experts in a VRAM cache and on the CPU | MTP up to 3, adaptive | 262K, no vision | 77-98 tok/s chat and 44-52 code on short prompts, 33-36 tok/s at 256K tokens deep; prompts read at ~410 tok/s at any depth; a follow-up turn reuses the conversation (TTFT ~1 s) |
+| `qwen3.8-flash-next-huihui` | Huihui abliterated Qwen3.8-Flash-Next, quantized here with the UD-IQ4_XS recipe | MTP up to 3, adaptive | 262K, no vision | Same as `qwen3.8-flash-next` |
 
-**Flash-Next** needs a `ninfer-serve.exe` built with `-DNINFER_WITH_FLASHNEXT=ON` and the GGUF shards (plus the shared-Q8_0 MTP head) in `models\`. A profile may instead point `exe` and `file` at other locations (absolute paths, `%USERPROFILE%` expands). Its expert routing statistics persist in `flash-next-routing.bin` next to the launcher.
+**Flash-Next** is served by the same `ninfer-serve.exe` (Flash-Next is part of the default build). Its files go in `models\qwen3.8-flash-next\` (the three UD-IQ4_XS shards in `UD-IQ4_XS\`, the shared-Q8_0 MTP head in `MTP\`) and `models\qwen3.8-flash-next-huihui\`. A profile may instead point `file` (and `exe`) at other locations: absolute paths work and `%USERPROFILE%` expands. Each Flash-Next profile keeps its expert routing statistics (which experts to cache) in its own file next to the launcher.
 
 **Lossless speculation.** Speculative decoding never changes what the model would have written. Drafts are verified by the full model, so speed comes without quality loss.
 
