@@ -3,7 +3,7 @@
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
-//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot] [--mtp mtp.gguf [--draft K]] [--hash]
+//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--mtp mtp.gguf [--draft K]] [--hash]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
@@ -11,6 +11,9 @@
 // relative error of every intermediate both produce, then the agreement of the prompt's logits.
 // --routing-stats loads expert routing counts to choose the experts kept in VRAM, and saves the
 // updated counts at the end.
+// --test-snapshot continues 8 tokens past the prompt, returns to the snapshot and checks that the same 8
+// tokens follow; --snapshot-detour N also feeds N more tokens (the prompt's first ones) before returning, so
+// that ring buffers (the MTP layer's K/V) wrap past the snapshot's positions.
 // --hash prints 64-bit FNV-1a hashes of the prompt's logits, of every later forward()'s logits and of
 // the MTP drafts, so that two builds or configurations can be checked for bitwise identical results.
 #include <algorithm>
@@ -136,7 +139,7 @@ static int run(int argc, char ** argv) {
     int n_gen = 16;
     bool compare_ref = false, test_snapshot = false, hash = false;
     std::uint64_t h_decode = fnv1a(nullptr, 0), h_drafts = fnv1a(nullptr, 0);
-    int n_draft = 2;
+    int n_draft = 2, detour = 0;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -159,6 +162,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--no-graphs") opt.cuda_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--test-snapshot") test_snapshot = true;
+        else if (a == "--snapshot-detour") detour = std::stoi(next());
         else if (a == "--no-host-images") opt.host_expert_images = false;
         else if (a == "--mtp") opt.mtp_path = next();
         else if (a == "--int8-cpu-experts") opt.precise_cpu_experts = false;
@@ -298,6 +302,12 @@ static int run(int argc, char ** argv) {
             return std::make_pair(ids, lg);
         };
         const auto first = greedy(logits);
+        if (detour > 0) {
+            std::vector<std::int32_t> extra;
+            while (int(extra.size()) < detour) extra.insert(extra.end(), prompt.begin(), prompt.begin() + std::min<std::size_t>(prompt.size(), std::size_t(detour) - extra.size()));
+            engine.forward(extra);
+            std::printf("snapshot detour: %d more tokens fed before the restore\n", detour);
+        }
         t_snap = std::chrono::steady_clock::now();
         engine.restore(snap);
         const double restore_ms = 1e3 * seconds_since(t_snap);
