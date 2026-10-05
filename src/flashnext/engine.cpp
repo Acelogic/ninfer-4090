@@ -474,7 +474,7 @@ struct Engine::Impl {
         M.head_up = W(b + "nextn.hc_head_up.weight", R, HCD);
         // A pass of T <= cap tokens writes rows pos0 .. pos0+T-1 and reads the 2050 before each: with cap + 2051
         // rows no two of those positions share a row.
-        M.ring = (std::int64_t(cap) + fc::kQsaWidth + 255) / 256 * 256;
+        M.ring = (std::int64_t(cap) + mtp_window + 255) / 256 * 256;
         const std::size_t kv = std::size_t(M.ring) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
         L.k_cache = zeros(kv);
         L.v_cache = zeros(kv);
@@ -629,7 +629,8 @@ struct Engine::Impl {
         // hidden rows, a draft from pending_h).
         if (!want_draft) return;
         // the most recent 2051 positions (llama.cpp attends densely; drafts are verified either way), as ring rows
-        fc::window_cells(pos, T, fc::kQsaWidth, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), stream, M.ring);
+        if (T != 1 && mtp_window != fc::kQsaWidth) throw std::logic_error("engine: a wide MTP window serves single-token drafts only");
+        fc::window_cells(pos, T, mtp_window, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), stream, M.ring);
         fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
                         n_cells.as<std::int32_t>(), T, cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
         linear(L.wo, att, out, T);
@@ -1857,6 +1858,8 @@ struct Engine::Impl {
     std::deque<int> s_inflight;
     std::int64_t s_hits = 0;
     std::int64_t mtp_skip_below = 0;  // the MTP catch-up of a prompt starts here (drafts never look further back)
+    // positions an MTP draft attends to (the last ones); NINFER_FN_MTP_WINDOW (experiment): more than kQsaWidth
+    int mtp_window = std::getenv("NINFER_FN_MTP_WINDOW") ? std::max(fc::kQsaWidth, std::atoi(std::getenv("NINFER_FN_MTP_WINDOW"))) : fc::kQsaWidth;
     // the CPU's share of a streamed chunk: a worker thread computes, per layer, the pairs of the experts that
     // plan_stream left to it (key -1), while the GPU computes the rest; the stream waits for it in a host function
     struct ShareWait {
@@ -2972,7 +2975,7 @@ std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, boo
     const std::size_t n = tokens.size();
     // the MTP catch-up skips what no draft can attend to (NINFER_FN_MTP_FULL=1: every position, as before)
     static const bool mtp_full = std::getenv("NINFER_FN_MTP_FULL") != nullptr;
-    impl_->mtp_skip_below = mtp_full ? 0 : std::max<std::int64_t>(0, impl_->n_past + std::int64_t(n) - cuda::kQsaWidth - 8);
+    impl_->mtp_skip_below = mtp_full ? 0 : std::max<std::int64_t>(0, impl_->n_past + std::int64_t(n) - impl_->mtp_window - 8);
     // a long prompt borrows bigger chunk buffers from the expert cache (kept until a step that needs them back)
     // (also a shorter one deep enough that attention stages its K/V, kv_cache.h: the pool comes with the loan)
     const bool lent = !all_logits && impl_->opt.prefill_lend && (n > std::size_t(impl_->cap) || impl_->stages_kv(std::int64_t(n)));

@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next in NInfer Extreme
 
-Status: the engine runs end to end at full context with speculative decoding, KV streaming and image
-input, 2026-10-05.
+Status: the engine runs end to end at full context with speculative decoding, KV streaming, image
+input and an expert cache that follows decoding, 2026-10-05.
 
 This document plans a Flash-Next runtime tailored to one machine: an RTX 4090 that also drives the
 desktop (about 22.5 GiB usable), a Ryzen 9 7950X (16 cores, AVX-512 with VNNI), and 192 GiB of
@@ -90,13 +90,66 @@ attention or DeltaNet, and the router; it writes the selections and the FFN inpu
 another flag; meanwhile the GPU computes the cached experts and the shared expert, then a one-block
 kernel waits for the CPU's answer. GEMVs that read the same input are fused (`gemv_multi`).
 
+A step of T tokens reads each dense weight once (the GEMVs take up to 4 tokens) and each expert the
+CPU computes once (`CpuExperts::run` groups a step's pairs by expert); the GPU's cached experts run
+per (token, expert) pair. So a step's cost is the GPU's dense part (8 ms for one token, 10 ms for
+four, at 64K) plus, per layer, the CPU's distinct experts (57-66 us each, 40-46 GB/s), which run beside
+the GPU's cached experts: in an MTP verification step of four tokens every layer waits for the CPU
+(none of 408 layers in an Nsight trace waited under 20 us), so the CPU's distinct experts per step
+decide its cost (section 4.4). While the cache swaps experts in the background (section 3.4) a step's
+and a draft's own uploads and downloads (the step record, embeddings, PLE rows, logits, the MTP
+pass's inputs, the expert maps, state copies for rollback) go through the SMs (`copy_sm`) rather than a
+copy engine: behind a batch of swap DMAs they waited up to 12 ms.
+
 ### 3.4 Expert cache
 
-Filled at load from routing counts (saved between runs), ranked by count per byte. After every
-prompt, and every 256 decoded tokens, it is re-ranked from the routing of recent tokens (half-life
-2,048 tokens) plus the long-run counts, and only clearly better experts are swapped in. A prompt's
-routing predicts its continuation well: on a 2,000-token code prompt, decode hits rose from 19%
-(cache calibrated on other text) to 50%.
+Filled at load from routing counts (saved between runs), ranked by count per byte; the per-layer
+sizes stay as chosen at load. A prompt that borrows VRAM (section 3.5) refills the borrowed slots,
+when it ends, with the uncached experts its routing ranks highest (the routing of recent tokens,
+half-life 2,048 tokens, plus half the long-run counts).
+
+**Decode-time adaptation** (`EngineOptions::decode_adapt`, on; `engine.cpp` "Decode-time
+adaptation"). The routing of the last steps predicts the next steps' far better than a prompt does:
+a conversation drifts. Recorded on the 32K-token code prompt below, the best static cache chosen from
+the prompt's routing would have kept 64% of the 256 decoded tokens' pairs in VRAM (the engine kept
+63%), the best static cache chosen from the decode routing itself 81%, and a cache that follows the
+last steps 75% (the MTP run's continuation drifted further: 37%, 76% and 64-67%). After every decode
+step:
+
+- each step's pairs count as uses of their experts (`use`, decayed with a half-life of 32 steps);
+- per layer, the uncached experts with a use replace the cached ones that score at least 1.5 uses
+  lower, at most 192 per step; the score is the decayed uses plus a weak prior, 5 tokens' worth of the
+  decayed routing above (mostly the prompt's), which ranks the experts without recent uses;
+- the swaps run on their own stream beside the next step. The evicted expert leaves the maps before
+  that step (the CPU computes it meanwhile); its slot is refilled from the CPU's pinned copy (DMA, then
+  the GPU conversion of section 3.5, byte-identical to the original); the new expert enters the maps at
+  the first step after its copy landed. One batch is in flight at a time. The batches (8 experts: their
+  copies and one conversion) are queued while the CPU spin-waits for the GPU's layers
+  (`host_experts`): queued between steps they delayed the following draft passes by as long as their
+  DMAs took. Every layer's map is one device array, uploaded once per step before its kernels.
+
+With adaptation the whole cache is no longer re-ranked after prompts: after a 32K-token prompt that
+took 0.4 s (some 3,300 swaps) and gained less over 256 decoded tokens than the adaptation does in a
+few steps (decode 54.0 against 49.7 tok/s; with MTP 56.8 against 57.0). `NINFER_FN_RERANK=1` restores
+it; without adaptation (`decode_adapt = false`, or no pinned CPU copy) the cache is re-ranked after
+every prompt and every 256 decoded tokens as before. Only placement changes: a pair runs with the
+GPU's FP32 or the CPU's 16-bit arithmetic, as with any cache change, so decode logits differ from a
+non-adapting run in the last bits while prompt logits stay bitwise the same (section 4.4).
+
+The parameters (`AdaptParams`; `NINFER_FN_ADAPT="hl,beta,margin,min_use,every,max_swaps"` overrides
+them) come from replaying recorded routing through the policy offline: `NINFER_FN_ROUTING_DUMP=<file>`
+records every routed pair and the cache's contents (format in `engine.cpp`), and a replay of the
+32K-token and short prompts' decodes, plain and with MTP, over half-lives of 4-64 steps, priors of
+0-50 tokens, margins of 0.5-2 and 16-256 swaps per step ranked the settings by the CPU's distinct
+experts per step plus the swaps' DMA (about 30 us of DRAM time each, measured). The landscape is flat
+near the optimum (half-lives 16-64 within 1%); margin 1.5 against 1.0 was then measured on the engine
+(fewer swaps, 32K MTP +11% partly through a different continuation, 32K plain -1.5%).
+
+Before this, `fn_generate` printed "0 cached experts swapped" after a long prompt because the refill
+and re-ranking ran at the first decode step, after it read the counters (they ran: 3,300 swaps and a
+0.2 s refill); the prompt's routing reached the statistics (streamed chunks record every pair). But
+during decoding the cache barely moved: the recent routing was dominated by the prompt's last 8K
+tokens, so 256 decoded tokens shifted it by a few percent and the re-rankings swapped 13-17 experts.
 
 ### 3.5 Prompts
 
@@ -113,8 +166,8 @@ A prompt of more than 512 tokens runs in big chunks with every routed expert on 
   at 250K depth with the KV staging pool). The buffers stay lent across consecutive prompt
   calls (the server feeds long prompts in pieces of 8,192) and come back at the next decode step or
   draft (`end_prompt`): the lent slots are refilled with the uncached experts that rank highest for
-  the cache, copied from pinned RAM and converted on the GPU (about 0.1 ms per expert), then the cache
-  is re-ranked as after any prompt.
+  the cache, copied from pinned RAM and converted on the GPU (about 0.1 ms per expert; 0.19 s after a
+  32K-token prompt); without decode adaptation the cache is then re-ranked as after any prompt.
 - **Chunk size.** `prefill_chunk = 0` (the default) takes per prompt the largest chunk on a 256-token
   grid, up to 8,192 (`prefill_chunk_max`), whose buffers, a ring of up to 1.5 GiB (at least 256 MiB)
   and, when KV streaming stages the prompt's chunks (section 3.9), the staging pool (2 KiB per
@@ -187,8 +240,21 @@ next token's embedding. `draft(next, k)` proposes tokens, `forward({next, drafts
 them in one step, and `rollback(n)` keeps the accepted prefix: DeltaNet conv and recurrent states are
 kept after each token of a 2 to 4 token step and the PLE history is rebuilt, so rejected drafts are
 undone exactly. Before every step the MTP layer catches up on the main model's tokens with their true
-hidden states, so drafts always attend to exact entries. Its 512 experts stay in VRAM (2.5 GB). The
-layer attends to its last 2,051 positions only, so its K/V is a ring of `cap + 2,051` rows (rounded up
+hidden states, so drafts always attend to exact entries. A catch-up pass stops once it has stored its
+K/V: in a single layer a position's keys and values depend only on that position's input, and the rest
+of the pass (attention, experts) was never read (drafts and verify logits bitwise unchanged; after a
+long prompt the catch-up of 2,059 positions no longer computes their experts).
+
+The layer's 512 routed experts (Q8_0, 2.7 GB) are computed by the CPU (`CpuExperts::add_layer`: Q8_0
+gate/up rows against the 16-bit activations the main layers' CPU experts use, 5.5e-5 from exact math in
+`test_cpu_experts --mtp`), through one more `ExpertLink` serviced while the draft pass's graph runs; the
+GPU computes the shared expert meanwhile. Their VRAM goes to the expert cache: 13.99 instead of 11.50
+GiB at a 64K window (6,256 experts instead of 5,144). A draft costs about 1 ms more (three drafts: 3.0-3.6
+ms of CPU experts per step); the drafts were the same tokens on every test (identical draft hashes on
+the oracle prompts, acceptance 94.5% on p2 and 73-75% after the 32K prompt, as before).
+`EngineOptions::mtp_experts_vram` (`fn_generate --mtp-experts-vram`) keeps them in VRAM. The
+layer attends to its last 2,051 positions only (`NINFER_FN_MTP_WINDOW`, an experiment, widens it; section
+4.5), so its K/V is a ring of `cap + 2,051` rows (rounded up
 to 256; 5.5 MiB with 512-token passes) instead of the whole window: a pass of up to `cap` tokens
 never overwrites a row it still reads, and attention reads the same values in the same order.
 
@@ -520,6 +586,103 @@ three times) and the 3,288-token prompt in pieces of 1,000 keep all 24 greedy to
 neither encoded nor computed again: its turn reuses the cached prompt (TTFT 0.3 s) and the encoded-image
 cache serves new prompts with it.
 
+### 4.4 Decode after prompts: the cache follows decoding
+
+Same-PC comparison with Strata 0.1.39 (2026-10-05): the same UD-IQ4_XS file and token ids, a 64K
+window, 256 greedy tokens; `fn_generate -m <shard 1> --tokens-file <ids> -n 256 --ctx 65536
+--routing-stats <fresh copy of fn_ref\routing.bin> [--mtp <shared-Q8_0 head> --draft 3]`, main (3900904b)
+and this work alternating, two runs each (means); Strata with `work\scratch\h2h.ps1`'s settings (`--spec
+4 --spec-min-p 0.5`, its own expert profile), one run. Prompts: `fn_ref\p2.ids` (15 tokens) and the
+first 32,768 ids of `fn_ref\kv_ctx64k.ids` (source code). "Hits": the decode's pairs computed from the
+VRAM cache.
+
+| | Ours, main | Ours, now | Strata 0.1.39 |
+|---|---|---|---|
+| Short prompt, plain | 54.4 tok/s, 67.3% hits | **62.2 tok/s**, 78.9% hits | |
+| Short prompt, MTP | 67.0 tok/s, 3.82 tokens per step, 57.1 ms per step, 94.5% accepted, 59.5% hits | **83.0 tok/s**, 3.82 tokens per step, 46.0 ms per step, 94.5% accepted, 76.3% hits | 54.8 tok/s, 3.44 tokens per round, 62.3 ms per round |
+| 32K prompt, prefill | 3,054 tok/s | 3,066 tok/s | 3,470 tok/s |
+| After the 32K prompt, plain | 46.0 tok/s, 62.8% hits | **53.2 tok/s**, 73.2% hits | |
+| After the 32K prompt, MTP | 42.0 tok/s, 3.24 tokens per step, 77.1 ms per step, 74.3% accepted, 36.4% hits | **65.6 tok/s**, 3.24 tokens per step, 49.4 ms per step, 75.1% accepted, 74.4% hits | 81.7 tok/s, 2.51 tokens per round, 30.7 ms per round |
+
+A step with MTP after the 32K prompt, before and after (per step, from the engine's counters):
+
+| | main | now |
+|---|---:|---:|
+| Drafts (the first one also refills the lent slots, and on main re-ranks the cache and computes the catch-up's experts) | 13.5 ms | 8.4-9.2 ms, of which the MTP experts on the CPU 2.8-3.3 ms |
+| Verification of 4 tokens | 63.2 ms | 39.8-40.7 ms |
+| - the CPU's experts | 50.3 ms (18.1 distinct experts per layer) | 26-27 ms (8.6 distinct experts per layer) |
+| - the CPU waiting for the GPU's layers | 10.0 ms | 10.6-10.8 ms |
+| Expert cache | 11.50 GiB, re-ranked once after the prompt | 13.99 GiB, 81 swaps per step in the background |
+
+So a verification step of four tokens costs what its distinct CPU experts cost: the CPU groups a step's
+pairs by expert (57-66 us per expert whatever the step's size), the dense part grows from 8 to 10 ms
+from one token to four, and the GPU's cached experts (per pair) always finish before the CPU's. Nsight on
+verification steps (short prompt, MTP 3, steps 32-40): per step 19.1 ms of the GPU waiting for the CPU,
+10.2 ms of cached experts (`k_gate_up` 4.3, `k_down` 5.9; about 29 pairs per layer), 11.7 ms of dense
+GEMVs (fused 6.3, Q8_0 3.2, the Q6_K head 1.7, F32 0.5), 1.1 ms of DeltaNet recurrence and about 3 ms of
+small kernels; all 408 layer waits were longer than 20 us (median 265 us), so grouping the GPU's pairs by
+expert would not shorten a step. With MTP, verification now beats plain decoding at 32K depth by 23%
+(65.6 against 53.2 tok/s; it was 9% slower). Strata stops drafting below a draft probability of 0.5
+(`--spec-min-p 0.5`), so its rounds verify fewer tokens (2.51 committed per round against our 3.24 per
+step) at a lower cost per round; `fn_generate` always verifies four (the server adapts the draft length).
+
+Other prompt shapes (one run each, main against now): the 32K prompt fed in pieces of 1,536 tokens (the
+server's way, with a snapshot after each), plain 61.9 against 60.3 tok/s (main re-ranked the cache after
+each piece: 75.6% hits; now 80.2%, with 37 swaps per step) and MTP 39.3 against 70.6; follow-ups of 300
+and 2,000 tokens after the 32K prompt, then decoding: plain 33.3 (32.0% hits) against 58.5 (80.3%), MTP
+36.2 against 65.1.
+
+Checks:
+
+- Bitwise, with the cache pinned to 8 GiB (`--cache-mib 8192 --hash`): with `--no-decode-adapt` (and
+  `--mtp-experts-vram` with MTP) this work and main give the same prompt, decode, verification and draft
+  hashes on p1 (plain), p3 (MTP 2), the 2,600-token prompt (MTP 3) and the 32K prompt (plain): the
+  catch-up's shortening, the transfers through the SMs and the step bookkeeping change nothing. With the
+  defaults, the prompt hashes are still main's, the draft hashes too (MTP experts on the CPU), and decode
+  and verification logits differ through placement only.
+- Against the FP32 reference (`--compare-ref`): p1 1.233e-4 and p3 8.026e-3, as main; with an MTP head
+  loaded (the larger cache computes more of the short prompts' pairs on the GPU) 1.258e-4 and 8.024e-3;
+  the 2,600-token prompt 6.439e-2 with an MTP head loaded, as main (streamed chunks do not depend on the
+  cache).
+- Snapshots: `--test-snapshot` on p1 with MTP, and on the 32K prompt fed in pieces of 8,192 with MTP,
+  gives bitwise the same continuation with `--no-decode-adapt` and the same tokens with adaptation (the
+  cache then changes between the two continuations, so logits differ in the last bits; the test now
+  compares logits only without it). With a 5,000-token detour, main's and this work's continuations
+  differ in the last bits as before (the detour's prompt re-ranks or adapts the cache); without a cache
+  (`--cache-mib 0 --no-decode-adapt`) they are bitwise the same.
+- `test_cpu_experts --mtp`: the MTP layer's experts 5.5e-5 from exact math, 4 tokens bitwise equal to
+  single-token calls.
+
+### 4.5 Decode at 250K depth
+
+`fn_ref\kv_needle250k.ids` (250,139 tokens of this repository's source with three facts planted at 11%,
+45% and 89%, then the question), a 262K window, `fn_generate --ctx 262144 -n 128 [--mtp ... --draft 3]`,
+one run each (2026-10-05). All four runs answer "1) 58213 2) Pistachio Thunderbolt 3) 6:47 in the
+morning", the three facts (main and this work generate the same 128 tokens, plain and with MTP).
+
+| | main | now |
+|---|---|---|
+| Expert cache (plain / MTP) | 14.24 / 11.17 GiB | 14.24 / 13.66 GiB |
+| Plain | 27.7 tok/s, 21.7% hits | **45.1 tok/s**, 69.3% hits (median step 18.3 ms) |
+| MTP 3 | 25.6 tok/s, 2.61 tokens per step, 55.1% accepted | **44.9 tok/s**, 2.56 tokens per step, 53.3% accepted |
+
+Where a plain step's time goes at that depth (now; the engine's counters, and Nsight over 16 steps): the
+CPU waiting for the GPU's layers 9.2 ms (8.2 ms after the 32K prompt), the CPU's experts 10.2 ms (3.1
+distinct experts per layer), the head and the step's end about 1 ms; the first step also refills the
+slots the prompt borrowed (0.21 s, 1.7 ms per token over 128 tokens). On the GPU: dense GEMVs 6.1 ms (fused
+3.5, Q8_0 1.7, head 0.6, F32 0.3), the attention layers 1.55 ms (indexer scores over the 62,500 blocks
+0.47, top-k selection 0.54, KV page copies 0.17, attention 0.18, page resolution 0.07), cached experts
+1.5 ms, DeltaNet 0.3 ms, small kernels about 1.3 ms. With MTP a verification step of four tokens costs 45
+ms (CPU experts 28.4 ms, 8.5 distinct per layer; the GPU's part 12.4 ms, of which attention 2.9 ms) for
+2.56 tokens: MTP no longer pays at that depth, because the drafts' acceptance falls with depth (94.5% on
+the short prompt, 75% after 32K tokens, 53% here).
+
+The MTP layer attends to its last 2,051 positions only. `NINFER_FN_MTP_WINDOW=32768` (an experiment: a
+ring of 32K + 512 rows, 68 MB, which snapshots carry too; single-token drafts only) measured, one run each:
+after the 32K prompt 81.3% accepted and 68.1 tok/s (75.1% and 65.5 with 2,051), at 250K 56.9% and 45.9
+tok/s (53.3% and 45.7), on the short prompt unchanged (94.5%, 81.9 against 83.0 tok/s); each draft's
+attention costs about 0.14 ms more.
+
 ## 5. Next
 
 1. Prompts: the streamed experts are now about a quarter of a chunk's GPU time and overlap their
@@ -535,3 +698,13 @@ cache serves new prompts with it.
    the patches: about 70% of a 1,024-token image's encode); better register tiling, or tensor cores with
    split fp16 operands, would cut it. The MTP catch-up could feed image rows instead of the image token's
    embedding. Video (the frontend already samples frames) needs the temporal positions and timestamps.
+5. Decode at depth (section 4.5). (a) MTP: acceptance falls with depth; a wider MTP window (measured +6
+   points of acceptance after 32K tokens, +4 at 250K) and a per-draft probability gate (Strata stops below
+   0.5; at 250K a four-token step costs 2.4 plain steps for 2.56 tokens) would let MTP pay at depth again;
+   fn_generate verifies a fixed four tokens, the server already adapts the length. (b) Expert misses are
+   still half a step: the refill after a long prompt (0.2 s) could overlap the first steps (refilling in the
+   background together with the re-ranking measured worse: 32K prompt, MTP, 47.4 against 57.0 tok/s, the
+   lent slots queued behind the re-ranking's swaps), and
+   the CPU reads experts at 40-46 GB/s of the 55-62 the RAM gives. (c) Attention at 250K is 8% of a step,
+   mostly the indexer's scores (FP32 block keys, about 800 GB/s already) and the top-k selection (0.54 ms
+   per token over 12 layers), where a faster exact selection (a radix select) could help.
