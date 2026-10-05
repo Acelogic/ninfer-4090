@@ -94,7 +94,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--cors] "
            "[--flashnext-expert-cache-mib N] [--flashnext-expert-threads N] "
            "[--flashnext-routing-stats FILE] [--flashnext-host-expert-images] "
-           "[--flashnext-mtp FILE [--flashnext-draft K]] "
+           "[--flashnext-mtp FILE [--flashnext-draft K]] [--flashnext-vision FILE] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -157,7 +157,10 @@ std::string serve_usage_text(const char* argv0) {
            "written back when idle); --flashnext-host-expert-images keeps a pinned host copy "
            "of "
            "every expert (tens of GB of RAM); --flashnext-mtp FILE loads the MTP head GGUF for "
-           "speculative decoding with --flashnext-draft K drafts per step (1..3, default 2)\n";
+           "speculative decoding with --flashnext-draft K drafts per step (1..3, default 2); "
+           "--flashnext-vision FILE loads the vision encoder (the model's mmproj GGUF, F16) for "
+           "image input (its weights stay in pinned RAM; each image borrows VRAM from the expert "
+           "cache while it is encoded)\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -248,6 +251,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.flashnext.mtp_path.empty()) {
                 throw std::invalid_argument("--flashnext-mtp must not be empty");
             }
+        } else if (arg == "--flashnext-vision") {
+            options.flashnext.vision_path = require_value("--flashnext-vision");
+            if (options.flashnext.vision_path.empty()) {
+                throw std::invalid_argument("--flashnext-vision must not be empty");
+            }
+            options.enable_vision = true;  // requests may carry media
         } else if (arg == "--flashnext-draft") {
             const int drafts =
                 parse_nonnegative_int(require_value("--flashnext-draft"), "flashnext-draft");
