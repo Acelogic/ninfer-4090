@@ -31,6 +31,16 @@ constexpr int kHeads = 24;             // full attention
 constexpr int kKvHeads = 2;
 constexpr int kHeadDim = 256;
 constexpr int kRot = 64;               // NEOX rotation of the first 64 dims
+// Rope positions. The model rotates with Qwen3-VL's interleaved multi-axis rope (sections [11, 11, 10, 0]): rotated
+// pair i turns with the temporal (i % 3 == 0), height (1) or width (2) position of its token, and a text token has
+// the same position in all three. Kernels take the positions as a table rpos [T][3] (temporal, height, width) per
+// token, separate from the KV cell (pos0 + t); a null table means text positions equal to the cells.
+constexpr int kRopeAxes = 3;
+#ifdef __CUDACC__
+__device__ __forceinline__ std::int64_t rope_position(const std::int32_t * rpos, std::int64_t cell, int t, int pair) {
+    return rpos ? std::int64_t(rpos[t * kRopeAxes + pair % kRopeAxes]) : cell;
+}
+#endif
 constexpr int kGroup = kHeads / kKvHeads;
 constexpr int kIdxDim = 128;           // QSA indexer key size
 
@@ -107,6 +117,10 @@ void attn_prep(const float * q_full, const float * k, const float * v, const flo
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
                const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0, int T, float eps,
                cudaStream_t s);
+// The same with rope positions rope_pos [T][3] in device memory (see kRopeAxes); null: positions pos0 + t.
+void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
+               const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0,
+               const std::int32_t * rope_pos, int T, float eps, cudaStream_t s);
 // Causal softmax attention of T queries over cells [0, pos0 + t] times sigmoid(gate). out [T][24][256].
 // Dense attention covers at most kAttnMaxCells cells (beyond that QSA selects 2051 of them), in up to
 // kAttnMaxChunks chunks; chunks past the context exit at once. work: attn_work_floats(T) floats.
