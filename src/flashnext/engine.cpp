@@ -29,6 +29,7 @@
 #include "flashnext/cuda/gemv.h"
 #include "flashnext/cuda/ops.h"
 #include "flashnext/cuda/qsa.h"
+#include "flashnext/kv_cache.h"
 #include "flashnext/quants.h"
 #include "flashnext/reference.h"
 
@@ -131,6 +132,7 @@ struct Engine::Impl {
         fc::DeviceWeight router, sh_gate, sh_up, sh_down, sh_gate_inp;  // FFN
         fc::DeviceBuffer conv_state, S, k_cache, v_cache, idx_raw, blocks;  // state
         fc::DeviceBuffer conv_snap, S_snap;  // DeltaNet states after each token of a step but the last (rollback)
+        int kv = -1;                         // the layer's index in the streamed KV cache (-1: k_cache/v_cache in VRAM)
     };
     std::vector<Layer> layers;
     fc::DeviceWeight output, out_hc_down, out_hc_up;
@@ -150,6 +152,11 @@ struct Engine::Impl {
     // raw indexer keys are needed only until their block of 4 is complete: a ring of a step's worth
     std::int64_t raw_ring() const { return std::max<std::int64_t>(fc::kMaxTokens, opt.prefill_chunk) + 2 * fc::kQsaRatio; }
     std::unique_ptr<fc::Gemm> gemm;
+    // KV streaming of the attention layers (null: their K/V are in VRAM), and the staging pool deep prompt
+    // chunks use when the prompt cannot borrow one
+    std::unique_ptr<KvStreamCache> kv;
+    fc::DeviceBuffer kv_stage_own;
+    bool kv_streaming() const { return opt.kv_stream > 0 || (opt.kv_stream < 0 && opt.max_ctx > opt.kv_resident); }
 
     // the token at every position whose keys and values are in the caches; the first n_past are the
     // current sequence, later ones are left over from a sequence that was abandoned by restore()
@@ -827,9 +834,14 @@ struct Engine::Impl {
                 L.idx_q_norm = V(b + "indexer.q_norm.weight", fc::kQsaDim);
                 L.idx_k_norm = V(b + "indexer.k_norm.weight", fc::kQsaDim);
                 require(cfg.compress_ratio[std::size_t(il)] == fc::kQsaRatio, "QSA compress ratio");
-                const std::size_t kv = std::size_t(opt.max_ctx) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
-                L.k_cache = fc::DeviceBuffer(kv);
-                L.v_cache = fc::DeviceBuffer(kv);
+                if (kv_streaming()) {
+                    if (!kv) kv = std::make_unique<KvStreamCache>(opt.max_ctx, opt.kv_resident, opt.kv_group_tokens, stream);
+                    L.kv = kv->add_layer();
+                } else {
+                    const std::size_t kvb = std::size_t(opt.max_ctx) * fc::kKvHeads * fc::kHeadDim * sizeof(half);
+                    L.k_cache = fc::DeviceBuffer(kvb);
+                    L.v_cache = fc::DeviceBuffer(kvb);
+                }
                 L.idx_raw = fc::DeviceBuffer(std::size_t(raw_ring()) * fc::kIdxDim * sizeof(float));
                 L.blocks = fc::DeviceBuffer(std::size_t(opt.max_ctx / fc::kQsaRatio + 1) * fc::kQsaDim * sizeof(float));
             }
@@ -929,7 +941,19 @@ struct Engine::Impl {
         plan_oncpu = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed);
         ypairs_host = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * fc::kUsed * fc::kEmbd * f);
         ple_hist = fc::DeviceBuffer(std::size_t(fc::kPleHist) * fc::kHcd * f);
+        // TODO(merge): the prompt planner lends this VRAM from the expert cache during prompts (kv_stage_borrow);
+        // until then deep prompt chunks stage into a pool of their own
+        if (kv) {
+            const std::int64_t cells = opt.kv_stage_cells < 0 ? opt.max_ctx : opt.kv_stage_cells;
+            const std::size_t bytes = kv->stage_bytes(cells);
+            if (bytes) kv_stage_own = fc::DeviceBuffer(bytes);
+        }
     }
+
+    // VRAM a prompt chunk ending at position pos_end - 1 needs for staging attention K/V (0: none)
+    std::size_t kv_stage_bytes(std::int64_t pos_end) const { return kv ? kv->stage_bytes(pos_end) : 0; }
+    // TODO(merge): replaced by the prompt planner's arena; a region of >= bytes for the current prompt chunk, or null
+    void * kv_stage_borrow(std::size_t bytes) { return bytes && bytes <= kv_stage_own.bytes() ? kv_stage_own.get() : nullptr; }
 
     void reset() {
         check(cudaStreamSynchronize(stream), "sync");
@@ -1125,8 +1149,15 @@ struct Engine::Impl {
         const std::int64_t * pos = d_step.as<std::int64_t>();
         linear_multi({{&L.wq, &qfull}, {&L.wk, &k}, {&L.wv, &v}, {&L.idx_k, &kraw}, {&L.idx_q, &qi}}, mixed, T);
         emit("Qcur_full", il, qfull.get(), n_past, T, 2 * fc::kHeads * fc::kHeadDim);
+        fc::KvStore kv_store;
+        if (L.kv >= 0) {
+            kv_store = kv->store(L.kv);
+        } else {
+            kv_store.k = L.k_cache.as<half>();
+            kv_store.v = L.v_cache.as<half>();
+        }
         fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
-                      q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), pos, T, cfg.rms_eps, stream);
+                      q.as<float>(), qgate.as<float>(), kv_store, pos, T, cfg.rms_eps, stream);
         emit("Qcur", il, q.get(), n_past, T, fc::kHeads * fc::kHeadDim);
         emit("indexer_k_raw", il, kraw.get(), n_past, T, fc::kIdxDim);
         // QSA: block keys and selections are kept from the first token on, so that past 2051 tokens
@@ -1137,8 +1168,12 @@ struct Engine::Impl {
         fc::qsa_query(qi.as<float>(), L.idx_q_norm.as<float>(), rope_freq.as<double>(), pos, T, cfg.rms_eps, stream);
         fc::qsa_select(qi.as<float>(), L.blocks.as<float>(), pos, T, opt.max_ctx, sel_work.get(), cells.as<std::int32_t>(),
                        n_cells.as<std::int32_t>(), stream);
-        fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
-                        n_cells.as<std::int32_t>(), T, cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
+        if (L.kv >= 0)  // streamed K/V: the page cache or a staging pool (bitwise the same result)
+            kv->attend(L.kv, q.as<float>(), qgate.as<float>(), cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), pos, cfg.kq_scale,
+                       attn_work.as<float>(), att.as<float>());
+        else
+            fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
+                            n_cells.as<std::int32_t>(), T, cfg.kq_scale, attn_work.as<float>(), att.as<float>(), stream);
         emit("attn_gated", il, att.get(), n_past, T, fc::kHeads * fc::kHeadDim);
         linear(L.wo, att, out, T);
     }
@@ -1305,6 +1340,7 @@ struct Engine::Impl {
     void enqueue(int T, int head_rows) {
         const std::int64_t pos0 = n_past;
         check(cudaMemcpyAsync(d_step.get(), h_step.get(), 2 * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "step");
+        if (kv) kv->begin_step(pos0, T, T > fc::kMaxTokens ? kv_stage_borrow(kv_stage_bytes(pos0 + T)) : nullptr);
         check(cudaMemcpyAsync(x.get(), h_x->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "embed");
         emit("model.input_embed", -1, x.get(), pos0, T, fc::kEmbd);
         fc::hc_expand(x.as<float>(), res.as<float>(), T, stream);
@@ -1377,6 +1413,7 @@ struct Engine::Impl {
         } else {
             enqueue(T, head_rows);
             check(cudaStreamSynchronize(stream), "step");
+            if (kv && T > fc::kMaxTokens && kv->stats().overflow) throw std::runtime_error("engine: the KV page cache overflowed");
         }
         const int n_out = all_logits ? T : 1, t_first = T - n_out, skip = head_rows - n_out;
         const float * src = h_logits->get() + std::size_t(skip) * cfg.n_vocab;
@@ -1441,6 +1478,7 @@ void Engine::set_activation_hook(EngineHook hook) { impl_->hook = std::move(hook
 const EngineStats & Engine::stats() const { return impl_->stats; }
 void Engine::save_routing_stats(const std::string & path) const { impl_->save_routing(path); }
 bool Engine::has_mtp() const { return impl_->mtp != nullptr; }
+KvStreamStats Engine::kv_stream_stats() const { return impl_->kv ? impl_->kv->stats() : KvStreamStats{}; }
 std::vector<std::int32_t> Engine::draft(std::int32_t next, int k) { return impl_->draft(next, k); }
 void Engine::rollback(int n_keep) { impl_->rollback(n_keep); }
 

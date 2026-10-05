@@ -4,6 +4,7 @@
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
 //                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--mtp mtp.gguf [--draft K]] [--hash]
+//                    [--kv-stream 0|1] [--kv-resident CELLS] [--kv-stage-cells CELLS] [--kv-group-tokens N] [--followup N[,N...]]
 //
 // Prints the generated ids, the top-5 logits at every step, and prefill/decode speed. The JSON has the
 // same layout as ref_generate's. --dump writes the prompt pass's intermediates like ref_generate does.
@@ -14,6 +15,10 @@
 // --test-snapshot continues 8 tokens past the prompt, returns to the snapshot and checks that the same 8
 // tokens follow; --snapshot-detour N also feeds N more tokens (the prompt's first ones) before returning, so
 // that ring buffers (the MTP layer's K/V) wrap past the snapshot's positions.
+// --kv-stream forces KV streaming off or on (default: on when --ctx exceeds --kv-resident, 32768 cells);
+// the KV counters are printed after the prompt and at the end. --followup feeds short prompts of N tokens
+// (the prompt's first ones) after the prompt and times them, like a conversation's next turn at that depth;
+// decoding then continues after them.
 // --hash prints 64-bit FNV-1a hashes of the prompt's logits, of every later forward()'s logits and of
 // the MTP drafts, so that two builds or configurations can be checked for bitwise identical results.
 #include <algorithm>
@@ -101,6 +106,16 @@ std::uint64_t fnv1a(const void * data, std::size_t n, std::uint64_t h = 14695981
     return h;
 }
 
+void print_kv(const Engine & engine, const char * when) {
+    const KvStreamStats k = engine.kv_stream_stats();
+    if (!k.enabled) return;
+    std::printf("kv stream %s: %lld layers, %lld resident cells each (%.2f GiB VRAM, %.2f GiB pinned RAM); %llu resolves, %llu page lookups, "
+                "%llu misses (%.2f%%), prompt chunks beyond it: %llu staged (%.2f GiB), %llu in groups%s\n",
+                when, (long long) k.layers, (long long) k.resident_cells, k.vram_gib, k.host_gib, (unsigned long long) k.resolves,
+                (unsigned long long) k.lookups, (unsigned long long) k.misses, 100.0 * double(k.misses) / double(k.lookups ? k.lookups : 1),
+                (unsigned long long) k.staged_chunks, k.staged_gib, (unsigned long long) k.grouped_chunks, k.overflow ? "; OVERFLOW" : "");
+}
+
 double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -140,6 +155,7 @@ static int run(int argc, char ** argv) {
     bool compare_ref = false, test_snapshot = false, hash = false;
     std::uint64_t h_decode = fnv1a(nullptr, 0), h_drafts = fnv1a(nullptr, 0);
     int n_draft = 2, detour = 0;
+    std::vector<std::int32_t> followups;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -170,6 +186,11 @@ static int run(int argc, char ** argv) {
         else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--gpu-miss-permille") opt.gpu_miss_permille = std::stoi(next());
         else if (a == "--hash") hash = true;
+        else if (a == "--kv-stream") opt.kv_stream = std::stoi(next());
+        else if (a == "--kv-resident") opt.kv_resident = std::stoll(next());
+        else if (a == "--kv-stage-cells") opt.kv_stage_cells = std::stoll(next());
+        else if (a == "--kv-group-tokens") opt.kv_group_tokens = std::stoi(next());
+        else if (a == "--followup") followups = parse_ids(next());
         else throw std::runtime_error("unknown argument " + a);
     }
     if (model_path.empty() || (tokens_arg.empty() && tokens_file.empty())) {
@@ -205,6 +226,18 @@ static int run(int argc, char ** argv) {
     const double t_prefill = seconds_since(t0);
     engine.set_activation_hook(nullptr);
     if (hash) std::printf("hash prompt logits: %016llx\n", (unsigned long long) fnv1a(logits.data(), logits.size() * sizeof(float)));
+    print_kv(engine, "after the prompt");
+    for (std::int32_t n : followups) {
+        const std::vector<std::int32_t> extra(prompt.begin(), prompt.begin() + std::min<std::size_t>(prompt.size(), std::size_t(n)));
+        const std::int64_t at = engine.n_past();
+        const auto tf = std::chrono::steady_clock::now();
+        logits = engine.forward(extra);
+        const double sec = seconds_since(tf);
+        std::printf("follow-up: %zu tokens at depth %lld in %.3f s (%.1f tok/s)", extra.size(), (long long) at, sec, double(extra.size()) / sec);
+        if (hash) std::printf("; hash logits %016llx", (unsigned long long) fnv1a(logits.data(), logits.size() * sizeof(float)));
+        std::printf("\n");
+    }
+    if (!followups.empty()) print_kv(engine, "after the follow-ups");
     std::printf("prompt: %zu tokens, prefill %.2f s (%.1f tok/s)%s; %lld cached experts swapped (%.2f s); CPU experts %.2f s\n", prompt.size(),
                 t_prefill, double(prompt.size()) / t_prefill, capture ? " with intermediates captured" : "", (long long) engine.stats().cache_swaps,
                 engine.stats().cache_swap_ms / 1e3, engine.stats().cpu_experts_ms / 1e3);
@@ -368,6 +401,7 @@ static int run(int argc, char ** argv) {
                     (engine.stats().cpu_experts_ms - cpu0) / steps, 1e3 * (total - draft_s - verify_s) / steps);
         if (hash)
             std::printf("hash verify logits: %016llx; hash drafts: %016llx\n", (unsigned long long) h_decode, (unsigned long long) h_drafts);
+        print_kv(engine, "at the end");
         if (!opt.routing_stats.empty()) engine.save_routing_stats(opt.routing_stats);
         if (!json_path.empty()) {
             std::ofstream f(json_path);
@@ -395,6 +429,7 @@ static int run(int argc, char ** argv) {
     for (std::int32_t id : generated) std::printf(" %d", id);
     std::printf("\n");
     if (hash) std::printf("hash decode logits: %016llx\n", (unsigned long long) h_decode);
+    print_kv(engine, "at the end");
     if (!step_times.empty()) {
         const double total = std::accumulate(step_times.begin(), step_times.end(), 0.0);
         const EngineStats & st = engine.stats();
