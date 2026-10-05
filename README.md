@@ -133,6 +133,10 @@ Flash-Next, all 25 stress scenarios of that extension pass.
     Q8_0. This uses ggml's own quantizer and mradermacher's importance matrix of the abliterated model (statistics
     that guide the rounding).
   - The result has the same formats, size and speed as the original.
+  - The tools are in [`tools/flashnext/abliterated/`](tools/flashnext/abliterated):
+    - `find_changed.py` compares byte samples of both BF16 releases over HTTP;
+    - `download_changed.py` fetches only the changed tensors;
+    - `patch_tensors.py` quantizes them into a copy of the original file.
 - **Qwen3.8 27B (Huihui)** and **Bonsai (Heretic):** see [windows/README.md](windows/README.md#abliterated-bonsai).
 
 ## What this build changes
