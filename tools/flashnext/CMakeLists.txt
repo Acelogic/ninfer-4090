@@ -2,6 +2,7 @@
 # Each runs against the real model files; see docs/maintainer/flash-next-engine.md.
 set(NINFER_FLASHNEXT_TOOLS
   fn_generate:fn_generate.cpp
+  fn_vision:fn_vision.cpp
   ref_generate:ref_generate.cpp
   test_cpu_experts:test_cpu_experts.cpp
   test_gpu_gemv:test_gpu_gemv.cu

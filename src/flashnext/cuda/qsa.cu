@@ -37,8 +37,9 @@ __device__ __forceinline__ float warp_sum(float v) {
 // RMSNorm and rotation of one 128-vector held one element per thread (blockDim.x == 128), exactly as
 // the reference's rms_norm (double sum of float squares in index order, float mean, 1/sqrtf) and
 // rope (double angle, float cos/sin, x0*c - x1*s and x0*s + x1*c without contraction).
+// p3: the token's rope positions (temporal, height, width; see kRopeAxes), or null for the text position pos.
 __device__ float norm_rope_128(float x, const float * __restrict__ w, const double * __restrict__ inv_freq, std::int64_t pos,
-                               float eps, float * xs, float * scale_s) {
+                               const std::int32_t * p3, float eps, float * xs, float * scale_s) {
     const int d = threadIdx.x;
     xs[d] = x;
     __syncthreads();
@@ -56,7 +57,7 @@ __device__ float norm_rope_128(float x, const float * __restrict__ w, const doub
     float out = y;
     if (d < kQsaRot) {
         const int i = d % (kQsaRot / 2);
-        const double theta = double(pos) * inv_freq[i];
+        const double theta = double(rope_position(p3, pos, 0, i)) * inv_freq[i];
         const float c = float(cos(theta)), s = float(sin(theta));
         const float x0 = xs[i], x1 = xs[i + kQsaRot / 2];
         out = d < kQsaRot / 2 ? __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s)) : __fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c));
@@ -64,10 +65,12 @@ __device__ float norm_rope_128(float x, const float * __restrict__ w, const doub
     return out;
 }
 
-// grid T/4 + 1: candidate block pos0/4 + blockIdx.x, updated only if this step completes it
+// grid T/4 + 1: candidate block pos0/4 + blockIdx.x, updated only if this step completes it. A block's key turns with
+// the rope position of its first member, at most 3 cells before pos0: row (4b - pos0) of rpos (which starts 3 rows early).
 __global__ void __launch_bounds__(kQsaDim) k_qsa_blocks(const float * __restrict__ raw, const float * __restrict__ k_norm,
                                                         const double * __restrict__ inv_freq, float * __restrict__ blocks,
-                                                        const std::int64_t * __restrict__ pos0p, int T, float eps, std::int64_t raw_rows) {
+                                                        const std::int64_t * __restrict__ pos0p, const std::int32_t * __restrict__ rpos,
+                                                        int T, float eps, std::int64_t raw_rows) {
     __shared__ float xs[kQsaDim];
     __shared__ float scale_s;
     const std::int64_t pos0 = *pos0p;
@@ -80,17 +83,19 @@ __global__ void __launch_bounds__(kQsaDim) k_qsa_blocks(const float * __restrict
 #pragma unroll
     for (int i = 1; i < kQsaRatio; ++i) acc = __fadd_rn(acc, row(i));
     const float pooled = __fmul_rn(acc, 1.0f / float(kQsaRatio));
-    blocks[std::size_t(b) * kQsaDim + d] = norm_rope_128(pooled, k_norm, inv_freq, b * kQsaRatio, eps, xs, &scale_s);
+    const std::int32_t * p3 = rpos ? rpos + (b * kQsaRatio - pos0) * kRopeAxes : nullptr;
+    blocks[std::size_t(b) * kQsaDim + d] = norm_rope_128(pooled, k_norm, inv_freq, b * kQsaRatio, p3, eps, xs, &scale_s);
 }
 
 // grid (T, 4 heads)
 __global__ void __launch_bounds__(kQsaDim) k_qsa_query(float * __restrict__ q, const float * __restrict__ q_norm,
                                                        const double * __restrict__ inv_freq, const std::int64_t * __restrict__ pos0p,
-                                                       float eps) {
+                                                       const std::int32_t * __restrict__ rpos, float eps) {
     __shared__ float xs[kQsaDim];
     __shared__ float scale_s;
     float * row = q + (std::size_t(blockIdx.x) * kQsaHeads + blockIdx.y) * kQsaDim;
-    const float y = norm_rope_128(row[threadIdx.x], q_norm, inv_freq, *pos0p + blockIdx.x, eps, xs, &scale_s);
+    const std::int32_t * p3 = rpos ? rpos + std::size_t(blockIdx.x) * kRopeAxes : nullptr;
+    const float y = norm_rope_128(row[threadIdx.x], q_norm, inv_freq, *pos0p + blockIdx.x, p3, eps, xs, &scale_s);
     row[threadIdx.x] = y;
 }
 
@@ -470,20 +475,30 @@ __global__ void __launch_bounds__(kHeadDim) k_attn_sparse_combine(const float * 
 
 void qsa_update_blocks(const float * idx_raw, const float * k_norm, const double * rope_inv_freq, float * blocks,
                        const std::int64_t * pos0, int T, float eps, cudaStream_t s) {
-    qsa_update_blocks(idx_raw, std::int64_t(1) << 62, k_norm, rope_inv_freq, blocks, pos0, T, eps, s);
+    qsa_update_blocks(idx_raw, std::int64_t(1) << 62, k_norm, rope_inv_freq, blocks, pos0, nullptr, T, eps, s);
 }
 
 void qsa_update_blocks(const float * idx_raw, std::int64_t raw_rows, const float * k_norm, const double * rope_inv_freq, float * blocks,
                        const std::int64_t * pos0, int T, float eps, cudaStream_t s) {
+    qsa_update_blocks(idx_raw, raw_rows, k_norm, rope_inv_freq, blocks, pos0, nullptr, T, eps, s);
+}
+
+void qsa_update_blocks(const float * idx_raw, std::int64_t raw_rows, const float * k_norm, const double * rope_inv_freq, float * blocks,
+                       const std::int64_t * pos0, const std::int32_t * rope_pos, int T, float eps, cudaStream_t s) {
     if (T < 1) throw std::runtime_error("qsa_update_blocks: T must be positive");
     if (raw_rows < T + kQsaRatio - 1) throw std::runtime_error("qsa_update_blocks: the raw-key ring is too small");
-    k_qsa_blocks<<<T / kQsaRatio + 1, kQsaDim, 0, s>>>(idx_raw, k_norm, rope_inv_freq, blocks, pos0, T, eps, raw_rows);
+    k_qsa_blocks<<<T / kQsaRatio + 1, kQsaDim, 0, s>>>(idx_raw, k_norm, rope_inv_freq, blocks, pos0, rope_pos, T, eps, raw_rows);
     launched("qsa_update_blocks");
 }
 
 void qsa_query(float * q, const float * q_norm, const double * rope_inv_freq, const std::int64_t * pos0, int T, float eps,
                cudaStream_t s) {
-    k_qsa_query<<<dim3(T, kQsaHeads), kQsaDim, 0, s>>>(q, q_norm, rope_inv_freq, pos0, eps);
+    qsa_query(q, q_norm, rope_inv_freq, pos0, nullptr, T, eps, s);
+}
+
+void qsa_query(float * q, const float * q_norm, const double * rope_inv_freq, const std::int64_t * pos0, const std::int32_t * rope_pos,
+               int T, float eps, cudaStream_t s) {
+    k_qsa_query<<<dim3(T, kQsaHeads), kQsaDim, 0, s>>>(q, q_norm, rope_inv_freq, pos0, rope_pos, eps);
     launched("qsa_query");
 }
 

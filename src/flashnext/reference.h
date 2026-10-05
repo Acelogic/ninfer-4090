@@ -60,6 +60,7 @@ struct ReferenceConfig {
     int ple_head_dim = 0;          // 160
     int ple_conv_kernel = 0;       // 4; dilation is ple_ngram
     std::int64_t ple_eos = 0;      // 248044
+    std::int64_t ple_image_token = -1;  // 248056 (<|image_pad|>): the id the hash reads at image positions; -1: none
     std::vector<std::uint64_t> ple_multipliers;
     std::vector<std::uint64_t> ple_offsets, ple_vocab;
 
@@ -99,6 +100,11 @@ public:
     // Consumes `tokens` at positions n_past() .. n_past() + size - 1 and returns the logits of the
     // last one ([n_vocab]), or of every new token ([size][n_vocab]) when all_logits is set.
     std::vector<float> forward(const std::vector<std::int32_t> & tokens, bool all_logits = false);
+    // The same with rope positions ([3][size] axis-major: temporal, height, width; null: text positions continuing
+    // after the largest so far) and per-token input embedding rows (null entries, or a null array: token embeddings),
+    // as Engine::forward(tokens, all_logits, ForwardInputs) takes them for images.
+    std::vector<float> forward(const std::vector<std::int32_t> & tokens, bool all_logits, const std::int32_t * positions,
+                               const float * const * embeddings);
 
     // Forgets every token (fresh sequence).
     void reset();

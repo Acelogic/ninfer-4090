@@ -32,7 +32,7 @@ std::int64_t optional_int(const flashnext::GgufModel& model, const char* key) {
 
 } // namespace
 
-FlashNextFrontendFiles flashnext_frontend_files(const flashnext::GgufModel& model) {
+FlashNextFrontendFiles flashnext_frontend_files(const flashnext::GgufModel& model, bool vision) {
     if (model.get_string("tokenizer.ggml.model") != "gpt2") {
         throw std::invalid_argument("Flash-Next GGUF tokenizer is not byte-level BPE");
     }
@@ -124,6 +124,30 @@ FlashNextFrontendFiles flashnext_frontend_files(const flashnext::GgufModel& mode
     files.tokenizer_config_json  = config.dump();
     files.generation_config_json = Json{{"eos_token_id", stops}}.dump();
     files.chat_template          = model.get_string("tokenizer.chat_template");
+    if (vision) {
+        const Json pipeline = {
+            {"do_resize", true},
+            {"do_rescale", true},
+            {"do_normalize", true},
+            {"do_convert_rgb", true},
+            {"resample", 3},
+            {"rescale_factor", 1.0 / 255.0},
+            {"image_mean", {0.5, 0.5, 0.5}},
+            {"image_std", {0.5, 0.5, 0.5}},
+            {"patch_size", 16},
+            {"temporal_patch_size", 2},
+            {"merge_size", 2},
+        };
+        Json image   = pipeline;
+        image["size"] = {{"shortest_edge", kFlashNextImageMinPixels}, {"longest_edge", kFlashNextImageMaxPixels}};
+        Json video   = pipeline;
+        video["size"] = {{"shortest_edge", 128ULL * 32ULL * 32ULL}, {"longest_edge", 4ULL * 1024ULL * 1024ULL}};
+        video["fps"]        = 2.0;
+        video["min_frames"] = 4;
+        video["max_frames"] = 768;
+        files.preprocessor_config_json       = image.dump();
+        files.video_preprocessor_config_json = video.dump();
+    }
     return files;
 }
 
@@ -134,6 +158,8 @@ models::qwen3_5::FrontendResources flashnext_frontend_resources(const FlashNextF
     resources.tokenizer_config_json  = files.tokenizer_config_json;
     resources.chat_template_jinja    = files.chat_template;
     resources.generation_config_json = files.generation_config_json;
+    resources.preprocessor_config_json       = files.preprocessor_config_json;
+    resources.video_preprocessor_config_json = files.video_preprocessor_config_json;
     resources.tokenizer              = std::make_shared<const models::qwen3_5::frontend::Tokenizer>(
         models::qwen3_5::frontend::TokenizerResources{
             files.tokenizer_json, files.tokenizer_config_json, files.generation_config_json});

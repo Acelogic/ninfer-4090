@@ -459,6 +459,7 @@ ReferenceConfig ReferenceConfig::from_gguf(const GgufModel & m) {
         c.ple_head_dim = int(m.get_int(key("embedding_length_per_layer_input")));
         c.ple_conv_kernel = int(m.get_int(key("ple.conv_kernel")));
         c.ple_eos = m.get_int(key("ple.eos_token_id"));
+        if (m.has(key("ple.image_token_id"))) c.ple_image_token = m.get_int(key("ple.image_token_id"));
         c.ple_multipliers = m.get_uints(key("ple.layer_multipliers"));
         c.ple_offsets = m.get_uints(key("ple.head_offsets"));
         c.ple_vocab = m.get_uints(key("ple.head_vocab_sizes"));
@@ -516,6 +517,13 @@ struct ReferenceModel::Impl {
     // state
     std::int64_t n_past = 0;
     std::vector<std::int32_t> history;  // every token consumed, by position
+    // rope positions (temporal, height, width) of every position, and the next text token's (1 + the largest so far);
+    // the current forward() call's positions ([3][call_n], axis-major) and input embedding rows, when given
+    std::vector<std::int32_t> rope_pos;
+    std::int64_t rope_next = 0;
+    const std::int32_t * call_positions = nullptr;
+    const float * const * call_embeddings = nullptr;
+    std::int64_t call_n = 0, call_pos0 = 0;
     struct AttnState {
         std::vector<float> k, v;        // [pos][n_head_kv * head_dim], k normed and rotated
         std::vector<float> idx_raw;     // [pos][idx_head_dim], raw indexer keys
@@ -663,6 +671,8 @@ struct ReferenceModel::Impl {
     void reset() {
         n_past = 0;
         history.clear();
+        rope_pos.clear();
+        rope_next = 0;
         const int conv_dim = 2 * cfg.ssm_k_heads * cfg.ssm_state + cfg.ssm_v_heads * cfg.ssm_state;
         attn_state.assign(std::size_t(cfg.n_layer), AttnState{});
         rec_state.assign(std::size_t(cfg.n_layer), RecState{});
@@ -719,11 +729,13 @@ struct ReferenceModel::Impl {
     }
 
     // ---------------------------------------------------------------------------- RoPE
-    // NEOX rotation of the first n_rot dims: pairs (i, i + n_rot/2), angle pos * base^(-2i/n_rot).
-    void rope(float * x, std::int64_t pos) const {
+    // NEOX rotation of the first n_rot dims: pairs (i, i + n_rot/2), angle p * base^(-2i/n_rot) where p is the
+    // temporal, height or width position of the token at `cell` (interleaved multi-axis rope, imrope: pair i's
+    // section is i % 3 with sections [11, 11, 10, 0]; text has the same position in all three).
+    void rope(float * x, std::int64_t cell) const {
         const int half = cfg.n_rot / 2;
         for (int i = 0; i < half; ++i) {
-            const double theta = double(pos) * inv_freq[std::size_t(i)];
+            const double theta = double(rope_pos[std::size_t(cell) * 3 + std::size_t(i % 3)]) * inv_freq[std::size_t(i)];
             const float c = float(std::cos(theta)), s = float(std::sin(theta));
             const float x0 = x[i], x1 = x[i + half];
             x[i] = x0 * c - x1 * s;
@@ -1266,9 +1278,21 @@ struct ReferenceModel::Impl {
             if (tokens[t] < 0 || tokens[t] >= cfg.n_vocab) throw std::runtime_error("reference: token id out of range");
             history.push_back(tokens[t]);
         }
+        // rope positions: the call's, or text continuing after the largest so far
+        const std::int64_t off = n_past - call_pos0;
+        std::int64_t next = rope_next;
+        for (std::int64_t t = 0; t < T; ++t)
+            for (int a = 0; a < 3; ++a) {
+                const std::int64_t p = call_positions ? std::int64_t(call_positions[a * call_n + off + t]) : rope_next + t;
+                rope_pos.push_back(std::int32_t(p));
+                next = std::max(next, p + 1);
+            }
+        rope_next = next;
         std::vector<float> x(std::size_t(T * E));
         parallel_for(pool, T, [&](std::int64_t t, int) {
-            dequantize_row(tok_embd.type, tok_embd.data + std::size_t(tokens[t]) * tok_embd.rb, x.data() + t * E, E);
+            const float * row = call_embeddings ? call_embeddings[off + t] : nullptr;
+            if (row) std::memcpy(x.data() + t * E, row, std::size_t(E) * sizeof(float));
+            else dequantize_row(tok_embd.type, tok_embd.data + std::size_t(tokens[t]) * tok_embd.rb, x.data() + t * E, E);
         });
         live("model.input_embed", -1, T, E, x.data());
 
@@ -1316,6 +1340,22 @@ ReferenceModel::ReferenceModel(const GgufModel & model, ReferenceOptions options
     : impl_(std::make_unique<Impl>(model, options)) {}
 
 ReferenceModel::~ReferenceModel() = default;
+
+std::vector<float> ReferenceModel::forward(const std::vector<std::int32_t> & tokens, bool all_logits, const std::int32_t * positions,
+                                           const float * const * embeddings) {
+    struct Scope {
+        Impl & I;
+        ~Scope() {
+            I.call_positions = nullptr;
+            I.call_embeddings = nullptr;
+        }
+    } scope{*impl_};
+    impl_->call_positions = positions;
+    impl_->call_embeddings = embeddings;
+    impl_->call_n = std::int64_t(tokens.size());
+    impl_->call_pos0 = impl_->n_past;
+    return forward(tokens, all_logits);
+}
 
 std::vector<float> ReferenceModel::forward(const std::vector<std::int32_t> & tokens, bool all_logits) {
     if (tokens.empty()) throw std::runtime_error("reference: forward() needs at least one token");

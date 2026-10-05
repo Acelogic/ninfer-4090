@@ -4,6 +4,7 @@
 #include "flashnext/engine.h"
 #include "flashnext/gguf.h"
 #include "flashnext/shards.h"
+#include "flashnext/vision.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/engine/flashnext_frontend.h"
 #include "runtime/engine/generation_budget.h"
@@ -12,8 +13,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <cstdio>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
+#include <list>
 #include <exception>
 #include <limits>
 #include <mutex>
@@ -62,7 +67,9 @@ void validate_options(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation) { reject("causal scoring"); }
     if (options.max_concurrency != 1) { reject("max_concurrency above 1 (it runs one sequence)"); }
     if (options.speculative.backend != SpeculativeBackend::None) { reject("speculative decoding"); }
-    if (options.enable_vision) { reject("vision input"); }
+    if (options.enable_vision && options.flashnext.vision_path.empty()) {
+        reject("--vision without a vision encoder (images need --flashnext-vision <mmproj.gguf>)");
+    }
     if (options.kv_cache != KvCacheStorage::BFloat16) { reject("KV cache formats"); }
     if (options.auto_save_evicted) { reject("slot auto-save"); }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
@@ -88,9 +95,74 @@ std::uint32_t resolve_draft_tokens(const FlashNextOptions& options) {
     return k;
 }
 
+// Per prompt position, what besides the token id its input is: 0 for text, else a key of the image (its content digest
+// and grid) and of the position's index in it. Prefix reuse compares these with the token ids, since every image
+// position carries the same <|image_pad|> id. An empty vector stands for all zeros (text only).
+using MediaKeys = std::vector<std::uint64_t>;
+
+std::uint64_t media_key_at(const MediaKeys& keys, std::size_t i) noexcept { return i < keys.size() ? keys[i] : 0; }
+
+bool media_equal(const MediaKeys& a, const MediaKeys& b, std::size_t depth) noexcept {
+    for (std::size_t i = 0; i < depth; ++i) {
+        if (media_key_at(a, i) != media_key_at(b, i)) { return false; }
+    }
+    return true;
+}
+
+std::uint64_t image_key(const models::qwen3_5::VisionItem& item) noexcept {
+    std::uint64_t h = 1469598103934665603ull;
+    for (const std::uint8_t b : item.content_digest) { h = (h ^ b) * 1099511628211ull; }
+    for (const std::int32_t v : {item.grid.temporal, item.grid.height, item.grid.width}) {
+        h = (h ^ std::uint64_t(std::uint32_t(v))) * 1099511628211ull;
+    }
+    return h;
+}
+
+MediaKeys prompt_media_keys(const models::qwen3_5::PreparedPromptData& data) {
+    MediaKeys keys;
+    if (!data.has_media()) { return keys; }
+    keys.assign(data.token_ids.size(), 0);
+    for (const auto& item : data.vision_items) {
+        const std::uint64_t key = image_key(item);
+        for (const auto& span : item.token_spans) {
+            for (std::size_t i = 0; i < span.count && span.begin + i < keys.size(); ++i) {
+                keys[span.begin + i] = ((key + i) * 0x9E3779B97F4A7C15ull) | 1u;
+            }
+        }
+    }
+    return keys;
+}
+
+// The frontend stores an image's patches as bf16 of u / 127.5 - 1 (u the 8-bit pixel value, mean and std 0.5): each of
+// the 256 values maps back to its exact pixel, which is normalized in FP32 as llama.cpp does, (u / 255 - 0.5) / 0.5.
+class PatchPixels {
+public:
+    PatchPixels() {
+        table_.fill(-1);
+        for (int u = 0; u < 256; ++u) {
+            std::uint32_t bits = std::bit_cast<std::uint32_t>(float(u) / 127.5f - 1.0f);
+            bits += 0x7fffU + ((bits >> 16U) & 1U);  // the frontend's round-to-nearest-even bf16
+            const auto b = static_cast<std::uint16_t>(bits >> 16U);
+            if (table_[b] >= 0) { throw std::logic_error("Flash-Next: bf16 pixel values collide"); }
+            table_[b] = std::int16_t(u);
+        }
+    }
+    void convert(std::span<const std::uint16_t> in, float* out) const {
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            const int u = table_[in[i]];
+            if (u < 0) { throw std::invalid_argument("Flash-Next: an image patch value is not a normalized pixel"); }
+            out[i] = (float(u) / 255.0f - 0.5f) / 0.5f;
+        }
+    }
+
+private:
+    std::array<std::int16_t, 65536> table_{};
+};
+
 // A host image of the engine's recurrent state at one token frontier.
 struct Snapshot {
     fn::EngineSnapshot state;
+    MediaKeys media;  // the media keys of its positions
     // Next-token logits over the public domain when taken at a prompt end: a later prompt that
     // ends at the same frontier samples from them without executing a token.
     std::vector<float> logits;
@@ -156,6 +228,11 @@ struct FlashNextCore::Request {
     PrefixReusePath prefix_reuse_path    = PrefixReusePath::Root;
     double prefill_seconds               = 0.0;
     double decode_seconds                = 0.0;
+    double vision_seconds                = 0.0;
+    // the media keys of the prompt's positions, and per vision item its rows ([tokens][2560], null when its positions
+    // are reused and need none)
+    MediaKeys media;
+    std::vector<std::shared_ptr<const std::vector<float>>> image_rows;
     SpeculativeStats speculative;
 
     // Consumer channel.
@@ -169,6 +246,12 @@ struct FlashNextCore::Request {
     bool capacity_released = false;
     GenerationResult result;
     std::exception_ptr error;
+};
+
+// A prompt with images as forward() feeds it: its data (positions, image spans) and the request (media keys, image rows).
+struct PromptMedia {
+    const models::qwen3_5::PreparedPromptData* data = nullptr;
+    const FlashNextCore::Request* request           = nullptr;
 };
 
 class FlashNextCore::State {
@@ -196,9 +279,16 @@ public:
         }
         inspect.complete();
 
+        if (!options.flashnext.vision_path.empty()) {
+            // before the engine sizes its expert cache: the encoder keeps its weights in pinned RAM and only a cuBLAS
+            // handle on the device
+            StartupPhaseScope vision_phase(options.startup_observer, StartupPhase::ProgramInitialize);
+            vision = std::make_unique<fn::VisionEncoder>(options.flashnext.vision_path.string());
+            vision_phase.complete();
+        }
         StartupPhaseScope frontend_phase(options.startup_observer,
                                          StartupPhase::FrontendInitialize);
-        files                 = flashnext_frontend_files(*gguf);
+        files                 = flashnext_frontend_files(*gguf, vision != nullptr);
         const auto& embedding = gguf->tensor("token_embd.weight");
         if (embedding.shape.size() < 2 || embedding.shape[1] <= 0 ||
             embedding.shape[1] > std::numeric_limits<std::uint32_t>::max()) {
@@ -207,11 +297,22 @@ public:
         const models::qwen3_5::FrontendResources resources =
             flashnext_frontend_resources(files, static_cast<std::uint32_t>(embedding.shape[1]));
         public_tokens = resources.public_token_count;
+        // with images: up to 32,768 image tokens per prompt (a conversation resends its images every turn), each
+        // image at most 4,096 (kFlashNextImageMaxPixels)
         frontend.emplace(models::qwen3_5::make_frontend(
-            resources, {.chat_template_path = options.chat_template_path,
-                        .architecture       = models::Architecture::Qwen3_5Moe,
-                        .vision_enabled     = false,
-                        .max_context        = capacity}));
+            resources, {.chat_template_path       = options.chat_template_path,
+                        .architecture             = models::Architecture::Qwen3_5Moe,
+                        .vision_enabled           = vision != nullptr,
+                        .max_context              = capacity,
+                        .media_cache_bytes        = options.media_cache_bytes,
+                        .media_live_bytes         = options.media_live_bytes,
+                        .media_preprocess_threads = options.media_preprocess_threads,
+                        .vision_max_tokens        = static_cast<std::uint32_t>(models::qwen3_5::kMaximumPromptVisionTokens)}));
+        if (vision) {
+            const std::vector<int> pad = resources.tokenizer->encode("<|image_pad|>");
+            if (pad.size() != 1) { throw std::invalid_argument("Flash-Next tokenizer has no <|image_pad|> token"); }
+            image_pad = pad[0];
+        }
         frontend_phase.complete();
 
         StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
@@ -237,6 +338,15 @@ public:
         if (draft_tokens != 0 && !engine->has_mtp()) {
             throw std::invalid_argument("the Flash-Next engine did not load the MTP head");
         }
+        if (vision && engine->image_token_id() >= 0 && engine->image_token_id() != image_pad) {
+            throw std::invalid_argument("the model's PLE image token is not the tokenizer's <|image_pad|>");
+        }
+        if (vision && vision->config().out_dim != 2560) {
+            throw std::invalid_argument("the vision encoder's projection does not match the model's width");
+        }
+        std::fprintf(stderr, "Flash-Next: expert cache %.2f GiB (%lld experts)%s\n", engine->stats().cache_gib,
+                     static_cast<long long>(engine->stats().cached_experts),
+                     vision ? "; vision encoder loaded (weights in pinned RAM)" : "");
         program.complete();
 
         load.architecture = std::string(kArchitecture);
@@ -301,8 +411,15 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            if (models::qwen3_5::PreparedPromptAccess::view(prompt).has_media()) {
-                throw std::invalid_argument("the Flash-Next backend serves text prompts only");
+            const auto& view = models::qwen3_5::PreparedPromptAccess::view(prompt);
+            if (view.has_media() && !vision) {
+                throw std::invalid_argument("this Flash-Next server takes text only: images need the vision "
+                                            "encoder (--flashnext-vision <mmproj.gguf>)");
+            }
+            for (const auto& item : view.vision_items) {
+                if (item.modality != models::qwen3_5::PromptModality::Image) {
+                    throw std::invalid_argument("the Flash-Next backend takes images, not video");
+                }
             }
             auto output = frontend->make_output_session(prompt, options.stop, options.output,
                                                         options.execution.thinking);
@@ -451,6 +568,8 @@ public:
     const std::uint32_t draft_tokens;
 
     std::unique_ptr<fn::GgufModel> gguf;
+    std::unique_ptr<fn::VisionEncoder> vision;
+    int image_pad = -1;
     FlashNextFrontendFiles files;
     std::optional<models::qwen3_5::Frontend> frontend;
     std::uint32_t public_tokens = 0;
@@ -527,6 +646,7 @@ private:
         result.timings.prepare_seconds = request.prepare_seconds;
         result.timings.prefill_seconds = request.prefill_seconds;
         result.timings.decode_seconds  = request.decode_seconds;
+        result.timings.vision_seconds  = request.vision_seconds;
         if (request.first_token) {
             result.timings.first_token_seconds =
                 request.prepare_seconds + seconds_between(request.submitted, *request.first_token);
@@ -723,6 +843,7 @@ private:
             live_reusable = false;
             live_tokens   = 0;
             kv_tokens.clear();
+            kv_media.clear();
             engine->reset();
             return true;
         } catch (...) { return false; }
@@ -772,18 +893,56 @@ private:
     // ---------------------------------------------------------------------------------------
     // Sequence state
 
-    // Runs `tokens` at the live frontier and returns the logits of the last one.
     // Runs `tokens` at the live frontier and returns the logits of the last one, or of every one
-    // ([size][n_vocab]) when all_logits is set.
-    std::vector<float> forward(std::span<const TokenId> tokens, bool all_logits = false) {
-        const std::size_t end = static_cast<std::size_t>(live_tokens) + tokens.size();
+    // ([size][n_vocab]) when all_logits is set. With a prompt's media (`media`: the prompt's keys, positions and image
+    // rows; the tokens are prompt positions from the live frontier on) they go with the tokens.
+    std::vector<float> forward(std::span<const TokenId> tokens, bool all_logits = false,
+                               const PromptMedia& media = {}) {
+        const std::size_t begin = live_tokens;
+        const std::size_t end   = begin + tokens.size();
         if (end > capacity) { throw std::logic_error("Flash-Next sequence exceeds max_context"); }
         // The engine records the tokens by position before it executes them.
         if (kv_tokens.size() < end) { kv_tokens.resize(end); }
         std::copy(tokens.begin(), tokens.end(), kv_tokens.begin() + live_tokens);
+        if (!kv_media.empty() || media.data != nullptr) {
+            if (kv_media.size() < kv_tokens.size()) { kv_media.resize(kv_tokens.size(), 0); }
+            for (std::size_t i = begin; i < end; ++i) {
+                kv_media[i] = media.data != nullptr ? media_key_at(media.request->media, i) : 0;
+            }
+        }
+        fn::ForwardInputs inputs;
+        std::vector<std::int32_t> positions;
+        std::vector<const float*> rows;
+        if (media.data != nullptr) {
+            // the frontend's rope positions ([3][prompt] axis-major) and each image position's row
+            const auto& data      = *media.data;
+            const std::size_t n   = data.token_ids.size();
+            const std::size_t len = tokens.size();
+            positions.resize(3 * len);
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                std::copy_n(data.positions.begin() + std::ptrdiff_t(axis * n + begin), len,
+                            positions.begin() + std::ptrdiff_t(axis * len));
+            }
+            rows.assign(len, nullptr);
+            for (std::size_t k = 0; k < data.vision_items.size(); ++k) {
+                for (const auto& span : data.vision_items[k].token_spans) {
+                    const std::size_t lo = std::max(span.begin, begin), hi = std::min(span.begin + span.count, end);
+                    if (lo >= hi) { continue; }
+                    const auto& r = media.request->image_rows[k];
+                    if (!r) { throw std::logic_error("Flash-Next image rows are missing"); }
+                    for (std::size_t i = lo; i < hi; ++i) {
+                        rows[i - begin] = r->data() + (i - span.begin) * kImageWidth;
+                    }
+                }
+            }
+            inputs.positions  = positions.data();
+            inputs.embeddings = rows.data();
+        }
         const auto started = Clock::now();
         std::vector<float> logits =
-            engine->forward(std::vector<std::int32_t>(tokens.begin(), tokens.end()), all_logits);
+            media.data != nullptr
+                ? engine->forward(std::vector<std::int32_t>(tokens.begin(), tokens.end()), all_logits, inputs)
+                : engine->forward(std::vector<std::int32_t>(tokens.begin(), tokens.end()), all_logits);
         live_tokens = static_cast<std::uint32_t>(end);
         check_sequence();
         engine_ns += elapsed_ns(started, Clock::now());
@@ -796,15 +955,17 @@ private:
         }
     }
 
-    [[nodiscard]] bool holds(const std::vector<TokenId>& tokens) const noexcept {
+    [[nodiscard]] bool holds(const std::vector<TokenId>& tokens, const MediaKeys& media) const noexcept {
         return tokens.size() <= kv_tokens.size() &&
-               std::equal(tokens.begin(), tokens.end(), kv_tokens.begin());
+               std::equal(tokens.begin(), tokens.end(), kv_tokens.begin()) &&
+               media_equal(media, kv_media, tokens.size());
     }
 
-    // Drops the snapshots whose tokens the engine no longer holds by position.
+    // Drops the snapshots whose tokens (and images) the engine no longer holds by position.
     void drop_stale_snapshots() {
-        std::erase_if(snapshots,
-                      [&](const Snapshot& snapshot) { return !holds(snapshot.state.tokens); });
+        std::erase_if(snapshots, [&](const Snapshot& snapshot) {
+            return !holds(snapshot.state.tokens, snapshot.media);
+        });
     }
 
     void capture(std::uint32_t depth, PrefixReusePath path, const std::vector<float>* logits) {
@@ -828,6 +989,10 @@ private:
         const auto started = Clock::now();
         Snapshot snapshot;
         snapshot.state     = engine->snapshot();
+        if (std::any_of(kv_media.begin(), kv_media.begin() + std::min<std::size_t>(depth, kv_media.size()),
+                        [](std::uint64_t k) { return k != 0; })) {
+            snapshot.media.assign(kv_media.begin(), kv_media.begin() + depth);
+        }
         snapshot.path      = path;
         snapshot.last_used = ++use_clock;
         if (logits != nullptr) {
@@ -852,13 +1017,14 @@ private:
     // The deepest held state whose tokens begin the prompt: the live sequence when the prompt
     // extends it, else a snapshot, else an empty sequence. A state as long as the prompt needs
     // its next-token logits.
-    BasePlan choose_base(const std::vector<TokenId>& prompt, bool reuse) {
+    BasePlan choose_base(const std::vector<TokenId>& prompt, const MediaKeys& media, bool reuse) {
         BasePlan plan;
         if (!reuse) { return plan; }
         drop_stale_snapshots();
         const std::size_t n = prompt.size();
         if (live_reusable && live_tokens != 0 && live_tokens < n &&
-            std::equal(kv_tokens.begin(), kv_tokens.begin() + live_tokens, prompt.begin())) {
+            std::equal(kv_tokens.begin(), kv_tokens.begin() + live_tokens, prompt.begin()) &&
+            media_equal(kv_media, media, live_tokens)) {
             plan = BasePlan{.depth = live_tokens, .path = PrefixReusePath::PrivateEndpoint};
         }
         for (std::size_t index = 0; index < snapshots.size(); ++index) {
@@ -868,7 +1034,8 @@ private:
                 continue;
             }
             if (!std::equal(snapshot.state.tokens.begin(), snapshot.state.tokens.end(),
-                            prompt.begin())) {
+                            prompt.begin()) ||
+                !media_equal(snapshot.media, media, depth)) {
                 continue;
             }
             plan = BasePlan{.depth = depth, .snapshot = index, .path = snapshot.path};
@@ -914,13 +1081,15 @@ private:
         // nothing reusable behind.
         const bool reuse =
             reuse_enabled && request.options.execution.allow_prefix_reuse && data.identity.reusable;
-        const BasePlan base          = choose_base(prompt, reuse);
+        request.media                = prompt_media_keys(data);
+        const BasePlan base          = choose_base(prompt, request.media, reuse);
         request.reused_prompt_tokens = base.depth;
         request.prefix_reuse_path    = base.path;
         publish_sequence(&request, true);
         publish_generation_start(request);
 
         const Clock::time_point prefill_started  = Clock::now();
+        encode_images(request, data, base.depth);
         std::optional<std::vector<float>> logits = prefill(request, data, base, reuse);
         // The sequence the engine holds is now exact for its tokens, whatever happens next.
         live_reusable = reuse;
@@ -963,6 +1132,65 @@ private:
         decode(request, budget, std::move(*logits), static_cast<std::uint32_t>(n));
     }
 
+    // The rows of every image whose positions the prompt still computes (those after `depth`): from the cache of
+    // encoded images (by content and grid), else encoded now in VRAM the expert cache lends until the prompt runs.
+    void encode_images(Request& request, const models::qwen3_5::PreparedPromptData& data, std::uint32_t depth) {
+        request.image_rows.assign(data.vision_items.size(), nullptr);
+        if (!data.has_media()) { return; }
+        const auto started = Clock::now();
+        std::vector<std::size_t> todo;
+        std::vector<std::pair<std::size_t, std::size_t>> same;  // (item, earlier item of the same image)
+        std::size_t max_patches = 0;
+        for (std::size_t k = 0; k < data.vision_items.size(); ++k) {
+            const auto& item = data.vision_items[k];
+            const bool needed = std::any_of(item.token_spans.begin(), item.token_spans.end(), [&](const auto& span) {
+                return span.begin + span.count > depth;
+            });
+            if (!needed) { continue; }
+            const std::uint64_t key = image_key(item);
+            const auto hit = std::find_if(image_cache.begin(), image_cache.end(), [&](const auto& e) { return e.first == key; });
+            if (hit != image_cache.end()) {
+                image_cache.splice(image_cache.end(), image_cache, hit);  // most recently used last
+                request.image_rows[k] = hit->second;
+                continue;
+            }
+            const auto twin = std::find_if(todo.begin(), todo.end(), [&](std::size_t j) { return image_key(data.vision_items[j]) == key; });
+            if (twin != todo.end()) {
+                same.emplace_back(k, *twin);
+                continue;
+            }
+            todo.push_back(k);
+            max_patches = std::max(max_patches, std::size_t(item.grid.height) * std::size_t(item.grid.width));
+        }
+        if (!todo.empty()) {
+            void* workspace = engine->lend_vram(vision->workspace_bytes(int(max_patches)));
+            std::vector<float> patches;
+            for (const std::size_t k : todo) {
+                const auto& item    = data.vision_items[k];
+                const auto& payload = data.media_payloads.at(k);
+                const int gh = item.grid.height, gw = item.grid.width;
+                const std::size_t count = std::size_t(gh) * std::size_t(gw);
+                if (!payload || item.grid.temporal != 1 || payload->patch_elements != count * std::size_t(vision->patch_values())) {
+                    throw std::logic_error("Flash-Next image patches do not match the image's grid");
+                }
+                patches.resize(payload->patch_elements);
+                patch_pixels.convert(payload->span(), patches.data());
+                auto rows = std::make_shared<std::vector<float>>(count / 4 * kImageWidth);
+                vision->encode(patches.data(), gh, gw, workspace, rows->data());
+                request.image_rows[k] = rows;
+                image_cache.emplace_back(image_key(item), rows);
+                image_cache_bytes += rows->size() * sizeof(float);
+                ++images_encoded;
+            }
+            while (image_cache_bytes > kImageCacheBytes && image_cache.size() > 1) {
+                image_cache_bytes -= image_cache.front().second->size() * sizeof(float);
+                image_cache.pop_front();
+            }
+        }
+        for (const auto& [k, j] : same) { request.image_rows[k] = request.image_rows[j]; }
+        request.vision_seconds = seconds_between(started, Clock::now());
+    }
+
     // Establishes the base state and executes the rest of the prompt, capturing snapshots at the
     // frontend's frontiers. Empty when the request was cancelled first.
     std::optional<std::vector<float>> prefill(Request& request,
@@ -987,6 +1215,7 @@ private:
         } else if (base.depth == 0) {
             engine->reset();
             kv_tokens.clear();
+            kv_media.clear();
             live_tokens = 0;
             snapshots.clear(); // the engine no longer holds any position
         }
@@ -1031,7 +1260,8 @@ private:
             if (request.cancelled.load(std::memory_order_acquire)) { return std::nullopt; }
             expire_waiting();
             const std::uint32_t end = std::min(splits[next], cursor + kPrefillPieceTokens);
-            logits = forward(std::span<const TokenId>(prompt).subspan(cursor, end - cursor));
+            logits = forward(std::span<const TokenId>(prompt).subspan(cursor, end - cursor), false,
+                             data.has_media() ? PromptMedia{&data, &request} : PromptMedia{});
             request.computed_prompt_tokens += end - cursor;
             cursor = end;
             if (cursor == splits[next]) { ++next; }
@@ -1293,6 +1523,14 @@ private:
     // Worker-owned sequence state. kv_tokens mirrors the engine's positional token history (what
     // its attention caches hold); live_tokens is the engine's n_past.
     std::vector<TokenId> kv_tokens;
+    MediaKeys kv_media;  // the media keys of those positions (empty while there were no images)
+    // encoded images by content (image_key), least recently used first, within kImageCacheBytes
+    static constexpr std::size_t kImageWidth      = 2560;
+    static constexpr std::size_t kImageCacheBytes = std::size_t(512) << 20;
+    std::list<std::pair<std::uint64_t, std::shared_ptr<const std::vector<float>>>> image_cache;
+    std::size_t image_cache_bytes = 0;
+    std::uint64_t images_encoded  = 0;
+    PatchPixels patch_pixels;
     std::uint32_t live_tokens = 0;
     bool live_reusable        = false;
     // Wall time inside the engine since the last accounted unit.

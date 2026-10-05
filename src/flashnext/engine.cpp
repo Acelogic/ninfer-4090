@@ -171,6 +171,17 @@ struct Engine::Impl {
     // current sequence, later ones are left over from a sequence that was abandoned by restore()
     std::vector<std::int32_t> history;
     std::int64_t n_past = 0;
+    // Rope positions (ops.h, kRopeAxes) of the same cells, [cell][3], and a key of each cell's input: 0 for the token's
+    // own embedding, else a hash of the embedding row it was given (snapshots check both). rope_next is the rope
+    // position of the next text token: 1 + the largest so far (after an image, text continues after its largest row or
+    // column position). rope_before is its value before the last step (rollback()).
+    std::vector<std::int32_t> rope_hist;
+    std::vector<std::uint64_t> input_key;
+    std::int64_t rope_next = 0, rope_before = 0;
+    // The current forward() call's extra inputs (null: text) and its length and first position.
+    const ForwardInputs * call = nullptr;
+    std::size_t call_n = 0;
+    std::int64_t call_pos0 = 0;
 
     // VRAM expert cache: per layer a pool of slots and the expert -> slot map (host and device)
     struct LayerCache {
@@ -192,7 +203,10 @@ struct Engine::Impl {
         LayerCache experts;  // all 512, slot = expert id
         fc::DeviceBuffer step, pending_h, h_in, e_in, en, hn, cat, res, dtok;
         std::unique_ptr<Pinned<float>> h_e;
-        Pinned<std::int64_t> h_step{1};
+        // {pos0} then the pass's rope table [T][3] (int32), uploaded with every pass
+        std::unique_ptr<Pinned<std::int64_t>> h_step;
+        std::int32_t * rope_host() const { return reinterpret_cast<std::int32_t *>(h_step->get() + 1); }
+        const std::int32_t * rope_dev() const { return reinterpret_cast<const std::int32_t *>(step.as<std::int64_t>() + 1); }
         Pinned<std::int32_t> h_tok{1};
         std::int64_t pos = 0;
         std::int64_t ring = 0;
@@ -228,9 +242,21 @@ struct Engine::Impl {
     fc::DeviceBuffer slots, eh, ypairs;   // decode steps: one row per (token, expert) pair
     fc::DeviceBuffer gpu_sum, batch_ws;   // prompt chunks: the cached experts' sum per token, and the batch kernels' workspace
 
-    // step state read by the kernels: {pos0, seq}, uploaded at the start of every step
-    fc::DeviceBuffer d_step, d_error;
-    Pinned<std::int64_t> h_step{2};
+    // step state read by the kernels: {pos0, seq}, then (steps of up to kMaxTokens tokens) the rope table: rows -3 ..
+    // T-1 of [3] int32 (the 3 cells before the step for QSA block keys, then the step's tokens); uploaded at the
+    // start of every step. Longer steps (prompt chunks) upload their table to d_rope.
+    static constexpr int kRopePre = 3;
+    static constexpr int kStepWords = 2 + ((fc::kMaxTokens + kRopePre) * fc::kRopeAxes + 1) / 2;
+    fc::DeviceBuffer d_step, d_error, d_rope;
+    Pinned<std::int64_t> h_step{kStepWords};
+    std::unique_ptr<Pinned<std::int32_t>> h_rope;
+    std::size_t rope_cap = 0;  // tokens d_rope / h_rope hold
+    std::int32_t * step_table_host(int T) { return T <= fc::kMaxTokens ? reinterpret_cast<std::int32_t *>(h_step.get() + 2) : h_rope->get(); }
+    // row 0 of the step's rope table in device memory (the table starts kRopePre rows earlier)
+    const std::int32_t * step_rope(int T) const {
+        const std::int32_t * base = T <= fc::kMaxTokens ? reinterpret_cast<const std::int32_t *>(d_step.as<std::int64_t>() + 2) : d_rope.as<std::int32_t>();
+        return base + kRopePre * fc::kRopeAxes;
+    }
     std::int64_t seq = 0;
     std::unique_ptr<Pinned<float>> h_logits;  // [kMaxTokens][n_vocab]
     // CUDA-graph mode: one graph per token count, experts handed to the CPU through mapped memory
@@ -441,7 +467,9 @@ struct Engine::Impl {
         M.experts.dmap = fc::DeviceBuffer(fc::kExperts * sizeof(std::int32_t));
         check(cudaMemcpy(M.experts.dmap.get(), M.experts.map.data(), M.experts.dmap.bytes(), cudaMemcpyHostToDevice), "MTP map");
         const std::size_t T = std::size_t(cap), f = sizeof(float);
-        M.step = zeros(sizeof(std::int64_t));
+        const std::size_t step_words = 1 + (T * fc::kRopeAxes + 1) / 2;
+        M.step = zeros(step_words * sizeof(std::int64_t));
+        M.h_step = std::make_unique<Pinned<std::int64_t>>(step_words);
         M.pending_h = zeros(HCD * f);
         M.h_in = fc::DeviceBuffer(T * HCD * f);
         M.e_in = fc::DeviceBuffer(T * E * f);
@@ -459,7 +487,7 @@ struct Engine::Impl {
     // pair is returned.
     std::int32_t mtp_pass(int T, std::int64_t pos0, bool want_draft) {
         Mtp & M = *mtp;
-        M.h_step.get()[0] = pos0;
+        M.h_step->get()[0] = pos0;
         if (T == 1 && want_draft && opt.cuda_graphs) {
             // a draft pass is replayed as one CUDA graph (positions and inputs come from pinned memory)
             if (!M.graph) {
@@ -490,7 +518,9 @@ struct Engine::Impl {
         Mtp & M = *mtp;
         Layer & L = M.L;
         const std::int64_t * pos = M.step.as<std::int64_t>();
-        check(cudaMemcpyAsync(M.step.get(), M.h_step.get(), sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "MTP step");
+        check(cudaMemcpyAsync(M.step.get(), M.h_step->get(), sizeof(std::int64_t) + std::size_t(T) * fc::kRopeAxes * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice, stream),
+              "MTP step");
         check(cudaMemcpyAsync(M.e_in.get(), M.h_e->get(), std::size_t(T) * fc::kEmbd * sizeof(float), cudaMemcpyHostToDevice, stream), "MTP embed");
         // inputs: per-stream RMSNorm of the hidden streams, RMSNorm of the embedding, concatenated per stream
         fc::hc_norm(M.h_in.as<float>(), M.hnorm.as<float>(), M.hn.as<float>(), T, cfg.rms_eps, stream);
@@ -505,7 +535,7 @@ struct Engine::Impl {
         ring.v = L.v_cache.as<half>();
         ring.ring = M.ring;
         fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
-                      q.as<float>(), qgate.as<float>(), ring, pos, T, cfg.rms_eps, stream);
+                      q.as<float>(), qgate.as<float>(), ring, pos, M.rope_dev(), T, cfg.rms_eps, stream);
         // the most recent 2051 positions (llama.cpp attends densely; drafts are verified either way), as ring rows
         fc::window_cells(pos, T, fc::kQsaWidth, cells.as<std::int32_t>(), n_cells.as<std::int32_t>(), stream, M.ring);
         fc::attn_sparse(q.as<float>(), qgate.as<float>(), L.k_cache.as<half>(), L.v_cache.as<half>(), cells.as<std::int32_t>(),
@@ -554,6 +584,7 @@ struct Engine::Impl {
         // mtp_skip_below are never read (their hidden rows are in this step, so the next pair still has its input)
         if (M.pos < mtp_skip_below) M.pos = std::min(mtp_skip_below, end);
         const std::size_t hb = fc::kHcd * sizeof(float);
+        bool caught_up = false;
         for (bool first = true; M.pos < end; first = false) {
             const int n = int(std::min<std::int64_t>(end - M.pos, cap));  // the MTP buffers hold cap tokens
             if (!first) check(cudaStreamSynchronize(stream), "MTP");  // h_e is refilled below
@@ -561,12 +592,18 @@ struct Engine::Impl {
                 const std::int64_t q = M.pos + i;
                 const float * src = q - 1 < rows_pos0 ? M.pending_h.as<float>() : res.as<float>() + std::size_t(q - 1 - rows_pos0) * fc::kHcd;
                 check(cudaMemcpyAsync(M.h_in.as<float>() + std::size_t(i) * fc::kHcd, src, hb, cudaMemcpyDeviceToDevice, stream), "MTP h");
+                // an image position embeds its token id (the image token), as the MTP head reads token ids
                 mtp_embed(i, history[std::size_t(q)]);
+                for (int a = 0; a < fc::kRopeAxes; ++a)
+                    M.rope_host()[i * fc::kRopeAxes + a] = rope_hist[std::size_t(q) * fc::kRopeAxes + std::size_t(a)];
             }
             mtp_pass(n, M.pos, false);
             trace_mtp_pass("catch-up", n, M.pos);
             M.pos += n;
+            caught_up = true;
         }
+        // the pass read h_e and the rope table from pinned memory: the next pass may refill them only after that
+        if (caught_up) check(cudaStreamSynchronize(stream), "MTP");
         // the next pair starts from the hidden state of the last kept position
         check(cudaMemcpyAsync(M.pending_h.get(), res.as<float>() + std::size_t(rows_valid - 1) * fc::kHcd, hb, cudaMemcpyDeviceToDevice, stream),
               "MTP h");
@@ -630,6 +667,7 @@ struct Engine::Impl {
             const float * src = i == 0 ? M.pending_h.as<float>() : M.res.as<float>();
             check(cudaMemcpyAsync(M.h_in.get(), src, hb, cudaMemcpyDeviceToDevice, stream), "MTP h");
             mtp_embed(0, tok);
+            for (int a = 0; a < fc::kRopeAxes; ++a) M.rope_host()[a] = std::int32_t(rope_next + i);  // text positions
             tok = mtp_pass(1, n_past + i, true);
             trace_mtp_pass("draft", 1, n_past + i);
             if (tok < 0 || tok >= cfg.n_vocab) {
@@ -666,6 +704,10 @@ struct Engine::Impl {
             }
             if (ple_table) fc::ple_hist_rebuild(ple_hist_prev.as<float>(), ple_norm.as<float>(), ple_hist.as<float>(), n_keep, stream);
             n_past -= last_T - n_keep;
+            rope_next = rope_before;
+            for (std::int64_t c = n_past - n_keep; c < n_past; ++c)
+                for (int a = 0; a < fc::kRopeAxes; ++a)
+                    rope_next = std::max<std::int64_t>(rope_next, std::int64_t(rope_hist[std::size_t(c) * fc::kRopeAxes + std::size_t(a)]) + 1);
             rows_valid = n_keep;
             if (mtp && mtp->pos > n_past) mtp->pos = n_past;
         }
@@ -820,6 +862,9 @@ struct Engine::Impl {
         require(cfg.n_embd == fc::kEmbd && cfg.hc == fc::kHc && cfg.hc_rank == fc::kHcRank, "hidden size / hyper-connections");
         require(cfg.n_head == fc::kHeads && cfg.n_head_kv == fc::kKvHeads && cfg.head_dim == fc::kHeadDim && cfg.n_rot == fc::kRot,
                 "attention heads");
+        // rotated pair i turns with axis i % 3 (ops.h, rope_position): interleaved sections [11, 11, 10, 0] over 32 pairs
+        require(cfg.rope_sections[0] == 11 && cfg.rope_sections[1] == 11 && cfg.rope_sections[2] == 10 && cfg.rope_sections[3] == 0,
+                "rope sections");
         require(cfg.ssm_state == fc::kDnState && cfg.ssm_k_heads == fc::kDnKHeads && cfg.ssm_v_heads == fc::kDnVHeads &&
                     cfg.ssm_conv == fc::kDnConv,
                 "Gated DeltaNet");
@@ -979,8 +1024,12 @@ struct Engine::Impl {
         logits = fc::DeviceBuffer(std::size_t(fc::kMaxTokens) * cfg.n_vocab * f);
         attn_work = fc::DeviceBuffer(fc::attn_sparse_work_floats(int(T)) * f);
         slots = fc::DeviceBuffer(T * fc::kUsed * sizeof(std::int32_t));
-        d_step = zeros(2 * sizeof(std::int64_t));
+        d_step = zeros(kStepWords * sizeof(std::int64_t));
         d_error = zeros(sizeof(int));
+        // rope tables of prompt chunks (decode steps carry theirs in d_step)
+        rope_cap = std::size_t(opt.prefill_lend ? std::max(cap, opt.prefill_chunk_max) : cap);
+        d_rope = fc::DeviceBuffer((rope_cap + kRopePre) * fc::kRopeAxes * sizeof(std::int32_t));
+        h_rope = std::make_unique<Pinned<std::int32_t>>((rope_cap + kRopePre) * fc::kRopeAxes);
         h_logits = std::make_unique<Pinned<float>>(std::size_t(fc::kMaxTokens) * cfg.n_vocab);
         const std::size_t link_bytes = std::size_t(cfg.n_layer) * sizeof(fc::ExpertLink);
         check(cudaHostAlloc(reinterpret_cast<void **>(&link_h), link_bytes, cudaHostAllocMapped | cudaHostAllocPortable), "expert link");
@@ -1025,6 +1074,9 @@ struct Engine::Impl {
         check(cudaMemset(ple_hist.get(), 0, ple_hist.bytes()), "memset");
         history.clear();
         n_past = 0;
+        rope_hist.clear();
+        input_key.clear();
+        rope_next = rope_before = 0;
         rows_pos0 = 0;
         rows_valid = 0;
         snaps_valid = false;
@@ -1056,8 +1108,9 @@ struct Engine::Impl {
         return v;
     }
 
+    // the buffers, then the MTP position (with MTP), the next rope position and the inputs' digest
     std::size_t state_bytes() {
-        std::size_t bytes = mtp ? sizeof(std::int64_t) : 0;
+        std::size_t bytes = (mtp ? sizeof(std::int64_t) : 0) + 2 * sizeof(std::int64_t);
         for (fc::DeviceBuffer * b : state_buffers()) bytes += b->bytes();
         return bytes;
     }
@@ -1074,7 +1127,12 @@ struct Engine::Impl {
             check(cudaMemcpy(snap.state.data() + off, b->get(), b->bytes(), cudaMemcpyDeviceToHost), "snapshot");
             off += b->bytes();
         }
-        if (mtp) std::memcpy(snap.state.data() + off, &mtp->pos, sizeof(std::int64_t));
+        if (mtp) {
+            std::memcpy(snap.state.data() + off, &mtp->pos, sizeof(std::int64_t));
+            off += sizeof(std::int64_t);
+        }
+        const std::int64_t tail[2] = {rope_next, std::int64_t(inputs_digest(n_past))};
+        std::memcpy(snap.state.data() + off, tail, sizeof(tail));
         return snap;
     }
 
@@ -1083,6 +1141,10 @@ struct Engine::Impl {
         if (n > history.size() || !std::equal(snap.tokens.begin(), snap.tokens.end(), history.begin()))
             throw std::runtime_error("engine: the caches no longer hold this snapshot's tokens");
         if (snap.state.size() != state_bytes()) throw std::runtime_error("engine: snapshot from a different model");
+        std::int64_t tail[2] = {0, 0};  // the next rope position, the inputs' digest
+        std::memcpy(tail, snap.state.data() + snap.state.size() - sizeof(tail), sizeof(tail));
+        if (std::uint64_t(tail[1]) != inputs_digest(std::int64_t(n)))
+            throw std::runtime_error("engine: the caches no longer hold this snapshot's inputs (positions or embedding rows differ)");
         check(cudaStreamSynchronize(stream), "restore");
         std::size_t off = 0;
         for (fc::DeviceBuffer * b : state_buffers()) {
@@ -1090,6 +1152,7 @@ struct Engine::Impl {
             off += b->bytes();
         }
         n_past = std::int64_t(n);
+        rope_next = rope_before = tail[0];
         rows_pos0 = n_past;
         rows_valid = 0;
         snaps_valid = false;
@@ -1184,13 +1247,73 @@ struct Engine::Impl {
         }
     }
 
-    // The host inputs of T tokens at pos0.. (history already holds them): embeddings into hx, PLE rows into hple.
-    // Reads only the history and the model, so it can run on a thread while the GPU runs another step.
-    void prepare_host(const std::int32_t * tokens, int T, std::int64_t pos0, float * hx, float * hple) const {
+    // The host inputs of T tokens at pos0.. (history already holds them): embeddings into hx (rows[t] when given: an
+    // image's), PLE rows into hple. Reads only the history, the rows and the model, so it can run on a thread while the
+    // GPU runs another step.
+    void prepare_host(const std::int32_t * tokens, const float * const * rows, int T, std::int64_t pos0, float * hx, float * hple) const {
         const std::size_t rb = row_bytes(tok_embd->type, fc::kEmbd);
-        for (int t = 0; t < T; ++t)
-            dequantize_row(tok_embd->type, tok_embd->data + std::size_t(tokens[t]) * rb, hx + std::size_t(t) * fc::kEmbd, fc::kEmbd);
+        for (int t = 0; t < T; ++t) {
+            float * dst = hx + std::size_t(t) * fc::kEmbd;
+            if (rows && rows[t]) std::memcpy(dst, rows[t], fc::kEmbd * sizeof(float));
+            else dequantize_row(tok_embd->type, tok_embd->data + std::size_t(tokens[t]) * rb, dst, fc::kEmbd);
+        }
         if (ple_table) ple_host(T, pos0, hple);
+    }
+
+    // A key of an input embedding row (FNV-1a over its 64-bit words; never 0, which marks a token's own embedding).
+    static std::uint64_t row_key(const float * row) {
+        std::uint64_t h = 1469598103934665603ull, w = 0;
+        const unsigned char * b = reinterpret_cast<const unsigned char *>(row);
+        for (std::size_t i = 0; i < fc::kEmbd * sizeof(float); i += sizeof(w)) {
+            std::memcpy(&w, b + i, sizeof(w));
+            h = (h ^ w) * 1099511628211ull;
+        }
+        return h | 1;
+    }
+
+    // The step's embedding rows (null: token embeddings only): those of the forward() call's tokens from the step's on.
+    const float * const * call_rows(std::int64_t pos0) const {
+        return call && call->embeddings ? call->embeddings + (pos0 - call_pos0) : nullptr;
+    }
+
+    // The rope table of a step of T tokens at pos0 (rows -kRopePre .. T-1, see step_rope) and the positions' entries in
+    // rope_hist and input_key. Positions come from the forward() call, or continue the text after rope_next.
+    // Returns rope_next after the step.
+    std::int64_t prepare_rope(int T, std::int64_t pos0) {
+        if (T > fc::kMaxTokens && std::size_t(T) > rope_cap) throw std::runtime_error("engine: step longer than its rope table");
+        const std::size_t need = std::size_t(pos0 + T);
+        if (rope_hist.size() < need * fc::kRopeAxes) rope_hist.resize(need * fc::kRopeAxes);
+        if (input_key.size() < need) input_key.resize(need);
+        std::int32_t * tab = step_table_host(T);
+        for (int r = 0; r < kRopePre; ++r) {  // QSA block keys turn with their first member, up to 3 cells back
+            const std::int64_t c = pos0 - kRopePre + r;
+            for (int a = 0; a < fc::kRopeAxes; ++a) tab[r * fc::kRopeAxes + a] = c >= 0 ? rope_hist[std::size_t(c) * fc::kRopeAxes + std::size_t(a)] : 0;
+        }
+        std::int32_t * rows = tab + kRopePre * fc::kRopeAxes;
+        const std::int32_t * given = call ? call->positions : nullptr;
+        const std::size_t off = std::size_t(pos0 - call_pos0);
+        const float * const * emb = call_rows(pos0);
+        std::int64_t next = rope_next;
+        for (int t = 0; t < T; ++t) {
+            for (int a = 0; a < fc::kRopeAxes; ++a) {
+                const std::int64_t p = given ? std::int64_t(given[std::size_t(a) * call_n + off + std::size_t(t)]) : rope_next + t;
+                rows[t * fc::kRopeAxes + a] = std::int32_t(p);
+                rope_hist[std::size_t(pos0 + t) * fc::kRopeAxes + std::size_t(a)] = std::int32_t(p);
+                next = std::max(next, p + 1);
+            }
+            input_key[std::size_t(pos0 + t)] = emb && emb[t] ? row_key(emb[t]) : 0;
+        }
+        return next;
+    }
+
+    // A digest of the rope positions and input keys of cells [0, n): a snapshot is valid only for the same inputs.
+    std::uint64_t inputs_digest(std::int64_t n) const {
+        if (rope_hist.size() < std::size_t(n) * fc::kRopeAxes || input_key.size() < std::size_t(n))
+            throw std::runtime_error("engine: no inputs recorded for every position");
+        std::uint64_t h = 1469598103934665603ull;
+        for (std::size_t i = 0; i < std::size_t(n) * fc::kRopeAxes; ++i) h = (h ^ std::uint64_t(std::uint32_t(rope_hist[i]))) * 1099511628211ull;
+        for (std::size_t i = 0; i < std::size_t(n); ++i) h = (h ^ input_key[i]) * 1099511628211ull;
+        return h;
     }
 
     void run_ple(const Layer & L, int il, int T) {
@@ -1236,7 +1359,7 @@ struct Engine::Impl {
             kv_store.v = L.v_cache.as<half>();
         }
         fc::attn_prep(qfull.as<float>(), k.as<float>(), v.as<float>(), L.q_norm.as<float>(), L.k_norm.as<float>(), rope_freq.as<double>(),
-                      q.as<float>(), qgate.as<float>(), kv_store, pos, T, cfg.rms_eps, stream);
+                      q.as<float>(), qgate.as<float>(), kv_store, pos, step_rope(T), T, cfg.rms_eps, stream);
         emit("Qcur", il, q.get(), n_past, T, fc::kHeads * fc::kHeadDim);
         emit("indexer_k_raw", il, kraw.get(), n_past, T, fc::kIdxDim);
         // QSA: block keys and selections are kept from the first token on, so that past 2051 tokens
@@ -1410,19 +1533,25 @@ struct Engine::Impl {
             for (int t = 0; t < T; ++t) history[std::size_t(pos0 + t)] = tokens[t];
             ensure_host(T);
             const auto t0 = clk::now();
-            prepare_host(tokens, T, pos0, h_x->get(), h_ple->get());
+            prepare_host(tokens, call_rows(pos0), T, pos0, h_x->get(), h_ple->get());
             if (T > fc::kMaxTokens) prof.add_host("prepare (embeddings, PLE rows)", std::chrono::duration<double, std::milli>(clk::now() - t0).count());
         }
         prepared_ahead = false;
+        rope_after = prepare_rope(T, pos0);
         h_step.get()[0] = pos0;
         h_step.get()[1] = ++seq;
     }
+    std::int64_t rope_after = 0;  // rope_next after the prepared step
 
     // Every GPU operation of a step, in order; host-free in graph mode, so it can be captured.
     // head_rows: how many of the last tokens get logits (at most kMaxTokens)
     void enqueue(int T, int head_rows) {
         const std::int64_t pos0 = n_past;
-        check(cudaMemcpyAsync(d_step.get(), h_step.get(), 2 * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "step");
+        const std::size_t table = std::size_t(T + kRopePre) * fc::kRopeAxes * sizeof(std::int32_t);
+        check(cudaMemcpyAsync(d_step.get(), h_step.get(), 2 * sizeof(std::int64_t) + (T <= fc::kMaxTokens ? table : 0), cudaMemcpyHostToDevice,
+                              stream),
+              "step");
+        if (T > fc::kMaxTokens) to_device(d_rope.get(), h_rope->get(), table);
         to_device(x.get(), h_x->get(), std::size_t(T) * fc::kEmbd * sizeof(float));
         if (!graph_mode) upload_batch_positions(T);
         // the first layers' experts copy and convert while the GPU starts on the chunk (after this step's small
@@ -1526,6 +1655,8 @@ struct Engine::Impl {
             hook("result_output", -1, pos0 + t_first, n_out, cfg.n_vocab, lg.data());
         }
         n_past += T;
+        rope_before = rope_next;
+        rope_next = rope_after;
         rows_pos0 = pos0;
         rows_valid = T;
         snaps_valid = mtp && T <= fc::kMaxTokens;
@@ -1821,6 +1952,8 @@ struct Engine::Impl {
         if (bytes > arena_bytes) throw std::runtime_error("engine: prompt buffers larger than the expert cache");
         check(cudaStreamSynchronize(stream), "lend");
         const std::size_t lo = arena_bytes - bytes;
+        // a region lent already (lend_vram, then a prompt) stays lent: only the slots below it are added
+        const std::size_t lo_prev = arena_bytes - lent_bytes;
         std::vector<bool> touched(std::size_t(cfg.n_layer), false);
         for (int il = 0; il < cfg.n_layer; ++il) {
             LayerCache & C = cache[std::size_t(il)];
@@ -1831,15 +1964,16 @@ struct Engine::Impl {
             for (int e = 0; e < fc::kExperts; ++e)
                 if (C.map[std::size_t(e)] >= 0) expert_of[std::size_t(C.map[std::size_t(e)])] = e;
             for (std::size_t s = 0; s < n_slots; ++s) {
-                if (pool_off[std::size_t(il)] + (s + 1) * sb <= lo) continue;
+                const std::size_t end = pool_off[std::size_t(il)] + (s + 1) * sb;
+                if (end <= lo || (lent_bytes && end > lo_prev)) continue;
                 if (expert_of[s] >= 0) C.map[std::size_t(expert_of[s])] = -1;
                 lent_slots[std::size_t(il)].push_back(int(s));
                 touched[std::size_t(il)] = true;
             }
         }
         upload_maps(touched);
-        lent_bytes = bytes;
-        stats.lent_gib = double(bytes) / double(1 << 30);
+        lent_bytes = std::max(lent_bytes, bytes);
+        stats.lent_gib = double(lent_bytes) / double(1 << 30);
         return cache_arena.as<std::uint8_t>() + lo;
     }
 
@@ -2288,15 +2422,16 @@ struct Engine::Impl {
     // scratch stay that small (the results are the same as in one pass: every query and block is computed alone).
     void qsa_index(Layer & L, int T) {
         const std::int64_t * pos = d_step.as<std::int64_t>();
+        const std::int32_t * rope = step_rope(T);
         const int nb = (T + kQsaBatch - 1) / kQsaBatch;
         auto pos_of = [&](int b) { return nb == 1 ? pos : d_pos.as<std::int64_t>() + b; };
         for (int b = 0; b < nb; ++b) {
             const int t0 = b * kQsaBatch, n = std::min(kQsaBatch, T - t0);
             fc::store_rows(kraw.as<float>() + std::size_t(t0) * fc::kIdxDim, L.idx_raw.as<float>(), pos_of(b), fc::kIdxDim, n, raw_ring(), stream);
             fc::qsa_update_blocks(L.idx_raw.as<float>(), raw_ring(), L.idx_k_norm.as<float>(), rope_freq.as<double>(), L.blocks.as<float>(),
-                                  pos_of(b), n, cfg.rms_eps, stream);
+                                  pos_of(b), rope + std::size_t(t0) * fc::kRopeAxes, n, cfg.rms_eps, stream);
         }
-        fc::qsa_query(qi.as<float>(), L.idx_q_norm.as<float>(), rope_freq.as<double>(), pos, T, cfg.rms_eps, stream);
+        fc::qsa_query(qi.as<float>(), L.idx_q_norm.as<float>(), rope_freq.as<double>(), pos, rope, T, cfg.rms_eps, stream);
         for (int b = 0; b < nb; ++b) {
             const int t0 = b * kQsaBatch, n = std::min(kQsaBatch, T - t0);
             fc::qsa_select(qi.as<float>() + std::size_t(t0) * fc::kQsaHeads * fc::kQsaDim, L.blocks.as<float>(), pos_of(b), n, opt.max_ctx,
@@ -2402,7 +2537,8 @@ struct Engine::Impl {
                     const std::int64_t pn = n_past + plan[c].T;
                     float * hx = h_x_alt->get();
                     float * hp = h_ple_alt->get();
-                    ahead = std::async(std::launch::async, [this, nt, tn, pn, hx, hp] { prepare_host(nt, tn, pn, hx, hp); });
+                    const float * const * nr = call_rows(pn);
+                    ahead = std::async(std::launch::async, [this, nt, nr, tn, pn, hx, hp] { prepare_host(nt, nr, tn, pn, hx, hp); });
                 }
                 stream_chunk = plan[c].stream;
                 last = step(tokens + i, plan[c].T, false);
@@ -2432,7 +2568,10 @@ struct Engine::Impl {
     // the lent buffers), the permanent buffers come back, the lent VRAM is refilled with experts, and the cache
     // is re-ranked from the prompt's routing (with adapt).
     void end_prompt(bool adapt) {
-        if (!bound_T) return;
+        if (!bound_T) {  // VRAM lent to work outside the model (lend_vram) comes back now
+            if (lent_bytes) refill();
+            return;
+        }
         mtp_catchup();
         unbind_prompt();
         if (adapt) {
@@ -2446,6 +2585,35 @@ struct Engine::Impl {
 
 Engine::Engine(const GgufModel & model, EngineOptions options) : impl_(std::make_unique<Impl>(model, options)) {}
 Engine::~Engine() = default;
+
+std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, bool all_logits, const ForwardInputs & inputs) {
+    if (!inputs.positions && !inputs.embeddings) return forward(tokens, all_logits);
+    Impl & I = *impl_;
+    const std::size_t n = tokens.size();
+    if (inputs.positions)
+        for (std::size_t i = 0; i < 3 * n; ++i)
+            if (inputs.positions[i] < 0) throw std::runtime_error("engine: negative rope position");
+    if (inputs.embeddings && I.cfg.ple_image_token >= 0)
+        for (std::size_t i = 0; i < n; ++i)
+            if (inputs.embeddings[i] && tokens[i] != I.cfg.ple_image_token)
+                throw std::runtime_error("engine: an embedding row at a position whose token is not the image token");
+    struct Scope {
+        Impl & I;
+        ~Scope() { I.call = nullptr; }
+    } scope{I};
+    I.call = &inputs;
+    I.call_n = n;
+    I.call_pos0 = I.n_past;
+    return forward(tokens, all_logits);
+}
+
+std::int64_t Engine::next_position() const { return impl_->rope_next; }
+std::int32_t Engine::image_token_id() const { return std::int32_t(impl_->cfg.ple_image_token); }
+void * Engine::lend_vram(std::size_t bytes) {
+    Impl & I = *impl_;
+    if (I.bound_T) I.end_prompt(false);  // a bound prompt's buffers (after its MTP catch-up) go back first
+    return I.lend(bytes);
+}
 
 std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, bool all_logits) {
     if (tokens.empty()) throw std::runtime_error("engine: forward() needs at least one token");

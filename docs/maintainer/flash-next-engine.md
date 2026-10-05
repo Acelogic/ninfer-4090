@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next in NInfer Extreme
 
-Status: the engine runs end to end at full context with speculative decoding and KV streaming, 2026-10-05.
+Status: the engine runs end to end at full context with speculative decoding, KV streaming and image
+input, 2026-10-05.
 
 This document plans a Flash-Next runtime tailored to one machine: an RTX 4090 that also drives the
 desktop (about 22.5 GiB usable), a Ryzen 9 7950X (16 cores, AVX-512 with VNNI), and 192 GiB of
@@ -239,6 +240,60 @@ MIT):
   `kv_stage_borrow()`, section 3.5); only with `prefill_lend = false` does the engine keep a pool of
   its own (`kv_stage_cells`, default the window).
 
+### 3.10 Images
+
+The model reads images through Qwen3-VL's vision tower, shipped for llama.cpp as `mmproj-F16.gguf`
+(`general.architecture = clip`, `clip.projector_type = qwen3vl_merger`; the same file serves the base and
+the Huihui model, whose abliteration does not touch vision). The reference is llama.cpp's mtmd
+(`tools/mtmd/models/qwen3vl.cpp`, `mtmd-helper.cpp`) and its `qwen4exp` graph.
+
+- **Encoder** (`vision.{h,cpp}`, `cuda/vision.{h,cu}`): 27 pre-norm ViT layers of 1152 (16 heads of 72,
+  2-D rope over the patch row and column, bidirectional attention, GELU-tanh MLP of 4304), a learned
+  48 x 48 position embedding resized bilinearly (aligned corners) to the patch grid, and the merger:
+  LayerNorm per patch, 2x2 patches as one 4608-wide row, 4608 -> GELU -> 2560. Patches are 16 x 16 with
+  the frame repeated (the two temporal kernels side by side as one 1152 x 1536 matrix). FP32 activations,
+  F16 weights converted exactly to FP32 for cuBLAS SGEMM (no TF32), an FP32 tiled attention kernel with
+  online softmax. The merger's GELU is exact (erf), as the model defines it (llama.cpp uses the tanh
+  approximation; on the test images the choice changes nothing measurable next to llama.cpp's own
+  rounding).
+- **VRAM.** None between images. The weights (0.9 GB, F16) live in pinned RAM. An encode borrows its
+  workspace from the expert cache (`Engine::lend_vram`, the same lending prompts use: about 270 MiB plus
+  65 KiB per patch, 356 MiB for a 1024-token image) and streams one layer's weights (30 MB) at a time into
+  a double-buffered stage, overlapped with the previous layer. The lent experts come back at the next step
+  that needs the cache (or the prompt binds its own buffers over the same region).
+- **Preprocessing** is the Qwen3.5 frontend's (decode, bicubic resize to multiples of 32 within the pixel
+  budget, 2x2-block patch order). The budget is llama.cpp's for this projector: 8 to 4,096 tokens per
+  image (8,192 to 4,194,304 pixels). The frontend hands patches over as bf16 of `u / 127.5 - 1`; each
+  value maps back to its 8-bit pixel, normalized in FP32 as llama.cpp does.
+- **Positions.** The model's rope is interleaved multi-axis (sections `[11, 11, 10, 0]` over the 32
+  rotated pairs: pair i turns with the temporal, height or width position, i % 3). An image's tokens share
+  the temporal position p of their first token and count rows and columns from p (`t = p, h = p + row,
+  w = p + col`); text after the image continues at `p + max(rows, cols)`, the largest position so far plus
+  one (mtmd and Qwen3-VL's `get_rope_index` alike). `Engine::forward(tokens, all_logits, ForwardInputs)`
+  takes these per token (`[3][n]`) with the image rows that replace the token embeddings; without them,
+  text continues after `next_position()`. The KV cell stays the token's index in the sequence (causal
+  attention in sequence order, as llama.cpp's 2-D causal mask orders an image's cells raster-wise), and
+  QSA blocks are 4 consecutive cells (llama.cpp's `indexer_kpool_by_order`), each block key turned with
+  its first member's positions. Kernels read a per-step position table (`ops.h`, `kRopeAxes`; decode
+  steps upload theirs with the step record inside the CUDA graph, prompt chunks with their inputs), rows
+  -3 .. T-1 so that blocks completed by the step find their first member. The MTP layer turns its queries
+  and keys with the same positions.
+- **PLE.** An image position carries the token id `qwen4exp.ple.image_token_id` (248056,
+  `<|image_pad|>`), which the n-gram hash reads there and in the n-grams of the tokens after it, in
+  sequence order (llama.cpp's behaviour when an image is decoded in one ubatch).
+- **MTP.** The catch-up feeds image positions the image token's embedding (the MTP head reads token ids,
+  as in llama.cpp and Strata); drafts are verified, so this affects only acceptance.
+- **State.** `rope_next` (the next text position) travels with snapshots; `restore()` also checks a digest
+  of the cells' positions and embedding-row hashes, so a snapshot cannot resume over a different image with
+  the same token ids. `rollback()` restores it from the kept tokens.
+- **Server** (`flashnext_core.cpp`, `--flashnext-vision <mmproj.gguf>`): images in OpenAI chat
+  (`image_url`), Responses and Anthropic messages, through the shared frontend (media cache, decode,
+  `<|vision_start|><|image_pad|>...<|vision_end|>`, positions). Before a prompt runs, the images whose
+  positions it still computes are encoded (or taken from a 512 MiB cache of encoded images keyed by content
+  digest and grid). Prefix reuse compares, besides token ids, a per-position media key (image digest, grid
+  and index), so snapshots and the live sequence are reused across turns that resend the same images. Video
+  is rejected. The request log reports `vision_tokens` and the encode time (`vision`).
+
 ## 4. Measurements (RTX 4090 + Ryzen 9 7950X)
 
 | Configuration | Result |
@@ -389,6 +444,82 @@ Checks on the merged tree:
   experts round activations to 8 bits, so the continuation differs in the last bits, as it did before
   this work. Follow-ups of 3,072, 6,144 and 500 tokens after 24K: 1,396, 2,555 and 327 tok/s.
 
+### 4.3 Images
+
+Tools: `fn_vision` (`tools/flashnext/fn_vision.cpp`) and llama.cpp's side, `vision_ref`
+(`tools/flashnext/llama_ref/`, a CPU build against the llama.cpp checkout; FP32 attention, the whole
+prompt in one ubatch). Test images: a photograph (448 x 448, 196 tokens), an editor screenshot with an
+error trace (800 x 480, 375), a bar chart (640 x 480, 300), a 1024 x 1024 wallpaper (1,024), all with
+sides that are multiples of 32 so that both sides see the same pixels.
+
+The encoder, against a double-precision CPU reference of the same formulas (`fn_vision --cpu-ref`),
+relative L2 error of the rows:
+
+| Image | Tokens | Ours | llama.cpp | Ours vs llama.cpp (mean cosine) |
+|---|---:|---:|---:|---:|
+| chart | 300 | 5.7e-6 | 1.0e-3 | 1.0e-3 (0.9999993) |
+| photo | 196 | 2.8e-6 | 1.9e-3 | 1.9e-3 (0.9999984) |
+| screenshot | 375 | | | 2.1e-3 (0.9999982) |
+| wallpaper | 1,024 | | | 5.6e-3 (0.9999827) |
+
+llama.cpp's error is its own (activations rounded to f16 for the F16 weights and in flash attention, a
+table GELU); the merger's GELU variant changes nothing at these digits.
+
+Encode time on the GPU (`fn_vision --repeat 3`, warm, idle machine; the stages from
+`NINFER_FN_VISION_PROFILE=1`), and llama.cpp on the CPU (16 threads) for comparison:
+
+| Image | Patches | Tokens | Encode | Attention | Other layers (QKV, MLP, merger) | Workspace lent | llama.cpp CPU |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 448 x 448 | 784 | 196 | 37 ms | 6 ms | 29 ms | 272 MiB | 1.6 s |
+| 640 x 480 | 1,200 | 300 | 52 ms | 11 ms | 39 ms | 283 MiB | 2.7 s |
+| 800 x 480 | 1,500 | 375 | 59 ms | 14 ms | 43 ms | 290 MiB | 4.0 s |
+| 1024 x 1024 | 4,096 | 1,024 | 204 ms | 100 ms | 100 ms | 356 MiB | 19.5 s |
+| 1920 x 1088 | 8,160 | 2,040 | 653 ms | 450 ms | 195 ms | 458 MiB | |
+| 2048 x 2048 | 16,384 | 4,096 (the most per image) | 2.07 s | 1.69 s | 0.37 s | 666 MiB | |
+
+Small images are bound by the weights' copy (0.9 GB per image over PCIe, hidden behind the layers from
+about 1,000 patches on); large ones by the attention (quadratic in the patches, about 18 TFLOPS on the
+CUDA cores; the GEMMs run at about 35 TFLOPS). The first encode after the server starts adds about
+40 ms (cuBLAS set-up).
+
+The whole model on image prompts, against llama.cpp on the CPU (`vision_ref case`, then
+`fn_vision --case`; first next-token logits and 24 greedy tokens; "llama rows" feeds llama.cpp's image
+rows to our engine, isolating the language model):
+
+| Prompt | Tokens (image) | First logits vs llama.cpp: rel L2, top-10 shared | Greedy tokens equal |
+|---|---:|---|---|
+| text only (control) | 67 (0) | 0.085, 10 | 24 of 24 |
+| chart | 325 (300) | 0.32, 8 (llama rows: 0.33, 8) | 18 of 24, a near-tie, then the same (llama rows: 24 of 24) |
+| photo + screenshot | 618 (571) | 0.36, 10 (llama rows: 0.34, 10) | 5 of 24, then synonyms ("rugged coastline" for "coastal landscape") and back in step |
+| 2,900 tokens of notes + chart (QSA sparse, positions shifted) | 3,288 (300) | 0.20, 8 | 24 of 24 |
+
+Top-1 agrees everywhere. With images the logits sit further from llama.cpp's than with text; our rows
+and llama.cpp's give the same continuations, so the differences come from the language model's rounding,
+not from the encoder or the positions. Against the FP32 reference model on the same inputs
+(`fn_vision --compare-ref`, chart prompt): rel L2 3.4e-2 with top-10 identical (0.15 and 9 of the top 10
+with llama.cpp's rows in both), in line with text prompts of that length (section 4.2: expert selections
+that flip at near-ties).
+
+Text-only work is unchanged. `fn_generate --hash` with a pinned cache gives bitwise the same prompt, decode,
+verify and draft hashes as main for the oracle prompts p1 (with the snapshot test), p2 and p3, the
+2,600-token prompt at 262K with MTP 3 and a 7,800-token prompt fed in pieces of 1,536 with MTP. Decode,
+`fn_generate -n 256` at 64K, three alternating runs each: code without MTP 53.5 tok/s (main) and 53.7 (this
+tree), chat with MTP 2 89.8 and 90.1. The server with `--flashnext-vision` keeps 3 experts fewer in its
+cache (11.16 against 11.17 GiB: the cuBLAS handle) and the encoder's 0.9 GB in pinned RAM; text requests
+decode and prefill as before (23.6K-token prompt: 2,759 tok/s with the encoder loaded, 2,763 on main).
+
+Through the server (`ninfer-serve --flashnext-vision`, 262K window, MTP 3, temperature 0): a photograph
+described, an error screenshot read verbatim (port, exception, quoted value), a chart's values, a follow-up
+turn reusing 595 of 628 tokens, an image in the middle of a conversation (402 of 436 reused), two images
+told apart, a 1920 x 1080 screenshot resized to 60 x 34 tokens (encode 0.66 s, TTFT 3.5 s), the Anthropic
+endpoint, a 66,652-token prompt with an image at its end (both the planted codename and the chart value;
+TTFT 24.9 s, decode 44 tok/s), an image across the boundary of the server's 8,192-token prompt pieces, and
+a six-turn conversation fed piecewise with images in two turns (MTP on, no invalid drafts): all correct on
+the base model and on Huihui. In `fn_vision`, the chart prompt fed in pieces of 100 tokens (the image split
+three times) and the 3,288-token prompt in pieces of 1,000 keep all 24 greedy tokens equal to llama.cpp's. An image that a conversation resends is
+neither encoded nor computed again: its turn reuses the cached prompt (TTFT 0.3 s) and the encoded-image
+cache serves new prompts with it.
+
 ## 5. Next
 
 1. Prompts: the streamed experts are now about a quarter of a chunk's GPU time and overlap their
@@ -400,3 +531,7 @@ Checks on the merged tree:
 2. Find why a short request through the server decodes slower than `fn_generate` with the same
    window (46 against 77 tok/s; different prompts, so measure like for like first).
 3. Higher-precision expert quantizations within the RAM budget, and an evaluation through Pi.
+4. Images: the encoder's attention is FP32 on the CUDA cores and dominates large images (quadratic in
+   the patches: about 70% of a 1,024-token image's encode); better register tiling, or tensor cores with
+   split fp16 operands, would cut it. The MTP catch-up could feed image rows instead of the image token's
+   embedding. Video (the frontend already samples frames) needs the temporal positions and timestamps.

@@ -372,7 +372,8 @@ __global__ void __launch_bounds__(kHeadDim) k_attn_prep(const float * __restrict
                                                         const float * __restrict__ v, const float * __restrict__ q_norm,
                                                         const float * __restrict__ k_norm, const double * __restrict__ inv_freq,
                                                         float * __restrict__ q, float * __restrict__ gate, const KvStore st,
-                                                        const std::int64_t * __restrict__ pos0p, float eps) {
+                                                        const std::int64_t * __restrict__ pos0p, const std::int32_t * __restrict__ rpos,
+                                                        float eps) {
     __shared__ float ys[kHeadDim];
     __shared__ float sh[32];
     const int t = blockIdx.x, hh = blockIdx.y, d = threadIdx.x;
@@ -385,7 +386,7 @@ __global__ void __launch_bounds__(kHeadDim) k_attn_prep(const float * __restrict
     __syncthreads();
     float y0 = 0.0f, y1 = 0.0f;
     if (d < kRot / 2) {
-        const double theta = double(pos) * inv_freq[d];
+        const double theta = double(rope_position(rpos, pos, t, d)) * inv_freq[d];
         const float c = float(cos(theta)), s = float(sin(theta));
         const float x0 = ys[d], x1 = ys[d + kRot / 2];
         y0 = x0 * c - x1 * s;
@@ -813,12 +814,19 @@ void dn_recurrence(const float * conv_out, const float * z, const float * beta, 
 }
 
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
-               const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0, int T, float eps,
-               cudaStream_t s) {
+               const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0,
+               const std::int32_t * rope_pos, int T, float eps, cudaStream_t s) {
     if (!store.k || !store.v || (store.k2 && !store.v2) || (store.page_table && (!store.kp || !store.vp)))
         throw std::runtime_error("attn_prep: incomplete K/V store");
-    k_attn_prep<<<dim3(T, kHeads + kKvHeads), kHeadDim, 0, s>>>(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, store, pos0, eps);
+    k_attn_prep<<<dim3(T, kHeads + kKvHeads), kHeadDim, 0, s>>>(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, store, pos0, rope_pos,
+                                                                eps);
     launched("attn_prep");
+}
+
+void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
+               const double * rope_inv_freq, float * q, float * gate, const KvStore & store, const std::int64_t * pos0, int T, float eps,
+               cudaStream_t s) {
+    attn_prep(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, store, pos0, nullptr, T, eps, s);
 }
 
 void attn_prep(const float * q_full, const float * k, const float * v, const float * q_norm, const float * k_norm,
@@ -827,7 +835,7 @@ void attn_prep(const float * q_full, const float * k, const float * v, const flo
     KvStore st;
     st.k = k_cache;
     st.v = v_cache;
-    attn_prep(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, st, pos0, T, eps, s);
+    attn_prep(q_full, k, v, q_norm, k_norm, rope_inv_freq, q, gate, st, pos0, nullptr, T, eps, s);
 }
 
 std::size_t attn_work_floats(int T) { return std::size_t(kAttnMaxChunks) * kKvHeads * kGroup * T * kAttnStride; }

@@ -120,7 +120,7 @@
       ]
     },
     "qwen3.8-flash-next": {
-      "label": "Qwen3.8 Flash-Next (GGUF UD-IQ4_XS, MTP up to 3, 262K, text)",
+      "label": "Qwen3.8 Flash-Next (GGUF UD-IQ4_XS, MTP up to 3, 262K, vision)",
       "file": "qwen3.8-flash-next\\UD-IQ4_XS\\Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
       "args": [
         "--max-context",
@@ -130,11 +130,13 @@
         "--flashnext-draft",
         "3",
         "--flashnext-routing-stats",
-        "flash-next-routing.bin"
+        "flash-next-routing.bin",
+        "--flashnext-vision",
+        "models\\qwen3.8-flash-next\\mmproj-F16.gguf"
       ]
     },
     "qwen3.8-flash-next-huihui": {
-      "label": "Qwen3.8 Flash-Next Huihui abliterated (UD-IQ4_XS recipe, MTP up to 3, 262K, text)",
+      "label": "Qwen3.8 Flash-Next Huihui abliterated (UD-IQ4_XS recipe, MTP up to 3, 262K, vision)",
       "file": "qwen3.8-flash-next-huihui\\UD-IQ4_XS\\Huihui-Qwen3.8-Flash-Next-abliterated-UD-IQ4_XS-00001-of-00003.gguf",
       "args": [
         "--max-context",
@@ -144,7 +146,9 @@
         "--flashnext-draft",
         "3",
         "--flashnext-routing-stats",
-        "flash-next-huihui-routing.bin"
+        "flash-next-huihui-routing.bin",
+        "--flashnext-vision",
+        "models\\qwen3.8-flash-next\\mmproj-F16.gguf"
       ]
     }
   },

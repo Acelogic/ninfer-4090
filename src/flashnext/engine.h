@@ -106,6 +106,19 @@ struct KvStreamStats {
     bool overflow = false;
 };
 
+// Inputs of a forward() call beyond its token ids, for prompts with images.
+struct ForwardInputs {
+    // Rope positions of the call's n tokens, axis-major [3][n]: temporal, height, width (the model's interleaved
+    // multi-axis rope; Qwen3-VL's layout: an image's tokens share the temporal position p and count rows from p in
+    // height and columns from p in width; text has the same position in all three). Null: text positions that
+    // continue after the largest position so far (next_position()).
+    const std::int32_t * positions = nullptr;
+    // Per token, the input embedding ([2560] floats: a vision encoder's output row) that replaces the token's own
+    // embedding, or null. Such a token's id must be Engine::image_token_id(), which the PLE n-gram hash reads there.
+    // A null array: every token embeds its id.
+    const float * const * embeddings = nullptr;
+};
+
 // The recurrent state after a sequence of tokens: DeltaNet recurrent and conv states, the PLE conv
 // history and the raw indexer keys of the incomplete QSA blocks, plus the tokens themselves. Attention keys and values (and indexer keys) stay in the
 // engine's caches, by position, so a snapshot is valid while those positions still hold its tokens.
@@ -124,6 +137,16 @@ public:
     // Consumes `tokens` at positions n_past() .. and returns the logits of the last one ([n_vocab]),
     // or of every new token ([size][n_vocab]) when all_logits is set.
     std::vector<float> forward(const std::vector<std::int32_t> & tokens, bool all_logits = false);
+    // The same with rope positions and input embeddings (images). Without them, forward() continues text positions.
+    std::vector<float> forward(const std::vector<std::int32_t> & tokens, bool all_logits, const ForwardInputs & inputs);
+    // The rope position of the next text token: one past the largest position so far (n_past() until an image).
+    std::int64_t next_position() const;
+    // The token id that image positions carry (qwen4exp.ple.image_token_id), -1 if the model names none.
+    std::int32_t image_token_id() const;
+    // Lends `bytes` of expert-cache VRAM to work outside the model (the vision encoder): the experts there leave the
+    // cache until the next forward() or draft() takes the memory back (a long prompt binds its buffers over it). The
+    // engine's stream is idle when this returns. Returns its device address.
+    void * lend_vram(std::size_t bytes);
 
     void reset();
     std::int64_t n_past() const;
@@ -133,9 +156,9 @@ public:
     // About 116 MiB of state; a few milliseconds.
     EngineSnapshot snapshot() const;
     // Returns to a snapshot taken earlier. Valid when the caches still hold the snapshot's tokens at
-    // their positions, i.e. nothing different was processed at those positions since (checked; throws
-    // otherwise). Typical use: snapshot at the end of each prompt, restore it when the next request
-    // extends that prompt.
+    // their positions, i.e. nothing different was processed at those positions since (checked, with the
+    // positions' rope positions and input embedding rows; throws otherwise). Typical use: snapshot at the
+    // end of each prompt, restore it when the next request extends that prompt.
     void restore(const EngineSnapshot & snapshot);
     int n_vocab() const;
     void set_activation_hook(EngineHook hook);  // slow: synchronizes and copies every activation

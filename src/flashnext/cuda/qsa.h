@@ -35,11 +35,18 @@ void qsa_update_blocks(const float * idx_raw, const float * k_norm, const double
 // raw keys only until it is complete, so raw_rows >= T + 3 suffices instead of the whole context.
 void qsa_update_blocks(const float * idx_raw, std::int64_t raw_rows, const float * k_norm, const double * rope_inv_freq, float * blocks,
                        const std::int64_t * pos0, int T, float eps, cudaStream_t s);
+// With rope positions (ops.h, kRopeAxes): block b turns with the positions of its first member, row 4b - pos0 of
+// rope_pos [T][3], so the table must also hold the 3 rows before it (rope_pos[-9 .. -1]). Null: position 4b.
+void qsa_update_blocks(const float * idx_raw, std::int64_t raw_rows, const float * k_norm, const double * rope_inv_freq, float * blocks,
+                       const std::int64_t * pos0, const std::int32_t * rope_pos, int T, float eps, cudaStream_t s);
 
 // 2. Indexer queries, in place: q [T][4][128] (the indexer.q_proj output) -> per-head RMSNorm with
 // q_norm [128], then rotation at position pos0 + t.
 void qsa_query(float * q, const float * q_norm, const double * rope_inv_freq, const std::int64_t * pos0, int T, float eps,
                cudaStream_t s);
+// With rope positions rope_pos [T][3] (ops.h, kRopeAxes); null: positions pos0 + t.
+void qsa_query(float * q, const float * q_norm, const double * rope_inv_freq, const std::int64_t * pos0, const std::int32_t * rope_pos,
+               int T, float eps, cudaStream_t s);
 
 // 3. Selection. For token t at position p = pos0 + t, cells [t][0 .. n_cells[t]) receives the sorted
 // cells it attends to: 0..p while p + 1 <= 2051 (dense), otherwise the best 2051 - tail cells of the
