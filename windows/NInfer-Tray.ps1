@@ -29,14 +29,24 @@ New-Item -ItemType Directory -Force -Path $leaseDir | Out-Null
 
 function Write-Log([string]$text) { Add-Content -LiteralPath $logFile -Value "[$(Get-Date -Format s)] $text" }
 
-# 'running' with the served model ids, 'loading' while the port is up but not answering, or 'stopped'.
+# Whether the server Start-NInfer.ps1 recorded is still that process. A big model loads for minutes before its
+# port opens, and the tray must not take that time for a stopped engine.
+function Test-EngineProcess {
+    try {
+        $rec = Get-Content -Raw -LiteralPath (Join-Path $configDir 'server-process.json') | ConvertFrom-Json
+        $p = Get-Process -Id $rec.pid -ErrorAction Stop
+        return $p.Path -eq $rec.executable
+    } catch { return $false }
+}
+
+# 'running' with the served model ids, 'loading' while the server process runs but does not answer yet, or 'stopped'.
 function Get-EngineState {
     try {
         $ids = @((Invoke-RestMethod "$($cfg.endpoint)/v1/models" -TimeoutSec 2).data | ForEach-Object id)
         return @{ state = 'running'; models = $ids }
     } catch {
         $listening = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
-        return @{ state = $(if ($listening) { 'loading' } else { 'stopped' }); models = @() }
+        return @{ state = $(if ($listening -or (Test-EngineProcess)) { 'loading' } else { 'stopped' }); models = @() }
     }
 }
 
@@ -54,8 +64,11 @@ function Get-Leases {
             $lease = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json
             $proc = Get-Process -Id $lease.pid -ErrorAction SilentlyContinue
             $started = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$lease.startedMs).LocalDateTime
-            $alive = $proc -and $proc.ProcessName -eq 'node' -and [Math]::Abs(($proc.StartTime - $started).TotalSeconds) -lt 10
-            [pscustomobject]@{ file = $_.FullName; alive = [bool]$alive; startedBackend = [bool]$lease.startedBackend }
+            $why = if (-not $proc) { 'no such process' } elseif ($proc.ProcessName -ne 'node') { "pid is now $($proc.ProcessName)" } else {
+                # StartTime can be unreadable (another user's or an elevated process); then the pid and name have to do
+                try { if ([Math]::Abs(($proc.StartTime - $started).TotalSeconds) -ge 10) { "pid reused (started $($proc.StartTime))" } } catch { $null }
+            }
+            [pscustomobject]@{ file = $_.FullName; alive = -not $why; why = $why; startedBackend = [bool]$lease.startedBackend }
         } catch { }
     }
 }
@@ -65,7 +78,12 @@ function Clear-Leases { Get-ChildItem -LiteralPath $leaseDir -Filter '*.json' -E
 # Only the leases of Pi sessions that are gone. A live session's lease must survive the moments the engine is down
 # while Pi switches models or the next one loads: Pi writes it once when it starts the engine, so a lease cleared
 # then is never written again, and killing that Pi afterwards left the engine loaded.
-function Remove-DeadLeases { Get-Leases | Where-Object { -not $_.alive } | ForEach-Object { Remove-Item -Force -LiteralPath $_.file -ErrorAction SilentlyContinue } }
+function Remove-DeadLeases {
+    Get-Leases | Where-Object { -not $_.alive } | ForEach-Object {
+        Write-Log "lease $(Split-Path -Leaf $_.file) removed: $($_.why)"
+        Remove-Item -Force -LiteralPath $_.file -ErrorAction SilentlyContinue
+    }
+}
 
 function Stop-Engine([string]$reason) {
     Write-Log "stopping engine: $reason"
@@ -150,6 +168,7 @@ $timer.add_Tick({
             # find this one still holding the mutex and quit, and nothing would watch the next engine).
             if (@(Get-Leases | Where-Object alive).Count) { $script:stoppedSince = Get-Date }
             if ($cfg.exitWhenStopped -and ((Get-Date) - $script:stoppedSince).TotalSeconds -gt 15) {
+                Write-Log 'exiting: the engine is stopped and no Pi session holds a lease'
                 $timer.Stop(); $notify.Visible = $false; [System.Windows.Forms.Application]::Exit()
             }
             return
@@ -160,7 +179,11 @@ $timer.add_Tick({
         $anyAlive = @($leases | Where-Object alive).Count -gt 0
         # Two polls in a row (about 6 s) so a Pi session that is just restarting doesn't trigger it.
         if ($autoItem.Checked -and $piStarted -and -not $anyAlive) { $script:deadPolls++ } else { $script:deadPolls = 0 }
-        if ($script:deadPolls -ge 2) { $script:deadPolls = 0; Stop-Engine 'Every Pi session using it has exited.' }
+        if ($script:deadPolls -ge 2) {
+            $script:deadPolls = 0
+            Write-Log ('leases: ' + (($leases | ForEach-Object { "$(Split-Path -Leaf $_.file) ($($_.why))" }) -join ', '))
+            Stop-Engine 'Every Pi session using it has exited.'
+        }
     } catch { Write-Log "tick: $($_.Exception.Message)" }
 })
 $timer.Start()
