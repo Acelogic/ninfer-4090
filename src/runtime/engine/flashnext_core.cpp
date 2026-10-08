@@ -22,6 +22,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <span>
@@ -263,6 +264,9 @@ public:
           reuse_enabled(options.context_cache.enabled),
           snapshot_capacity(options.context_cache.enabled ? options.context_cache.host_state_slots
                                                           : 0U),
+          park_budget(options.context_cache.enabled && options.context_cache.host_state_slots != 0
+                          ? std::size_t(options.flashnext.park_mib) << 20
+                          : 0),
           routing_stats(options.flashnext.routing_stats.string()),
           draft_tokens(resolve_draft_tokens(options.flashnext)) {
         validate_options(options);
@@ -563,6 +567,7 @@ public:
     const std::chrono::milliseconds pending_timeout;
     const bool reuse_enabled;
     const std::uint32_t snapshot_capacity;
+    const std::size_t park_budget;  // host RAM for parked conversations (bytes); 0: none are kept
     const std::string routing_stats;
     // Tokens the MTP head drafts per decode step; zero without speculative decoding.
     const std::uint32_t draft_tokens;
@@ -1044,6 +1049,158 @@ private:
     }
 
     // ---------------------------------------------------------------------------------------
+    // Parked conversations
+    //
+    // The engine holds one sequence by position. A request that does not continue it (a client's side task such as
+    // a compaction summary, or another session) overwrites it from the depth it shares, and the conversation's next
+    // turn then reads everything again: minutes at a few hundred thousand tokens. Instead the held conversation is
+    // parked first (its positions and deepest snapshots copied to host RAM, about a second) and copied back when a
+    // later request continues it.
+
+    static constexpr std::uint32_t kParkMinTokens   = 16384; // shorter conversations are read again quickly
+    static constexpr std::uint32_t kUnparkMinGain   = 4096;  // resume this much deeper than what is held, or not at all
+    static constexpr std::size_t kParkedSnapshots   = 3;     // the deepest snapshots kept with a parked conversation
+
+    // The deepest snapshot of `pool` that begins the prompt (0: none).
+    static std::uint32_t resumable_depth(const std::vector<Snapshot>& pool, const std::vector<TokenId>& prompt,
+                                         const MediaKeys& media) {
+        std::uint32_t best = 0;
+        for (const Snapshot& snapshot : pool) {
+            const std::uint32_t depth = snapshot.depth();
+            if (depth <= best || depth > prompt.size() || (depth == prompt.size() && snapshot.logits.empty())) {
+                continue;
+            }
+            if (std::equal(snapshot.state.tokens.begin(), snapshot.state.tokens.end(), prompt.begin()) &&
+                media_equal(snapshot.media, media, depth)) {
+                best = depth;
+            }
+        }
+        return best;
+    }
+
+    // Parks the held conversation when the next request keeps only its first `keep` positions and discards most of
+    // it (a request that keeps most of it continues the conversation: its tail is the last answer, replaced). A
+    // sequence still live past its last snapshot is snapshotted first, so it resumes where it ended. `protect` (a
+    // last_used value) names a parked conversation that must not be dropped to make room. True when parked.
+    bool park_held(std::uint32_t keep, std::optional<std::uint64_t> protect = std::nullopt) {
+        if (park_budget == 0) { return false; }
+        drop_stale_snapshots();
+        std::uint32_t end = live_reusable ? live_tokens : 0;
+        for (const Snapshot& snapshot : snapshots) { end = std::max(end, snapshot.depth()); }
+        if (end < kParkMinTokens || keep > end / 2 || end - keep < kParkMinTokens) { return false; }
+        // the snapshots the request keeps stay in use: no capture below may evict one of them
+        for (Snapshot& snapshot : snapshots) {
+            if (snapshot.depth() <= keep) { snapshot.last_used = ++use_clock; }
+        }
+        if (live_reusable && live_tokens == end) { capture(end, PrefixReusePath::PrivateEndpoint, nullptr); }
+        std::vector<std::size_t> deep;
+        for (std::size_t i = 0; i < snapshots.size(); ++i) {
+            if (snapshots[i].depth() > keep) { deep.push_back(i); }
+        }
+        std::sort(deep.begin(), deep.end(),
+                  [&](std::size_t a, std::size_t b) { return snapshots[a].depth() > snapshots[b].depth(); });
+        if (deep.empty() || snapshots[deep.front()].depth() != end) { return false; }
+        if (deep.size() > kParkedSnapshots) { deep.resize(kParkedSnapshots); }
+
+        // room first: the estimate is the positions plus the snapshots, as Parked::bytes counts them
+        std::size_t bytes = engine->park_bytes(end);
+        for (const std::size_t i : deep) {
+            const Snapshot& snapshot = snapshots[i];
+            bytes += snapshot.state.state.size() + snapshot.state.tokens.size() * sizeof(std::int32_t) +
+                     snapshot.logits.size() * sizeof(float) + snapshot.media.size() * sizeof(std::uint64_t);
+        }
+        if (bytes > park_budget) {
+            std::fprintf(stderr, "Flash-Next: a %u-token conversation (%.1f GiB) does not fit --flashnext-park-mib; not parked\n",
+                         end, double(bytes) / double(1 << 30));
+            return false;
+        }
+        while (parked_bytes + bytes > park_budget) {
+            auto oldest = parked.end();
+            for (auto it = parked.begin(); it != parked.end(); ++it) {
+                if (protect && it->last_used == *protect) { continue; }
+                if (oldest == parked.end() || it->last_used < oldest->last_used) { oldest = it; }
+            }
+            if (oldest == parked.end()) {
+                std::fprintf(stderr, "Flash-Next: no room to park a %u-token conversation; not parked\n", end);
+                return false;
+            }
+            std::fprintf(stderr, "Flash-Next: dropped a parked %lld-token conversation for room\n",
+                         static_cast<long long>(oldest->positions.end));
+            parked_bytes -= oldest->bytes();
+            parked.erase(oldest);
+        }
+
+        const auto started = Clock::now();
+        Parked entry;
+        try {
+            entry.positions = engine->park(end);
+        } catch (const std::bad_alloc&) {  // parking only reads the engine: without the RAM the request runs unparked
+            std::fprintf(stderr, "Flash-Next: no host RAM to park a %u-token conversation; not parked\n", end);
+            return false;
+        }
+        if (!kv_media.empty()) {
+            entry.media.assign(kv_media.begin(), kv_media.begin() + std::min<std::size_t>(end, kv_media.size()));
+        }
+        std::sort(deep.begin(), deep.end(), std::greater<>());  // erase from the back
+        for (const std::size_t i : deep) {
+            entry.snapshots.push_back(std::move(snapshots[i]));
+            snapshots.erase(snapshots.begin() + std::ptrdiff_t(i));
+        }
+        entry.last_used = ++use_clock;
+        const std::size_t actual = entry.bytes();
+        parked_bytes += actual;
+        parked.push_back(std::move(entry));
+        std::fprintf(stderr, "Flash-Next: parked a %u-token conversation (%.1f GiB, %.2f s; %zu parked, %.1f GiB)\n", end,
+                     double(actual) / double(1 << 30), seconds_between(started, Clock::now()), parked.size(),
+                     double(parked_bytes) / double(1 << 30));
+        return true;
+    }
+
+    // Before a request runs from `base`: when a parked conversation lets it resume at least kUnparkMinGain deeper,
+    // park what is held and copy that conversation back; otherwise park the held conversation if the request is about
+    // to overwrite it. Returns the plan to run from (choose_base again whenever the snapshots changed).
+    BasePlan switch_conversation(const std::vector<TokenId>& prompt, const MediaKeys& media, const BasePlan& base) {
+        if (park_budget == 0) { return base; }
+        std::optional<std::size_t> best;
+        std::uint32_t best_depth = 0;
+        for (std::size_t i = 0; i < parked.size(); ++i) {
+            const std::uint32_t depth = resumable_depth(parked[i].snapshots, prompt, media);
+            if (depth > best_depth) {
+                best       = i;
+                best_depth = depth;
+            }
+        }
+        if (!best || best_depth < base.depth + kUnparkMinGain) {
+            const bool continues_live = live_reusable && base.depth == live_tokens;
+            if (!continues_live && park_held(base.depth)) { return choose_base(prompt, media, true); }
+            return base;
+        }
+        const std::uint64_t chosen = parked[*best].last_used = ++use_clock;
+        park_held(0, chosen);
+        const auto it = std::find_if(parked.begin(), parked.end(), [&](const Parked& p) { return p.last_used == chosen; });
+        if (it == parked.end()) { return choose_base(prompt, media, true); }  // protected above; not expected
+        const std::size_t bytes = it->bytes();
+        const long long end     = static_cast<long long>(it->positions.end);
+        const auto started      = Clock::now();
+        engine->unpark(it->positions);
+        kv_tokens.assign(it->positions.tokens.begin(), it->positions.tokens.end());
+        kv_media      = std::move(it->media);
+        live_tokens   = 0;
+        live_reusable = false;
+        check_sequence();
+        snapshots.clear();  // they named positions the unparked conversation now holds
+        for (Snapshot& snapshot : it->snapshots) {
+            snapshot.last_used = ++use_clock;
+            snapshots.push_back(std::move(snapshot));
+        }
+        parked_bytes -= bytes;
+        parked.erase(it);
+        std::fprintf(stderr, "Flash-Next: unparked a %lld-token conversation in %.2f s; resuming at %u tokens\n", end,
+                     seconds_between(started, Clock::now()), best_depth);
+        return choose_base(prompt, media, true);
+    }
+
+    // ---------------------------------------------------------------------------------------
     // Request execution
 
     void execute(Request& request) {
@@ -1082,7 +1239,8 @@ private:
         const bool reuse =
             reuse_enabled && request.options.execution.allow_prefix_reuse && data.identity.reusable;
         request.media                = prompt_media_keys(data);
-        const BasePlan base          = choose_base(prompt, request.media, reuse);
+        BasePlan base = choose_base(prompt, request.media, reuse);
+        if (reuse) { base = switch_conversation(prompt, request.media, base); }
         request.reused_prompt_tokens = base.depth;
         request.prefix_reuse_path    = base.path;
         publish_sequence(&request, true);
@@ -1537,6 +1695,24 @@ private:
     std::uint64_t engine_ns = 0;
     std::vector<Snapshot> snapshots;
     std::uint64_t use_clock = 0;
+    // Conversations parked by requests that did not continue them (park_held): their positions and their deepest
+    // snapshots, least recently used first, within park_budget.
+    struct Parked {
+        fn::EngineParked positions;
+        MediaKeys media;  // the media keys of those positions (empty without images)
+        std::vector<Snapshot> snapshots;
+        std::uint64_t last_used = 0;
+        [[nodiscard]] std::size_t bytes() const noexcept {
+            std::size_t n = positions.bytes() + media.size() * sizeof(std::uint64_t);
+            for (const Snapshot& snapshot : snapshots) {
+                n += snapshot.state.state.size() + snapshot.state.tokens.size() * sizeof(std::int32_t) +
+                     snapshot.logits.size() * sizeof(float) + snapshot.media.size() * sizeof(std::uint64_t);
+            }
+            return n;
+        }
+    };
+    std::vector<Parked> parked;
+    std::size_t parked_bytes = 0;
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;

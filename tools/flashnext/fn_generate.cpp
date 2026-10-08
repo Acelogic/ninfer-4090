@@ -3,7 +3,7 @@
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
-//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--mtp mtp.gguf [--draft K]
+//                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--test-park] [--mtp mtp.gguf [--draft K]
 //                    [--mtp-experts-vram]] [--no-decode-adapt] [--hash]
 //                    [--kv-stream 0|1] [--kv-resident CELLS] [--kv-stage-cells CELLS] [--kv-group-tokens N] [--followup N[,N...]]
 //                    [--no-lend] [--no-stream] [--stream-min N] [--chunk-max N] [--cpu-share-max N] [--dense-sgemm] [--profile]
@@ -20,7 +20,9 @@
 // (the expert cache keeps what earlier runs taught it).
 // --test-snapshot continues 8 tokens past the prompt, returns to the snapshot and checks that the same 8
 // tokens follow; --snapshot-detour N also feeds N more tokens (the prompt's first ones) before returning, so
-// that ring buffers (the MTP layer's K/V) wrap past the snapshot's positions.
+// that ring buffers (the MTP layer's K/V) wrap past the snapshot's positions. --test-park (implies --test-snapshot)
+// parks the prompt's positions before the return instead, then overwrites every one of them (and 64 more) with
+// another sequence from an empty one (the prompt reversed), unparks and restores: the same 8 tokens must follow.
 // --kv-stream forces KV streaming off or on (default: on when --ctx exceeds --kv-resident, 32768 cells);
 // the KV counters are printed after the prompt and at the end. --followup feeds short prompts of N tokens
 // (the prompt's first ones) after the prompt and times them, like a conversation's next turn at that depth;
@@ -159,7 +161,7 @@ int main(int argc, char ** argv) {
 static int run(int argc, char ** argv) {
     std::string model_path, tokens_arg, tokens_file, json_path, dump_dir;
     int n_gen = 16;
-    bool compare_ref = false, test_snapshot = false, hash = false, hash_state = false;
+    bool compare_ref = false, test_snapshot = false, test_park = false, hash = false, hash_state = false;
     std::uint64_t h_decode = fnv1a(nullptr, 0), h_drafts = fnv1a(nullptr, 0);
     int n_draft = 2, detour = 0;
     std::vector<std::int32_t> followups;
@@ -187,6 +189,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--no-graphs") opt.cuda_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--test-snapshot") test_snapshot = true;
+        else if (a == "--test-park") test_snapshot = test_park = true;
         else if (a == "--snapshot-detour") detour = std::stoi(next());
         else if (a == "--no-host-images") opt.host_expert_images = false;
         else if (a == "--mtp") opt.mtp_path = next();
@@ -415,6 +418,30 @@ static int run(int argc, char ** argv) {
             engine.forward(extra);
             std::printf("snapshot detour: %d more tokens fed before the restore\n", detour);
         }
+        bool park_checks = true;  // with --test-park: a restore without the unpark must be refused
+        if (test_park) {
+            auto t_park = std::chrono::steady_clock::now();
+            const EngineParked parked = engine.park(std::int64_t(prompt.size()));
+            const double park_ms = 1e3 * seconds_since(t_park);
+            // another sequence over every parked position: what an unrelated request does to the caches
+            std::vector<std::int32_t> other(prompt.rbegin(), prompt.rend());
+            for (std::size_t i = 0; other.size() < prompt.size() + 64; ++i) other.push_back(prompt[i % prompt.size()]);
+            if (std::int64_t(other.size()) > opt.max_ctx) other.resize(std::size_t(opt.max_ctx));
+            engine.reset();
+            engine.forward(other);
+            bool stale_rejected = false;
+            try {
+                engine.restore(snap);
+            } catch (const std::exception &) {
+                stale_rejected = true;  // the caches no longer hold the snapshot's tokens
+            }
+            t_park = std::chrono::steady_clock::now();
+            engine.unpark(parked);
+            const double unpark_ms = 1e3 * seconds_since(t_park);
+            std::printf("park: %.2f GiB in %.1f ms, %zu other tokens fed, restore without unpark rejected: %s, unpark in %.1f ms\n",
+                        parked.bytes() / 1073741824.0, park_ms, other.size(), stale_rejected ? "yes" : "NO", unpark_ms);
+            park_checks = stale_rejected;
+        }
         t_snap = std::chrono::steady_clock::now();
         engine.restore(snap);
         const double restore_ms = 1e3 * seconds_since(t_snap);
@@ -423,7 +450,7 @@ static int run(int argc, char ** argv) {
         // adaptation (the default) it changes during the first continuation, and a detour's prompt refills and re-ranks it
         // (unless there is no cache), so some pairs then run on the other device: the same tokens, logits that differ in
         // the last bits. Bitwise: --no-decode-adapt, and without a detour or with --cache-mib 0.
-        const bool strict = !opt.decode_adapt && (detour == 0 || opt.expert_cache_mib == 0);
+        const bool strict = !opt.decode_adapt && ((detour == 0 && !test_park) || opt.expert_cache_mib == 0);
         const bool same_ids = first.first == second.first, same = same_ids && first.second == second.second;
         std::printf("snapshot %.1f MiB in %.1f ms, restore in %.1f ms; continuation after restore: tokens identical: %s, logits bitwise "
                     "identical: %s%s\n",
@@ -448,7 +475,7 @@ static int run(int argc, char ** argv) {
                         min_margin, first_diff >= 0 ? (", first different token at " + std::to_string(first_diff)).c_str() : "");
         }
         engine.restore(snap);
-        if (!same_ids || (!same && strict)) return 1;
+        if (!same_ids || (!same && strict) || !park_checks) return 1;
     }
 
     std::vector<std::int32_t> generated;

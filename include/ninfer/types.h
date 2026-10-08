@@ -205,6 +205,10 @@ struct FlashNextOptions {
     std::filesystem::path mtp_path;
     // Tokens the MTP head drafts per decode step, 1..3; zero selects 2 when mtp_path is set.
     std::uint32_t draft_tokens = 0;
+    // Host RAM (MiB) for parked conversations: a long cached conversation that an unrelated request (a
+    // summary, another session) would overwrite is copied out first (about 25.5 KiB per token, plus a
+    // few recurrent-state snapshots) and copied back when a later request continues it. Zero disables.
+    std::uint32_t park_mib = 12288;
     // The vision encoder for image input: the model's mmproj GGUF (clip, projector qwen3vl_merger, F16). Empty serves
     // text only.
     std::filesystem::path vision_path;

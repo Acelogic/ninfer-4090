@@ -142,6 +142,22 @@ struct EngineSnapshot {
     std::vector<std::uint8_t> state;
 };
 
+// The caches' contents at positions [0, end): every attention layer's keys and values and QSA block keys, plus the
+// positions' tokens, rope positions and input keys. A snapshot is valid only while the caches hold its positions;
+// parking them first lets other tokens use those positions in between: park(end), run anything, unpark(), then
+// restore() a snapshot of the parked sequence (one no deeper than end). About 25.5 KiB per position.
+struct EngineParked {
+    std::int64_t end = 0;
+    std::vector<std::int32_t> tokens;     // [end]
+    std::vector<std::int32_t> rope;       // [end][3]
+    std::vector<std::uint64_t> inputs;    // [end]
+    std::vector<std::uint8_t> rows;       // per attention layer: K [end], V [end], QSA blocks [end / 4 + 1]
+    std::size_t bytes() const {
+        return rows.size() + tokens.size() * sizeof(std::int32_t) + rope.size() * sizeof(std::int32_t) +
+               inputs.size() * sizeof(std::uint64_t);
+    }
+};
+
 class Engine {
 public:
     Engine(const GgufModel & model, EngineOptions options = {});
@@ -175,6 +191,13 @@ public:
     // positions' rope positions and input embedding rows; throws otherwise). Typical use: snapshot at the
     // end of each prompt, restore it when the next request extends that prompt.
     void restore(const EngineSnapshot & snapshot);
+    // A copy of positions [0, end) of the caches (end <= the positions they hold); the engine is unchanged.
+    EngineParked park(std::int64_t end);
+    // What park(end) returns, in bytes (EngineParked::bytes()).
+    std::size_t park_bytes(std::int64_t end) const;
+    // Writes parked positions back into the caches. The engine is then at an empty sequence (n_past() 0) whose caches
+    // hold the parked positions, so restore() of a snapshot of that sequence continues it.
+    void unpark(const EngineParked & parked);
     int n_vocab() const;
     void set_activation_hook(EngineHook hook);  // slow: synchronizes and copies every activation
     const EngineStats & stats() const;

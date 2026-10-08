@@ -266,6 +266,19 @@ streaming, in the host copy), and restore checks they still hold the snapshot's 
 reuses a conversation's prefix this way. The MTP ring is overwritten by later positions, so it travels
 with the snapshot (with the MTP position): a restore puts back exactly the rows the next drafts read.
 
+`park(end)` copies a sequence's positions out to RAM: the K/V rows of the 12 attention layers (from
+the host copy with KV streaming, else from VRAM), the indexer's block keys and the token, rope and
+input-digest history; `unpark()` writes them back and invalidates the VRAM page cache. The recurrent
+state is not part of it: the server parks a conversation together with its deepest snapshots
+(`flashnext_core.cpp`, `park_held` and `switch_conversation`), so it resumes through an ordinary
+restore, and a restore over positions that were overwritten and not unparked is refused as before.
+The server parks the held conversation when a prompt keeps at most half of it and drops at least
+16K tokens (a side request, another session; a normal turn keeps most of it), and unparks one when
+that resumes at least 4,096 tokens deeper than the held sequence, within `--flashnext-park-mib`.
+`fn_generate --test-park` parks after the prompt, feeds as many other tokens, checks that a restore is
+refused until the unpark, then unparks and restores: 40K tokens with streamed K/V and MTP, 0.97 GiB,
+park 227 ms and unpark 39 ms; 12K tokens resident, 0.29 GiB, 38 and 16 ms; continuations identical.
+
 ### 3.9 Long context: KV streaming
 
 At 24 KiB per token (fp16 K and V of 2 heads of 256, 12 attention layers) a 262K window's attention

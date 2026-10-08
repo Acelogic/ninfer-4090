@@ -85,8 +85,14 @@ sequence executes only its new suffix. Up to `--host-state-slots` host snapshots
 state (about 113 MiB each) are kept at prompt ends and at the frontend's rewrite checkpoint, long
 anchors and shared tool prefix, so a rewritten turn restarts from the deepest snapshot that the new
 prompt begins with. Attention keys and values stay in the engine by position: a snapshot stays usable
-until another prompt overwrites its positions, so alternating between conversations reuses only
-their common prefix. `--no-prefix-reuse` disables both kinds of reuse.
+until another prompt overwrites its positions. A prompt that would overwrite most of a held
+conversation of 16K tokens or more (a client's side task such as a compaction summary, or another
+session) parks that conversation first: its keys and values, positions and three deepest snapshots
+are copied to RAM (about 25 KiB per token; 1 GiB in a quarter of a second for 40K tokens), and a
+later prompt that continues it at least 4,096 tokens deeper than what the engine holds copies it back
+instead of reading it again. Parked conversations share `--flashnext-park-mib`, the least recently
+used dropped first; the log reports each park and unpark. `--no-prefix-reuse` disables all of this
+reuse.
 
 With `--flashnext-vision`, requests may carry images (OpenAI chat `image_url` parts, Responses
 `input_image`, Anthropic `image` blocks; data URLs or base64) and the frontend preprocesses them as
@@ -111,6 +117,7 @@ expert cache). Options for these models:
 | `--flashnext-mtp FILE` | the MTP head GGUF; enables speculative decoding | off |
 | `--flashnext-draft K` | most MTP drafts per decode step, `1..3`; each step uses the length with the most expected tokens per second, from moving averages of draft acceptance and step time | `2` with `--flashnext-mtp` |
 | `--flashnext-vision FILE` | the vision encoder: the model's mmproj GGUF (`clip`, `qwen3vl_merger`, F16); enables image input | off (text only) |
+| `--flashnext-park-mib N` | RAM for parked conversations (above); `0`, `--no-prefix-reuse` or `--host-state-slots 0` disables parking | `12288` |
 
 They are rejected for `.ninfer` artifacts. Flash-Next does not support `--max-concurrency` above 1,
 `--spec` (it uses `--flashnext-mtp`), `--vision` (it uses `--flashnext-vision`), video input,

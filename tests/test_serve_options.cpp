@@ -187,12 +187,12 @@ int main() {
         parse({"ninfer-serve", "model.gguf", "--flashnext-expert-cache-mib", "4096",
                "--flashnext-expert-threads", "12", "--flashnext-routing-stats", "routing.bin",
                "--flashnext-host-expert-images", "--flashnext-mtp", "mtp.gguf", "--flashnext-draft",
-               "3"});
+               "3", "--flashnext-park-mib", "4096"});
     failures += check(
         flashnext.flashnext.expert_cache_mib == 4096 && flashnext.flashnext.expert_threads == 12 &&
             flashnext.flashnext.routing_stats == "routing.bin" &&
             flashnext.flashnext.host_expert_images && flashnext.flashnext.mtp_path == "mtp.gguf" &&
-            flashnext.flashnext.draft_tokens == 3,
+            flashnext.flashnext.draft_tokens == 3 && flashnext.flashnext.park_mib == 4096,
         "Flash-Next options were not applied");
     bool wide_draft_rejected = false;
     try {

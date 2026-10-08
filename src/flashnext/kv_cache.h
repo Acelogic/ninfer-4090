@@ -69,6 +69,17 @@ public:
     // cache holds, which a legal resident size rules out; the engine throws on it).
     KvStreamStats stats() const;
 
+    // Bytes of one position of K (or V) in a layer's host copy.
+    static std::size_t row_bytes();
+    // Positions [0, end) of layer li's host copy, K and V (Engine::park / unpark). The engine's stream must be idle:
+    // steps write the host copy through device-mapped memory. After write_rows the page cache may hold other tokens
+    // at those positions: call reset_pages() before the next step.
+    void read_rows(int li, std::int64_t end, std::uint8_t * k, std::uint8_t * v) const;
+    void write_rows(int li, std::int64_t end, const std::uint8_t * k, const std::uint8_t * v);
+    // Empties every layer's page cache (later steps load the pages they need from the host copy again); this also
+    // zeroes its counters.
+    void reset_pages();
+
 private:
     struct Layer;
     void issue_stage(int li);

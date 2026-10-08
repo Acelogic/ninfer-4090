@@ -160,7 +160,10 @@ std::string serve_usage_text(const char* argv0) {
            "speculative decoding with --flashnext-draft K drafts per step (1..3, default 2); "
            "--flashnext-vision FILE loads the vision encoder (the model's mmproj GGUF, F16) for "
            "image input (its weights stay in pinned RAM; each image borrows VRAM from the expert "
-           "cache while it is encoded)\n";
+           "cache while it is encoded); --flashnext-park-mib N keeps up to N MiB of host RAM "
+           "(default 12288, 0: off) for long cached conversations that an unrelated request "
+           "would overwrite, so that a later request continuing one resumes it instead of "
+           "reading it again\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -257,6 +260,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--flashnext-vision must not be empty");
             }
             options.enable_vision = true;  // requests may carry media
+        } else if (arg == "--flashnext-park-mib") {
+            options.flashnext.park_mib = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--flashnext-park-mib"), "flashnext-park-mib"));
         } else if (arg == "--flashnext-draft") {
             const int drafts =
                 parse_nonnegative_int(require_value("--flashnext-draft"), "flashnext-draft");

@@ -1,6 +1,7 @@
 #include "flashnext/kv_cache.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -189,6 +190,27 @@ KvStreamStats KvStreamCache::stats() const {
     s.grouped_chunks = grouped_chunks_;
     s.staged_gib = staged_bytes_ / double(1 << 30);
     return s;
+}
+
+std::size_t KvStreamCache::row_bytes() { return kRowBytes; }
+
+void KvStreamCache::read_rows(int li, std::int64_t end, std::uint8_t * k, std::uint8_t * v) const {
+    if (end < 0 || end > max_ctx_) throw std::runtime_error("engine: KV rows out of range");
+    const Layer & L = *layers_[std::size_t(li)];
+    std::memcpy(k, L.host_k, std::size_t(end) * kRowBytes);
+    std::memcpy(v, L.host_v, std::size_t(end) * kRowBytes);
+}
+
+void KvStreamCache::write_rows(int li, std::int64_t end, const std::uint8_t * k, const std::uint8_t * v) {
+    if (end < 0 || end > max_ctx_) throw std::runtime_error("engine: KV rows out of range");
+    Layer & L = *layers_[std::size_t(li)];
+    std::memcpy(L.host_k, k, std::size_t(end) * kRowBytes);
+    std::memcpy(L.host_v, v, std::size_t(end) * kRowBytes);
+}
+
+void KvStreamCache::reset_pages() {
+    for (auto & L : layers_) fc::kv_map_reset(L->map, stream_);
+    check(cudaStreamSynchronize(stream_), "KV map");
 }
 
 }  // namespace ninfer::flashnext

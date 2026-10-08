@@ -1285,6 +1285,84 @@ struct Engine::Impl {
         trace_state("restore", std::int64_t(n));
     }
 
+    // Engine::park / unpark: per attention layer K [end], V [end] and the QSA block keys [end / 4 + 1] (the block
+    // that position end - 1 is in, possibly incomplete: a snapshot carries the raw keys that complete it), then the
+    // positions' tokens, rope positions and input keys. The recurrent state is the snapshots' business.
+    static std::size_t kv_row_bytes() { return std::size_t(fc::kKvHeads) * fc::kHeadDim * sizeof(half); }
+    std::size_t park_block_bytes(std::int64_t end) const {
+        const std::int64_t n = std::min<std::int64_t>(end / fc::kQsaRatio + 1, opt.max_ctx / fc::kQsaRatio + 1);
+        return std::size_t(n) * fc::kQsaDim * sizeof(float);
+    }
+    std::size_t park_row_bytes(std::int64_t end) const {
+        std::size_t n = 0;
+        for (const Layer & L : layers)
+            if (!L.recurrent) n += 2 * std::size_t(end) * kv_row_bytes() + park_block_bytes(end);
+        return n;
+    }
+
+    EngineParked park(std::int64_t end) {
+        if (end < 0 || end > std::int64_t(history.size()) || rope_hist.size() < std::size_t(end) * fc::kRopeAxes ||
+            input_key.size() < std::size_t(end))
+            throw std::runtime_error("engine: cannot park positions the caches do not hold");
+        check(cudaStreamSynchronize(stream), "park");  // steps write the host K/V copy through device-mapped memory
+        EngineParked p;
+        p.end = end;
+        p.tokens.assign(history.begin(), history.begin() + end);
+        p.rope.assign(rope_hist.begin(), rope_hist.begin() + end * fc::kRopeAxes);
+        p.inputs.assign(input_key.begin(), input_key.begin() + end);
+        const std::size_t kvb = std::size_t(end) * kv_row_bytes(), blb = park_block_bytes(end);
+        p.rows.resize(park_row_bytes(end));
+        std::uint8_t * at = p.rows.data();
+        for (const Layer & L : layers) {
+            if (L.recurrent) continue;
+            if (L.kv >= 0) {
+                kv->read_rows(L.kv, end, at, at + kvb);
+            } else if (kvb) {
+                check(cudaMemcpy(at, L.k_cache.get(), kvb, cudaMemcpyDeviceToHost), "park");
+                check(cudaMemcpy(at + kvb, L.v_cache.get(), kvb, cudaMemcpyDeviceToHost), "park");
+            }
+            check(cudaMemcpy(at + 2 * kvb, L.blocks.get(), blb, cudaMemcpyDeviceToHost), "park");
+            at += 2 * kvb + blb;
+        }
+        trace_state("park", end);
+        return p;
+    }
+
+    void unpark(const EngineParked & p) {
+        if (p.end < 0 || p.end > opt.max_ctx || p.rows.size() != park_row_bytes(p.end) || p.tokens.size() != std::size_t(p.end) ||
+            p.rope.size() != std::size_t(p.end) * fc::kRopeAxes || p.inputs.size() != std::size_t(p.end))
+            throw std::runtime_error("engine: parked positions from a different model or context size");
+        check(cudaStreamSynchronize(stream), "unpark");
+        const std::size_t kvb = std::size_t(p.end) * kv_row_bytes(), blb = park_block_bytes(p.end);
+        const std::uint8_t * at = p.rows.data();
+        for (Layer & L : layers) {
+            if (L.recurrent) continue;
+            if (L.kv >= 0) {
+                kv->write_rows(L.kv, p.end, at, at + kvb);
+            } else if (kvb) {
+                check(cudaMemcpy(L.k_cache.get(), at, kvb, cudaMemcpyHostToDevice), "unpark");
+                check(cudaMemcpy(L.v_cache.get(), at + kvb, kvb, cudaMemcpyHostToDevice), "unpark");
+            }
+            check(cudaMemcpy(L.blocks.get(), at + 2 * kvb, blb, cudaMemcpyHostToDevice), "unpark");
+            at += 2 * kvb + blb;
+        }
+        if (kv) kv->reset_pages();  // its pages may hold other tokens at these positions
+        if (history.size() < std::size_t(p.end)) history.resize(std::size_t(p.end));
+        std::copy(p.tokens.begin(), p.tokens.end(), history.begin());
+        if (rope_hist.size() < p.rope.size()) rope_hist.resize(p.rope.size());
+        std::copy(p.rope.begin(), p.rope.end(), rope_hist.begin());
+        if (input_key.size() < p.inputs.size()) input_key.resize(p.inputs.size());
+        std::copy(p.inputs.begin(), p.inputs.end(), input_key.begin());
+        // an empty sequence over the parked positions: the caller restores a snapshot of them next
+        n_past = 0;
+        rope_next = rope_before = 0;
+        rows_pos0 = 0;
+        rows_valid = 0;
+        snaps_valid = false;
+        if (mtp) mtp->pos = 0;
+        trace_state("unpark", p.end);
+    }
+
     // ---------------------------------------------------------------------------------------------
 
     void emit(const char * name, int il, const void * dev, std::int64_t pos, int T, std::int64_t width) {
@@ -3031,6 +3109,12 @@ std::vector<std::int32_t> Engine::tokens() const {
 }
 EngineSnapshot Engine::snapshot() const { return impl_->snapshot(); }
 void Engine::restore(const EngineSnapshot & snapshot) { impl_->restore(snapshot); }
+EngineParked Engine::park(std::int64_t end) { return impl_->park(end); }
+std::size_t Engine::park_bytes(std::int64_t end) const {
+    // the rows, then per position its token, rope positions and input key
+    return impl_->park_row_bytes(end) + std::size_t(end) * ((1 + fc::kRopeAxes) * sizeof(std::int32_t) + sizeof(std::uint64_t));
+}
+void Engine::unpark(const EngineParked & parked) { impl_->unpark(parked); }
 int Engine::n_vocab() const { return impl_->cfg.n_vocab; }
 void Engine::set_activation_hook(EngineHook hook) { impl_->hook = std::move(hook); }
 const EngineStats & Engine::stats() const { return impl_->stats; }
