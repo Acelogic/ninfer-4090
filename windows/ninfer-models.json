@@ -9,7 +9,9 @@
     "16",
     "--pending-timeout-ms",
     "600000",
-    "--preserve-thinking"
+    "--preserve-thinking",
+    "--default-max-tokens",
+    "32768"
   ],
   "profiles": {
     "qwen3.8-27b-fast": {

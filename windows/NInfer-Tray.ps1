@@ -3,12 +3,14 @@ NInfer tray icon.
 
 Shows whether the local NInfer engine is serving a model and lets you stop it to free the GPU,
 or start any profile listed in ninfer-models.json. The icon is green while a model is
-served, amber while one is loading, and grey when the engine is stopped.
+served, amber while one is loading, and grey when the engine is stopped. While the engine is
+generating (a request is being processed, per its /slots endpoint) the green dot flashes;
+"flashWhenGenerating": false in ninfer-models.json keeps it solid.
 
-Auto-stop: Pi sessions that use the engine leave lease files in %LOCALAPPDATA%\ninfer-tray\leases
-(written by the pi-local-backend extension). When a Pi session started the engine and every Pi
-session holding a lease is gone, the tray stops the engine. This covers terminals closed without
-/quit, where Pi gets no chance to clean up. An engine you started yourself is never auto-stopped.
+Auto-stop: Pi and Hermes sessions that use the engine leave lease files in %LOCALAPPDATA%\ninfer-tray\leases
+(written by Pi's pi-local-backend extension and Hermes' ninfer-backend plugin). When a session started the
+engine and every session holding a lease is gone, the tray stops the engine. This covers terminals closed
+without /quit, where Pi or Hermes gets no chance to clean up. An engine you started yourself is never auto-stopped.
 
 Run with: pwsh -STA -WindowStyle Hidden -File NInfer-Tray.ps1   (Start-NInferTray.ps1 does this)
 #>
@@ -57,14 +59,16 @@ function Get-VramText {
     } catch { return '' }
 }
 
-# Leases whose Pi process is still the same process (pid reuse is checked against start time).
+# Leases whose session process is still the same process (pid reuse is checked against start time). A lease names
+# its process (Hermes runs in python); one without a name is Pi's, which runs in node.
 function Get-Leases {
     Get-ChildItem -LiteralPath $leaseDir -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
         try {
             $lease = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json
             $proc = Get-Process -Id $lease.pid -ErrorAction SilentlyContinue
             $started = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$lease.startedMs).LocalDateTime
-            $why = if (-not $proc) { 'no such process' } elseif ($proc.ProcessName -ne 'node') { "pid is now $($proc.ProcessName)" } else {
+            $expected = if ($lease.process) { [string]$lease.process } else { 'node' }
+            $why = if (-not $proc) { 'no such process' } elseif ($proc.ProcessName -ne $expected) { "pid is now $($proc.ProcessName)" } else {
                 # StartTime can be unreadable (another user's or an elevated process); then the pid and name have to do
                 try { if ([Math]::Abs(($proc.StartTime - $started).TotalSeconds) -ge 10) { "pid reused (started $($proc.StartTime))" } } catch { $null }
             }
@@ -114,6 +118,7 @@ $icons = @{
     running = New-DotIcon ([System.Drawing.Color]::FromArgb(46, 204, 113))
     loading = New-DotIcon ([System.Drawing.Color]::FromArgb(243, 156, 18))
     stopped = New-DotIcon ([System.Drawing.Color]::FromArgb(149, 165, 166))
+    dimmed  = New-DotIcon ([System.Drawing.Color]::FromArgb(24, 92, 54))   # the "off" phase of the generating flash
 }
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
@@ -134,7 +139,7 @@ foreach ($name in $cfg.profiles.PSObject.Properties.Name) {
     $item.add_Click({ Start-Engine $this.Tag })
 }
 [void]$menu.Items.Add($startMenu)
-$autoItem = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto-stop when Pi exits'
+$autoItem = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto-stop when Pi or Hermes exits'
 $autoItem.CheckOnClick = $true
 $autoItem.Checked = [bool]$cfg.autoStopWhenPiExits
 [void]$menu.Items.Add($autoItem)
@@ -142,11 +147,42 @@ $logsItem = $menu.Items.Add('Open logs folder')
 $logsItem.add_Click({ Start-Process explorer.exe (Join-Path $configDir 'logs') })
 [void]$menu.Items.Add('-')
 $exitItem = $menu.Items.Add('Exit tray (engine keeps running)')
-$exitItem.add_Click({ $timer.Stop(); $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
+$exitItem.add_Click({ $timer.Stop(); $flash.Stop(); $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
 $notify.ContextMenuStrip = $menu
 
 $script:deadPolls = 0
 $script:stoppedSince = $null
+$script:engineState = 'stopped'
+$script:generating = $false
+$script:flashOn = $true
+
+function Set-TrayIcon {
+    $dim = $script:engineState -eq 'running' -and $script:generating -and -not $script:flashOn
+    $notify.Icon = if ($dim) { $icons.dimmed } else { $icons[$script:engineState] }
+}
+
+# Generating = any slot of the engine's /slots is processing a request. Polled about once a second with a
+# non-blocking request (a busy engine must not freeze the tray menu); the dot toggles every half second.
+$http = [System.Net.Http.HttpClient]::new()
+$http.Timeout = [TimeSpan]::FromSeconds(3)
+$script:slotsCall = $null
+$script:flashTicks = 0
+$flash = New-Object System.Windows.Forms.Timer
+$flash.Interval = 500
+$flash.add_Tick({
+    try {
+        $script:flashTicks++
+        if ($script:slotsCall -and $script:slotsCall.IsCompleted) {
+            $script:generating = $script:slotsCall.Status -eq 'RanToCompletion' -and
+                [bool](@($script:slotsCall.Result | ConvertFrom-Json) | Where-Object is_processing)
+            $script:slotsCall = $null
+        }
+        if ($script:engineState -ne 'running') { $script:generating = $false }
+        elseif (-not $script:slotsCall -and $script:flashTicks % 2 -eq 0) { $script:slotsCall = $http.GetStringAsync("$($cfg.endpoint)/slots") }
+        $script:flashOn = -not ($script:generating -and $script:flashOn)
+        Set-TrayIcon
+    } catch { $script:slotsCall = $null }
+})
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 3000
 $timer.add_Tick({
@@ -154,8 +190,10 @@ $timer.add_Tick({
         $engine = Get-EngineState
         $label = if ($engine.models.Count) { $engine.models -join ', ' } else { '' }
         $vram = if ($engine.state -ne 'stopped') { Get-VramText } else { '' }
-        $notify.Icon = $icons[$engine.state]
-        $text = ("NInfer: $($engine.state) $label $vram").Trim() -replace '\s+', ' '
+        $script:engineState = $engine.state
+        Set-TrayIcon
+        $busy = if ($engine.state -eq 'running' -and $script:generating) { 'generating' } else { '' }
+        $text = ("NInfer: $($engine.state) $busy $label $vram").Trim() -replace '\s+', ' '
         $notify.Text = $text.Substring(0, [Math]::Min(63, $text.Length)) # Windows caps tooltips at 63 chars
         $statusItem.Text = $text
         $stopItem.Enabled = $engine.state -ne 'stopped'
@@ -168,8 +206,8 @@ $timer.add_Tick({
             # find this one still holding the mutex and quit, and nothing would watch the next engine).
             if (@(Get-Leases | Where-Object alive).Count) { $script:stoppedSince = Get-Date }
             if ($cfg.exitWhenStopped -and ((Get-Date) - $script:stoppedSince).TotalSeconds -gt 15) {
-                Write-Log 'exiting: the engine is stopped and no Pi session holds a lease'
-                $timer.Stop(); $notify.Visible = $false; [System.Windows.Forms.Application]::Exit()
+                Write-Log 'exiting: the engine is stopped and no session holds a lease'
+                $timer.Stop(); $flash.Stop(); $notify.Visible = $false; [System.Windows.Forms.Application]::Exit()
             }
             return
         }
@@ -182,11 +220,12 @@ $timer.add_Tick({
         if ($script:deadPolls -ge 2) {
             $script:deadPolls = 0
             Write-Log ('leases: ' + (($leases | ForEach-Object { "$(Split-Path -Leaf $_.file) ($($_.why))" }) -join ', '))
-            Stop-Engine 'Every Pi session using it has exited.'
+            Stop-Engine 'Every Pi or Hermes session using it has exited.'
         }
     } catch { Write-Log "tick: $($_.Exception.Message)" }
 })
 $timer.Start()
+if ($cfg.flashWhenGenerating -ne $false) { $flash.Start() }
 Write-Log "tray started (pid $PID)"
 [System.Windows.Forms.Application]::Run()
 $notify.Dispose()
