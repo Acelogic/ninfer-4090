@@ -567,7 +567,10 @@ struct Engine::Impl {
         if (M.on_cpu) {
             int err = 0;
             check(cudaMemcpy(&err, d_error.get(), sizeof(int), cudaMemcpyDeviceToHost), "error flag");
-            if (err) throw std::runtime_error("engine: the GPU timed out waiting for the CPU's MTP experts");
+            if (err) {
+                clear_error_flag();
+                throw std::runtime_error("engine: the GPU timed out waiting for the CPU's MTP experts");
+            }
         }
         return M.h_tok.get()[0];
     }
@@ -1176,8 +1179,15 @@ struct Engine::Impl {
         return opt.kv_group_tokens <= 0 || n > std::max<std::int64_t>(opt.kv_group_tokens, n_past / KvStreamCache::kGroupDepth);
     }
 
+    // k_link_wait sets the flag when the CPU experts take too long; it must not stay set, or every later
+    // step fails with the same timeout (seen as an "internal error" storm until the server restarted).
+    void clear_error_flag() {
+        if (d_error.get()) check(cudaMemset(d_error.get(), 0, sizeof(int)), "error flag");
+    }
+
     void reset() {
         check(cudaStreamSynchronize(stream), "sync");
+        clear_error_flag();
         for (Layer & L : layers) {
             for (fc::DeviceBuffer * b : {&L.conv_state, &L.S, &L.k_cache, &L.v_cache, &L.idx_raw, &L.blocks})
                 if (b->get()) check(cudaMemset(b->get(), 0, b->bytes()), "memset");
@@ -1777,7 +1787,10 @@ struct Engine::Impl {
             check(cudaStreamSynchronize(stream), "step");
             int err = 0;
             check(cudaMemcpy(&err, d_error.get(), sizeof(int), cudaMemcpyDeviceToHost), "error flag");
-            if (err) throw std::runtime_error("engine: the GPU timed out waiting for the CPU experts");
+            if (err) {
+                clear_error_flag();
+                throw std::runtime_error("engine: the GPU timed out waiting for the CPU experts");
+            }
         } else {
             if (stream_chunk) plan_stream(T);
             enqueue(T, head_rows);

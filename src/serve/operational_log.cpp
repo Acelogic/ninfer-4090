@@ -156,6 +156,12 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
     } else {
         append_clause(out, classification_name(failure.classification));
     }
+    // The engine's own diagnostics ("engine: ...") carry no request data and are the only clue to
+    // what went wrong; any other internal detail stays in the JSONL log only.
+    if (failure.classification == RequestFailureClass::Internal &&
+        failure.machine_message.rfind("engine: ", 0) == 0) {
+        append_clause(out, failure.machine_message.substr(0, 240));
+    }
 }
 
 } // namespace

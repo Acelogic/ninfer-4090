@@ -573,6 +573,12 @@ int main() {
         check(internal_failure.severity == OperationalSeverity::Error &&
                   internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
               "operational internal failure severity or data policy mismatch");
+    const OperationalRecord engine_failure = render_request_failure(
+        context, make_internal_request_failure(RequestFailurePhase::Generation,
+                                               "engine: the GPU timed out waiting for the CPU experts"));
+    failures += check(engine_failure.message.find("the GPU timed out waiting for the CPU experts") !=
+                          std::string::npos,
+                      "operational log hides the engine's own diagnostic");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
     failures += check(disconnected.severity == OperationalSeverity::Info &&
