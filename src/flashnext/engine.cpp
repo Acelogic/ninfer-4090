@@ -112,6 +112,40 @@ void prefetch_mapped(const void * p, std::size_t n) {
 #endif
 }
 
+// Asks the OS to read a set of pages (4 KiB page numbers; sorted and deduplicated here) of the memory-mapped GGUF, as one
+// batch of ranges. From a cold file cache, faulting such scattered pages in one at a time ran at ~1,700 pages/s; one
+// PrefetchVirtualMemory call over 131K of them took about a second (measured on the NVMe drive that holds the model).
+void prefetch_pages(std::vector<std::uintptr_t> & pages) {
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    if (pages.empty()) return;
+#ifdef _WIN32
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    for (const std::uintptr_t pg : pages) {
+        void * a = reinterpret_cast<void *>(pg << 12);
+        if (!ranges.empty() && static_cast<std::uint8_t *>(ranges.back().VirtualAddress) + ranges.back().NumberOfBytes == a)
+            ranges.back().NumberOfBytes += 4096;
+        else
+            ranges.push_back({a, 4096});
+    }
+    PrefetchVirtualMemory(GetCurrentProcess(), ranges.size(), ranges.data(), 0);
+#else
+    for (std::size_t i = 0; i < pages.size();) {
+        std::size_t j = i + 1;
+        while (j < pages.size() && pages[j] == pages[j - 1] + 1) ++j;
+        madvise(reinterpret_cast<void *>(pages[i] << 12), (j - i) << 12, MADV_WILLNEED);
+        i = j;
+    }
+#endif
+}
+
+// Reads a byte of every page: the pages enter the working set (at the thread's memory priority).
+void touch_pages(const std::uint8_t * p, std::size_t n) {
+    volatile std::uint8_t sink = 0;
+    for (std::size_t i = 0; i < n; i += 4096) sink = sink + p[i];
+    if (n) sink = sink + p[n - 1];
+}
+
 void require(bool ok, const char * what) {
     if (!ok) throw std::runtime_error(std::string("engine: model does not match the compiled shapes: ") + what);
 }
@@ -310,9 +344,6 @@ struct Engine::Impl {
         prof.enable(opt.profile || std::getenv("NINFER_FN_PROFILE") != nullptr);
         release_experts();  // CpuExperts and the VRAM cache have their own copies now
         warm_up_cpu_experts();
-        // every token reads 16 random rows of the 27 GB PLE table: warm the OS file cache in the
-        // background so that early tokens do not wait on disk reads
-        if (ple_table) prefetch_mapped(ple_table->data, ple_table->bytes);
         if (opt.host_expert_images) {
             build_images();
             release_experts();
@@ -327,6 +358,10 @@ struct Engine::Impl {
         }
         stats.vram_tracked = vram != nullptr;
         fit_vram(true);
+        if (const char * m = std::getenv("NINFER_FN_PREFETCH_ROWS_MIN")) prefetch_rows_min = std::max(1, std::atoi(m));
+        // every token reads 16 random rows of the 27 GB PLE table and its embedding row: both go into RAM in the
+        // background (last: nothing may throw after the thread starts)
+        warm_thread = std::thread([this] { warm_tables(); });
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -957,6 +992,8 @@ struct Engine::Impl {
         stats.cache_gib = double(used) / double(1 << 30);
     }
     ~Impl() {
+        warm_stop = true;
+        if (warm_thread.joinable()) warm_thread.join();
         if (dump_file) std::fclose(dump_file);
         if (stream) cudaStreamSynchronize(stream);
         if (swap_stream) {
@@ -1442,6 +1479,70 @@ struct Engine::Impl {
         }
     }
 
+    // The tables every token reads rows of (the 27 GB PLE table, the token embeddings) go into RAM after the load, a
+    // piece at a time: PrefetchVirtualMemory reads the piece, then a touch of every page puts it into the working set at
+    // normal priority. Prefetched in one call, they waited on the standby list below the ~60 GB of expert pages the load
+    // had just read and released and evicted one another, so the first prompt faulted its rows in one at a time
+    // (~1,700 pages/s: 61 s for an 8K-token chunk's PLE rows, against 1.4 s with them in RAM). Prompts prefetch their own
+    // rows meanwhile (prefetch_rows).
+    std::thread warm_thread;
+    std::atomic<bool> warm_stop{false};
+    void warm_tables() {
+        const auto t0 = clk::now();
+        constexpr std::size_t kPiece = std::size_t(256) << 20;
+        int threads = 4;  // parts of each table warmed side by side (NINFER_FN_WARM_THREADS)
+        if (const char * w = std::getenv("NINFER_FN_WARM_THREADS")) threads = std::clamp(std::atoi(w), 1, 16);
+        std::atomic<std::size_t> bytes{0};
+        std::vector<std::thread> workers;
+        for (int w = 0; w < threads; ++w)
+            workers.emplace_back([&, w] {
+                for (const GgufTensor * t : {ple_table, tok_embd}) {
+                    if (!t) continue;
+                    const std::size_t lo = t->bytes * std::size_t(w) / std::size_t(threads) / 4096 * 4096;
+                    const std::size_t hi = w + 1 == threads ? t->bytes : t->bytes * std::size_t(w + 1) / std::size_t(threads) / 4096 * 4096;
+                    for (std::size_t off = lo; off < hi && !warm_stop; off += kPiece) {
+                        const std::size_t n = std::min(kPiece, hi - off);
+                        prefetch_mapped(t->data + off, n);
+                        touch_pages(t->data + off, n);
+                        bytes += n;
+                    }
+                }
+            });
+        for (std::thread & w : workers) w.join();
+        if (!warm_stop && bytes)
+            std::fprintf(stderr, "engine: %.1f GB of PLE and embedding rows in RAM after %.1f s\n", double(bytes) / 1e9,
+                         std::chrono::duration<double>(clk::now() - t0).count());
+    }
+
+    // The pages of the memory-mapped rows T tokens at pos0.. read (embeddings unless given, PLE rows), as one batch
+    // (prefetch_pages), before prepare_host reads them: a prompt chunk's rows arrive together instead of one fault at a time
+    // when they are not in RAM yet (an 8K-token chunk: about a second instead of a minute from a cold file cache).
+    void prefetch_rows(const std::int32_t * tokens, const float * const * rows, int T, std::int64_t pos0) const {
+        std::vector<std::uintptr_t> pages;
+        pages.reserve(std::size_t(T) * (fc::kPleHeads + 2));
+        auto add = [&](const std::uint8_t * p, std::size_t n) {
+            for (std::uintptr_t a = std::uintptr_t(p) >> 12, b = (std::uintptr_t(p) + n - 1) >> 12; a <= b; ++a) pages.push_back(a);
+        };
+        const std::size_t eb = row_bytes(tok_embd->type, fc::kEmbd);
+        for (int t = 0; t < T; ++t)
+            if (!(rows && rows[t]) && tokens[t] >= 0 && tokens[t] < cfg.n_vocab) add(tok_embd->data + std::size_t(tokens[t]) * eb, eb);
+        if (ple_table) {
+            const std::size_t rb = row_bytes(ple_table->type, fc::kPleHeadDim);
+            const std::int64_t n_rows = ple_table->shape[1];
+            for (int t = 0; t < T; ++t) {
+                std::int32_t r[fc::kPleHeads];
+                ple_rows(pos0 + t, r);
+                for (int h = 0; h < fc::kPleHeads; ++h)
+                    if (r[h] >= 0 && r[h] < n_rows) add(ple_table->data + std::size_t(r[h]) * rb, rb);
+            }
+        }
+        prefetch_pages(pages);
+    }
+    // From this many tokens on (NINFER_FN_PREFETCH_ROWS_MIN): prompt chunks. Batching every decode step's rows too cost
+    // 6-29% of the decode speed with the tables in RAM (40 against 37 and 29 tok/s; the calls contend with warm_tables),
+    // to save faults only in the seconds before the warm-up has the tables in RAM.
+    int prefetch_rows_min = 64;
+
     // host part of PLE: the hashed n-gram rows of T tokens at pos0.., dequantized into dst
     void ple_host(int T, std::int64_t pos0, float * dst) const {
         const std::size_t rb = row_bytes(ple_table->type, fc::kPleHeadDim);
@@ -1461,6 +1562,7 @@ struct Engine::Impl {
     // image's), PLE rows into hple. Reads only the history, the rows and the model, so it can run on a thread while the
     // GPU runs another step.
     void prepare_host(const std::int32_t * tokens, const float * const * rows, int T, std::int64_t pos0, float * hx, float * hple) const {
+        if (T >= prefetch_rows_min) prefetch_rows(tokens, rows, T, pos0);
         const std::size_t rb = row_bytes(tok_embd->type, fc::kEmbd);
         for (int t = 0; t < T; ++t) {
             float * dst = hx + std::size_t(t) * fc::kEmbd;

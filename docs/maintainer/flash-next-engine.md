@@ -227,6 +227,15 @@ A prompt of more than 512 tokens runs in big chunks with every routed expert on 
 - **QSA** stores raw keys and selects cells 256 queries at a time, so the raw-key ring is 264 rows and
   the selection scratch 64 MiB at 262K whatever the chunk.
 - **Host work** for chunk c+1 (embeddings, the 16 PLE rows per token) runs on a thread during chunk c.
+  Those rows are read from the memory-mapped GGUF, so a chunk first hands the OS the pages of all its rows as
+  one batch (`prefetch_rows`, PrefetchVirtualMemory). Faulted in one at a time from a cold file cache, they
+  came at about 1,700 pages/s: an 8K-token chunk's 131K PLE rows took 61 s, and the first long prompt after a
+  load read at 456 tok/s against 2,700 later. Batched, the same rows take about a second. After a load,
+  `warm_tables` reads the PLE table and the token embeddings into RAM on a thread, 256 MB at a time, touching
+  each piece so that its pages enter the working set at normal priority. A single prefetch of the whole table,
+  as before, left its pages on the standby list below the ~60 GB of expert pages the load had just released,
+  and they evicted one another. Decode steps fault their rows in as before: batching them cost 6-29% of the
+  decode speed with the tables in RAM (`NINFER_FN_PREFETCH_ROWS_MIN`, default 64 tokens).
 - **MTP.** The MTP layer's catch-up skips the prompt positions that no draft can attend to (all but
   the last 2,051 + 8), in passes of at most 512 tokens, so its K/V ring of 512 + 2,051 rows (section
   3.9) holds whatever the chunk size.
