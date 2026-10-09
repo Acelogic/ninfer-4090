@@ -95,6 +95,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--flashnext-expert-cache-mib N] [--flashnext-expert-threads N] "
            "[--flashnext-routing-stats FILE] [--flashnext-host-expert-images] "
            "[--flashnext-mtp FILE [--flashnext-draft K]] [--flashnext-vision FILE] "
+           "[--flashnext-park-mib N] [--flashnext-vram-reserve-mib N] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -163,7 +164,9 @@ std::string serve_usage_text(const char* argv0) {
            "cache while it is encoded); --flashnext-park-mib N keeps up to N MiB of host RAM "
            "(default 12288, 0: off) for long cached conversations that an unrelated request "
            "would overwrite, so that a later request continuing one resumes it instead of "
-           "reading it again\n";
+           "reading it again; --flashnext-vram-reserve-mib N keeps N MiB of VRAM free for other "
+           "programs (default 1024; on Windows within the OS's VRAM budget for the process: the "
+           "expert cache gives VRAM back when other programs need it and takes it back later)\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -260,6 +263,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--flashnext-vision must not be empty");
             }
             options.enable_vision = true;  // requests may carry media
+        } else if (arg == "--flashnext-vram-reserve-mib") {
+            options.flashnext.vram_reserve_mib = parse_nonnegative_int(
+                require_value("--flashnext-vram-reserve-mib"), "flashnext-vram-reserve-mib");
         } else if (arg == "--flashnext-park-mib") {
             options.flashnext.park_mib = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--flashnext-park-mib"), "flashnext-park-mib"));

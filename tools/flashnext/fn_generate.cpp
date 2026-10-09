@@ -2,7 +2,7 @@
 //
 // Usage: fn_generate -m <shard 1 of the GGUF> (--tokens 1,2,3 | --tokens-file ids.txt) [-n 32] [--ctx N]
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
-//                    [--cache-mib N] [--reserve-mib N] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
+//                    [--cache-mib N] [--reserve-mib N] [--no-vram-budget] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
 //                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--test-park] [--mtp mtp.gguf [--draft K]
 //                    [--mtp-experts-vram]] [--no-decode-adapt] [--hash]
 //                    [--kv-stream 0|1] [--kv-resident CELLS] [--kv-stage-cells CELLS] [--kv-group-tokens N] [--followup N[,N...]]
@@ -185,6 +185,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--compare-ref") compare_ref = true;
         else if (a == "--cache-mib") opt.expert_cache_mib = std::stoll(next());
         else if (a == "--reserve-mib") opt.vram_reserve_mib = std::stoll(next());
+        else if (a == "--no-vram-budget") opt.vram_follow_budget = false;
         else if (a == "--routing-stats") opt.routing_stats = next();
         else if (a == "--no-graphs") opt.cuda_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
@@ -239,6 +240,9 @@ static int run(int argc, char ** argv) {
     Engine engine(gguf, opt);
     std::printf("loaded %s in %.1f s; expert cache: %lld experts in %.2f GiB of VRAM\n", model_path.c_str(), seconds_since(t_load),
                 (long long) engine.stats().cached_experts, engine.stats().cache_gib);
+    if (engine.stats().vram_tracked)
+        std::printf("VRAM budget %.2f GiB, %.2f GiB in use; %.2f GiB of the expert cache given back to keep %lld MiB free\n",
+                    engine.stats().vram_budget_gib, engine.stats().vram_usage_gib, engine.stats().cache_released_gib, (long long) opt.vram_reserve_mib);
 
     Capture mine;
     const bool capture = compare_ref || !dump_dir.empty();

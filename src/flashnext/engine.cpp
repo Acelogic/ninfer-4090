@@ -40,6 +40,7 @@
 #include "flashnext/prefill.h"
 #include "flashnext/quants.h"
 #include "flashnext/reference.h"
+#include "flashnext/vram.h"
 
 namespace ninfer::flashnext {
 
@@ -317,6 +318,15 @@ struct Engine::Impl {
             release_experts();
         }
         reset();
+        const char * vb = std::getenv("NINFER_FN_VRAM_BUDGET");
+        if (opt.vram_follow_budget && cache_arena.elastic() && !(vb && std::string(vb) == "off")) {
+            int dev = 0;
+            check(cudaGetDevice(&dev), "device");
+            vram = std::make_unique<VramBudget>(dev);
+            if (!vram->available()) vram.reset();
+        }
+        stats.vram_tracked = vram != nullptr;
+        fit_vram(true);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -918,11 +928,12 @@ struct Engine::Impl {
         std::unique_ptr<Pinned<std::uint8_t>> staging = most ? std::make_unique<Pinned<std::uint8_t>>(most) : nullptr;
         // one allocation for every pool, layer after layer: a prompt can borrow its tail (lend())
         pool_off.assign(std::size_t(nl), 0);
+        released_slots.assign(std::size_t(nl), {});
         for (int il = 0; il < nl; ++il) {
             pool_off[std::size_t(il)] = arena_bytes;
             arena_bytes += (chosen[std::size_t(il)].size() * cache[std::size_t(il)].lay.slot_bytes + 255) / 256 * 256;
         }
-        if (arena_bytes) cache_arena = fc::DeviceBuffer(arena_bytes);
+        if (arena_bytes) cache_arena = ElasticArena(arena_bytes);
         for (int il = 0; il < nl; ++il) {
             LayerCache & C = cache[std::size_t(il)];
             std::vector<int> & list = chosen[std::size_t(il)];
@@ -936,7 +947,7 @@ struct Engine::Impl {
                             pack_slot(il, list[j], staging->get() + j * C.lay.slot_bytes);
                     });
                 for (auto & th : pool) th.join();
-                C.pool = fc::DeviceBuffer::view(cache_arena.as<std::uint8_t>() + pool_off[std::size_t(il)], list.size() * C.lay.slot_bytes);
+                C.pool = fc::DeviceBuffer::view(cache_arena.base() + pool_off[std::size_t(il)], list.size() * C.lay.slot_bytes);
                 check(cudaMemcpy(C.pool.get(), staging->get(), C.pool.bytes(), cudaMemcpyHostToDevice), "expert cache");
                 for (std::size_t j = 0; j < list.size(); ++j) C.map[std::size_t(list[j])] = std::int32_t(j);
             }
@@ -1911,11 +1922,16 @@ struct Engine::Impl {
     int group_override = 0;                             // experts per streamed group (NINFER_FN_GROUP; 0: by chunk size)
     static constexpr int kRefillBatch = 8;                              // experts per refill/swap conversion batch
 
-    fc::DeviceBuffer cache_arena;              // every layer's expert pool is a view into it, layer after layer
+    ElasticArena cache_arena;                  // every layer's expert pool is a view into it, layer after layer
     std::vector<std::size_t> pool_off;         // [layer] offset of the pool in the arena
     std::size_t arena_bytes = 0;
-    std::size_t lent_bytes = 0;                // the arena's tail [arena_bytes - lent_bytes, arena_bytes) is lent
+    std::size_t lent_bytes = 0;                // [cache_top() - lent_bytes, cache_top()) is lent
     std::vector<std::vector<int>> lent_slots;  // [layer] slots in the lent tail (their experts were dropped)
+    // Above cache_top() the arena went back to the OS (fit_vram); prompts borrow below it.
+    std::vector<std::vector<int>> released_slots;  // [layer] slots reaching above cache_top(): no expert in them
+    std::unique_ptr<VramBudget> vram;              // null: no budget to follow
+    clk::time_point vram_checked{}, vram_shrunk_at{};
+    std::size_t cache_top() const { return std::min(cache_arena.mapped(), arena_bytes); }
     int bound_T = 0;                           // tokens the bound (lent) chunk buffers hold; 0: the permanent ones
     std::vector<fc::DeviceBuffer> saved_acts;  // the permanent buffers while lent views are bound
     std::uint8_t * ring = nullptr;             // streaming ring, conversion slots and KV staging, in the lent region
@@ -2388,12 +2404,13 @@ struct Engine::Impl {
     // cache until refill(). Returns its device address.
     std::uint8_t * lend(std::size_t bytes) {
         bytes = (bytes + (std::size_t(1) << 20) - 1) & ~((std::size_t(1) << 20) - 1);
-        if (bytes > arena_bytes) throw std::runtime_error("engine: prompt buffers larger than the expert cache");
+        const std::size_t top = cache_top();  // the arena above it went back to the OS (fit_vram)
+        if (bytes > top) throw std::runtime_error("engine: prompt buffers larger than the expert cache");
         finish_swaps();
         check(cudaStreamSynchronize(stream), "lend");
-        const std::size_t lo = arena_bytes - bytes;
+        const std::size_t lo = top - bytes;
         // a region lent already (lend_vram, then a prompt) stays lent: only the slots below it are added
-        const std::size_t lo_prev = arena_bytes - lent_bytes;
+        const std::size_t lo_prev = top - lent_bytes;
         std::vector<bool> touched(std::size_t(cfg.n_layer), false);
         for (int il = 0; il < cfg.n_layer; ++il) {
             LayerCache & C = cache[std::size_t(il)];
@@ -2405,7 +2422,7 @@ struct Engine::Impl {
                 if (C.map[std::size_t(e)] >= 0) expert_of[std::size_t(C.map[std::size_t(e)])] = e;
             for (std::size_t s = 0; s < n_slots; ++s) {
                 const std::size_t end = pool_off[std::size_t(il)] + (s + 1) * sb;
-                if (end <= lo || (lent_bytes && end > lo_prev)) continue;
+                if (end <= lo || end > top || (lent_bytes && end > lo_prev)) continue;
                 if (expert_of[s] >= 0) C.map[std::size_t(expert_of[s])] = -1;
                 lent_slots[std::size_t(il)].push_back(int(s));
                 touched[std::size_t(il)] = true;
@@ -2414,19 +2431,27 @@ struct Engine::Impl {
         upload_maps(touched);
         lent_bytes = std::max(lent_bytes, bytes);
         stats.lent_gib = double(lent_bytes) / double(1 << 30);
-        return cache_arena.as<std::uint8_t>() + lo;
+        return cache_arena.base() + lo;
     }
 
-    // Gives the lent tail back to the cache: its slots get the uncached experts that rank highest (recent routing
-    // plus the long-run counts, as adapt_cache ranks them).
+    // Gives the lent tail back to the cache: its slots get the uncached experts that rank highest.
     void refill() {
         if (!lent_bytes) return;
         finish_swaps();
         const auto t0 = clk::now();
+        fill_free_slots(lent_slots);
+        lent_bytes = 0;
+        stats.refill_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        cache_dump(1);
+    }
+
+    // Fills free slots ([layer] lists, emptied) with the uncached experts that rank highest (recent routing plus the
+    // long-run counts, as adapt_cache ranks them).
+    void fill_free_slots(std::vector<std::vector<int>> & slots) {
         std::vector<SlotLoad> loads;
         std::vector<bool> touched(std::size_t(cfg.n_layer), false);
         for (int il = 0; il < cfg.n_layer; ++il) {
-            std::vector<int> & free_slots = lent_slots[std::size_t(il)];
+            std::vector<int> & free_slots = slots[std::size_t(il)];
             if (free_slots.empty()) continue;
             LayerCache & C = cache[std::size_t(il)];
             const std::size_t base = std::size_t(il) * fc::kExperts;
@@ -2451,9 +2476,127 @@ struct Engine::Impl {
         }
         load_slots(loads);
         upload_maps(touched);
-        lent_bytes = 0;
-        stats.refill_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
-        cache_dump(1);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // VRAM budget (EngineOptions::vram_reserve_mib, vram.h). The OS pages a process's allocations out to system RAM
+    // while it holds more than its budget, and every step then waited on PCIe (10-40x slower, until a restart; seen when
+    // a display woke up). So the engine keeps vram_reserve_mib free within the budget: when the budget shrinks, the top
+    // of the expert cache goes back to the OS (its experts are computed by the CPU instead) before the OS pages anything;
+    // once the budget has had room for kVramGrowAfter, the top comes back with the uncached experts that rank highest.
+    // Late allocations of the engine's own (a staging pool, the vision encoder's) are absorbed the same way.
+
+    static constexpr auto kVramCheckEvery = std::chrono::milliseconds(100);
+    static constexpr auto kVramGrowAfter = std::chrono::seconds(10);
+    static constexpr std::int64_t kVramGrowSlack = std::int64_t(256) << 20;  // room left over after taking memory back
+
+    void fit_vram(bool force) {
+        if (!vram) return;
+        const auto now = clk::now();
+        if (!force && now - vram_checked < kVramCheckEvery) return;
+        vram_checked = now;
+        const VramBudget::Reading r = vram->read();
+        if (!r.valid) return;
+        stats.vram_budget_gib = double(r.budget) / double(1 << 30);
+        stats.vram_usage_gib = double(r.usage) / double(1 << 30);
+        const std::int64_t room = r.budget - r.usage - (opt.vram_reserve_mib << 20);
+        if (room < 0) {
+            give_back_vram(std::size_t(-room), r);
+        } else if (cache_arena.mapped() < cache_arena.bytes() && room >= 2 * kVramGrowSlack && now - vram_shrunk_at >= kVramGrowAfter) {
+            take_back_vram(std::size_t(room - kVramGrowSlack), r);
+        }
+    }
+
+    // Gives at least `bytes` from the top of the expert cache back to the OS: every slot reaching above the new top
+    // leaves the cache.
+    void give_back_vram(std::size_t bytes, const VramBudget::Reading & r) {
+        const std::size_t ch = cache_arena.chunk();
+        if (!ch || !cache_arena.mapped()) return;
+        const auto t0 = clk::now();
+        if (bound_T || lent_bytes) end_prompt(false);  // the top is lent (a prompt's buffers, the vision encoder): back first
+        finish_swaps();
+        check(cudaDeviceSynchronize(), "VRAM budget");
+        const std::size_t old_top = cache_top();
+        const std::size_t want = (bytes + ch - 1) / ch * ch;
+        const std::size_t new_mapped = cache_arena.mapped() > want ? cache_arena.mapped() - want : 0;
+        const std::size_t new_top = std::min(new_mapped, arena_bytes);
+        std::vector<bool> touched(std::size_t(cfg.n_layer), false);
+        int dropped = 0;
+        for (int il = 0; il < cfg.n_layer; ++il) {
+            LayerCache & C = cache[std::size_t(il)];
+            if (!C.pool.get()) continue;
+            const std::size_t sb = C.lay.slot_bytes, n_slots = C.pool.bytes() / sb;
+            if (pool_off[std::size_t(il)] + n_slots * sb <= new_top) continue;
+            std::vector<int> expert_of(n_slots, -1);
+            for (int e = 0; e < fc::kExperts; ++e)
+                if (C.map[std::size_t(e)] >= 0) expert_of[std::size_t(C.map[std::size_t(e)])] = e;
+            for (std::size_t s = 0; s < n_slots; ++s) {
+                const std::size_t end = pool_off[std::size_t(il)] + (s + 1) * sb;
+                if (end <= new_top || end > old_top) continue;  // kept, or given back before
+                if (expert_of[s] >= 0) {
+                    C.map[std::size_t(expert_of[s])] = -1;
+                    ++dropped;
+                }
+                released_slots[std::size_t(il)].push_back(int(s));
+                touched[std::size_t(il)] = true;
+            }
+        }
+        upload_maps(touched);
+        check(cudaDeviceSynchronize(), "VRAM budget");
+        cache_arena.shrink_to(new_mapped);
+        vram_shrunk_at = clk::now();
+        ++stats.cache_shrinks;
+        refresh_cache_stats();
+        std::fprintf(stderr,
+                     "Flash-Next: VRAM budget %.2f GiB with %.2f GiB in use: the expert cache gave %.2f GiB back to the OS (%d experts) "
+                     "in %.0f ms; %.2f GiB cached\n",
+                     double(r.budget) / double(1 << 30), double(r.usage) / double(1 << 30), double(old_top - new_top) / double(1 << 30),
+                     dropped, std::chrono::duration<double, std::milli>(clk::now() - t0).count(), stats.cache_gib);
+    }
+
+    // Takes up to `bytes` back for the expert cache (whole chunks); the slots below the new top get the uncached
+    // experts that rank highest.
+    void take_back_vram(std::size_t bytes, const VramBudget::Reading & r) {
+        if (bound_T || lent_bytes) return;  // a prompt holds the top: later
+        const std::size_t ch = cache_arena.chunk();
+        const std::size_t target = std::min(cache_arena.bytes(), cache_arena.mapped() + bytes / ch * ch);
+        if (target <= cache_arena.mapped()) return;
+        const auto t0 = clk::now();
+        finish_swaps();
+        const std::size_t old_top = cache_top();
+        cache_arena.grow_to(target);  // may stop short
+        const std::size_t new_top = cache_top();
+        if (new_top <= old_top) return;
+        std::vector<std::vector<int>> back(std::size_t(cfg.n_layer));
+        for (int il = 0; il < cfg.n_layer; ++il) {
+            std::vector<int> & rel = released_slots[std::size_t(il)];
+            const std::size_t off = pool_off[std::size_t(il)], sb = cache[std::size_t(il)].lay.slot_bytes;
+            const auto below = std::stable_partition(rel.begin(), rel.end(), [&](int s) { return off + (std::size_t(s) + 1) * sb > new_top; });
+            back[std::size_t(il)].assign(below, rel.end());
+            rel.erase(below, rel.end());
+        }
+        fill_free_slots(back);
+        ++stats.cache_grows;
+        refresh_cache_stats();
+        std::fprintf(stderr,
+                     "Flash-Next: VRAM budget %.2f GiB with %.2f GiB in use: the expert cache took %.2f GiB back in %.0f ms; %.2f GiB "
+                     "cached, %.2f GiB still given back\n",
+                     double(r.budget) / double(1 << 30), double(r.usage) / double(1 << 30), double(new_top - old_top) / double(1 << 30),
+                     std::chrono::duration<double, std::milli>(clk::now() - t0).count(), stats.cache_gib, stats.cache_released_gib);
+    }
+
+    void refresh_cache_stats() {
+        std::int64_t n = 0;
+        double bytes = 0;
+        for (const LayerCache & C : cache)
+            for (const std::int32_t slot : C.map)
+                if (slot >= 0) {
+                    ++n;
+                    bytes += double(C.lay.slot_bytes);
+                }
+        stats.cached_experts = n;
+        stats.cache_gib = bytes / double(1 << 30);
+        stats.cache_released_gib = double(cache_arena.bytes() - cache_arena.mapped()) / double(1 << 30);
     }
 
     // The buffers a chunk of T tokens borrows, and which of them may share memory: set 0 lives through a
@@ -2902,7 +3045,7 @@ struct Engine::Impl {
     std::vector<ChunkPlan> plan_prompt(std::int64_t n, int & bind_T, bool & bind_stream, std::size_t & ring_b, std::size_t & kv_b) {
         kv_b = kv_stage_bytes(n_past + n);
         const bool can_stream = opt.prefill_stream && stats.pinned_layers > 0;
-        const std::size_t lendable = arena_bytes / 10 * 9;
+        const std::size_t lendable = cache_top() / 10 * 9;
         const int grid = 256;
         int T = opt.prefill_chunk > 0 ? int(std::min<std::int64_t>(opt.prefill_chunk, n))
                                       : int(std::min<std::int64_t>(opt.prefill_chunk_max, (n + grid - 1) / grid * grid));
@@ -3060,6 +3203,7 @@ void * Engine::lend_vram(std::size_t bytes) {
 
 std::vector<float> Engine::forward(const std::vector<std::int32_t> & tokens, bool all_logits) {
     if (tokens.empty()) throw std::runtime_error("engine: forward() needs at least one token");
+    impl_->fit_vram(false);
     impl_->trace_state("forward", std::int64_t(tokens.size()), all_logits);
     const auto t0 = clk::now();
     std::vector<float> all, last;
@@ -3125,6 +3269,7 @@ void Engine::set_prefill(int chunk, bool stream) {
     impl_->opt.prefill_stream = stream;
 }
 void Engine::save_routing_stats(const std::string & path) const { impl_->save_routing(path); }
+void Engine::fit_vram() { impl_->fit_vram(false); }
 bool Engine::has_mtp() const { return impl_->mtp != nullptr; }
 KvStreamStats Engine::kv_stream_stats() const { return impl_->kv ? impl_->kv->stats() : KvStreamStats{}; }
 std::vector<std::int32_t> Engine::draft(std::int32_t next, int k) { return impl_->draft(next, k); }

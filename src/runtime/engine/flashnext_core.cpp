@@ -327,6 +327,9 @@ public:
         engine_options.routing_stats      = routing_stats;
         engine_options.host_expert_images = options.flashnext.host_expert_images;
         engine_options.mtp_path           = options.flashnext.mtp_path.string();
+        if (options.flashnext.vram_reserve_mib >= 0) {
+            engine_options.vram_reserve_mib = options.flashnext.vram_reserve_mib;
+        }
         if (options.flashnext.expert_threads != 0) {
             engine_options.cpu_threads = static_cast<int>(options.flashnext.expert_threads);
         }
@@ -351,6 +354,11 @@ public:
         std::fprintf(stderr, "Flash-Next: expert cache %.2f GiB (%lld experts)%s\n", engine->stats().cache_gib,
                      static_cast<long long>(engine->stats().cached_experts),
                      vision ? "; vision encoder loaded (weights in pinned RAM)" : "");
+        if (engine->stats().vram_tracked) {
+            std::fprintf(stderr, "Flash-Next: following the OS VRAM budget (%.2f GiB, %.2f GiB in use, %lld MiB kept free)\n",
+                         engine->stats().vram_budget_gib, engine->stats().vram_usage_gib,
+                         static_cast<long long>(engine_options.vram_reserve_mib));
+        }
         program.complete();
 
         load.architecture = std::string(kArchitecture);
@@ -793,7 +801,15 @@ private:
             std::shared_ptr<Request> request;
             {
                 std::unique_lock lock(queue_mutex);
-                queue_cv.wait(lock, [&] { return stopping || !pending.empty(); });
+                // while idle the engine keeps within its VRAM budget (other programs may need memory now)
+                while (!queue_cv.wait_for(lock, std::chrono::milliseconds(250),
+                                          [&] { return stopping || !pending.empty(); })) {
+                    lock.unlock();
+                    try {
+                        engine->fit_vram();
+                    } catch (...) {}
+                    lock.lock();
+                }
                 if (stopping) { break; }
                 request = std::move(pending.front());
                 pending.pop_front();

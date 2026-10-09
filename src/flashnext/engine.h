@@ -21,7 +21,12 @@ struct EngineOptions {
     bool precise_cpu_experts = true;      // 16-bit activations for the CPU experts (5e-5 error instead of 1.3%)
     bool pin_cpu_threads = false;         // pin the expert threads to physical cores (faster big prompt chunks, 3-6% slower decode)
     std::int64_t expert_cache_mib = -1;   // VRAM for routed experts; -1: all that is free but the reserve
-    std::int64_t vram_reserve_mib = 1536; // left free for the desktop and other programs
+    // VRAM left free for the desktop and other programs. On Windows the engine keeps it free within the budget the OS
+    // gives the process (vram.h), not only at load: when other programs need more, the top of the expert cache goes
+    // back to the OS before the OS pages the engine's memory out (every step then crawled, 10-40x slower), and it
+    // comes back once the budget has room again for a while (vram_follow_budget).
+    std::int64_t vram_reserve_mib = 1024;
+    bool vram_follow_budget = true;
     std::string routing_stats;            // per-layer expert counts that choose the cached experts ("" = none)
     bool cuda_graphs = true;              // replay each step as one CUDA graph (off: launch kernels one by one)
     // Prompts (more than 4 tokens) run in chunks of prefill_chunk tokens; 0 = automatic: per prompt, the
@@ -107,6 +112,11 @@ struct EngineStats {
     double refill_ms = 0;              // putting experts back into the lent VRAM after prompts
     std::int64_t cpu_share_experts = 0; // experts of streamed chunks computed by the CPU instead
     int pinned_layers = 0;             // layers whose CPU copy is pinned (streamable)
+    // VRAM budget (vram_follow_budget): the last reading, and what the expert cache gave back to keep within it
+    bool vram_tracked = false;         // the OS reports a budget and the cache can give memory back
+    double vram_budget_gib = 0, vram_usage_gib = 0;
+    double cache_released_gib = 0;     // the top of the expert cache given back now
+    std::int64_t cache_shrinks = 0, cache_grows = 0;
 };
 
 // KV streaming (kv_cache.h): its configuration and counters.
@@ -205,6 +215,10 @@ public:
     void set_prefill(int chunk, bool stream);
     // Writes the routing counts (the loaded ones plus everything seen since) for the next start.
     void save_routing_stats(const std::string & path) const;
+    // Keeps the engine within its VRAM budget (EngineOptions::vram_reserve_mib): gives the top of the expert cache back
+    // when other programs need memory, takes it back when they no longer do. forward() checks too (at most every
+    // 100 ms); a server calls this while idle. Nothing happens without a budget (not Windows) or when it is off.
+    void fit_vram();
 
     // Speculative decoding with the model's MTP head (EngineOptions::mtp_path). draft() proposes k
     // tokens to follow `next`, the token the caller feeds next; verify them with

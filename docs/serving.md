@@ -111,6 +111,7 @@ expert cache). Options for these models:
 | Option | Meaning | Default |
 |---|---|---:|
 | `--flashnext-expert-cache-mib N` | VRAM for the routed-expert cache | all free VRAM but a reserve |
+| `--flashnext-vram-reserve-mib N` | VRAM kept free for the desktop and other programs; on Windows within the OS's VRAM budget for the process, all the time (below) | `1024` |
 | `--flashnext-expert-threads N` | CPU threads for experts that miss the cache | engine default (16) |
 | `--flashnext-routing-stats FILE` | expert routing counts that choose the cached experts; read at start when present, written back whenever the request queue drains and at shutdown | none |
 | `--flashnext-host-expert-images` | keep a pinned host copy of every expert (tens of GB of RAM, only when free) | off |
@@ -118,6 +119,14 @@ expert cache). Options for these models:
 | `--flashnext-draft K` | most MTP drafts per decode step, `1..3`; each step uses the length with the most expected tokens per second, from moving averages of draft acceptance and step time | `2` with `--flashnext-mtp` |
 | `--flashnext-vision FILE` | the vision encoder: the model's mmproj GGUF (`clip`, `qwen3vl_merger`, F16); enables image input | off (text only) |
 | `--flashnext-park-mib N` | RAM for parked conversations (above); `0`, `--no-prefix-reuse` or `--host-state-slots 0` disables parking | `12288` |
+
+On Windows the OS gives every process a budget of the GPU's memory and pages a process's allocations out to
+system RAM while it holds more than its budget. On a GPU that also drives a display this happens when the desktop
+needs memory back (a display waking up, a game), and every step then waits on PCIe: 10 to 40 times slower, until a
+restart. The engine therefore keeps `--flashnext-vram-reserve-mib` free within that budget (read before every step,
+at most every 100 ms, and every 250 ms while idle): when the budget shrinks, the top of the expert cache goes back to
+the OS in 32 MiB pieces (those experts are computed by the CPU meanwhile), and once the budget has had room for 10
+seconds the top comes back with the experts recent routing ranks highest. The log reports both.
 
 They are rejected for `.ninfer` artifacts. Flash-Next does not support `--max-concurrency` above 1,
 `--spec` (it uses `--flashnext-mtp`), `--vision` (it uses `--flashnext-vision`), video input,

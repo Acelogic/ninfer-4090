@@ -10,6 +10,7 @@ add_library(ninfer_flashnext STATIC
   prefill.cpp
   kv_cache.cpp
   vision.cpp
+  vram.cpp
   cuda/gemv.cu
   cuda/ops.cu
   cuda/experts.cu
@@ -22,6 +23,12 @@ add_library(ninfer_flashnext STATIC
   cuda/vision.cu)
 target_include_directories(ninfer_flashnext PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(ninfer_flashnext PUBLIC CUDA::cublas ${NINFER_CUDART_TARGET} Threads::Threads)
+# The expert cache's elastic arena maps device memory with the driver's virtual memory API (vram.cpp); on Windows the
+# OS's VRAM budget comes from DXGI.
+target_link_libraries(ninfer_flashnext PUBLIC CUDA::cuda_driver)
+if(WIN32)
+  target_link_libraries(ninfer_flashnext PUBLIC dxgi)
+endif()
 ninfer_cuda_non_rdc_archive(ninfer_flashnext)
 if(WIN32)
   set_target_properties(ninfer_flashnext PROPERTIES CUDA_RUNTIME_LIBRARY Static)
@@ -38,7 +45,7 @@ endif()
 # so the DLL is delay-loaded on Windows: executables that never serve Flash-Next start without it.
 if(WIN32)
   set(NINFER_CUBLAS_DLL "cublas64_${CUDAToolkit_VERSION_MAJOR}.dll")
-  target_link_options(ninfer_flashnext INTERFACE "/DELAYLOAD:${NINFER_CUBLAS_DLL}")
+  target_link_options(ninfer_flashnext INTERFACE "/DELAYLOAD:${NINFER_CUBLAS_DLL}" "/DELAYLOAD:nvcuda.dll")
   target_link_libraries(ninfer_flashnext INTERFACE delayimp)
   file(GLOB NINFER_CUBLAS_RUNTIME
     "${CUDAToolkit_BIN_DIR}/cublas64_*.dll" "${CUDAToolkit_BIN_DIR}/cublasLt64_*.dll"

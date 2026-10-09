@@ -209,6 +209,11 @@ struct FlashNextOptions {
     // summary, another session) would overwrite is copied out first (about 25.5 KiB per token, plus a
     // few recurrent-state snapshots) and copied back when a later request continues it. Zero disables.
     std::uint32_t park_mib = 12288;
+    // VRAM (MiB) kept free for the desktop and other programs. On Windows the engine keeps it free within the budget
+    // the OS gives the process: when other programs need more, the top of the expert cache goes back to the OS (instead
+    // of the OS paging the engine out, which made every step crawl), and it comes back later. Negative keeps the
+    // engine's default (1024).
+    std::int64_t vram_reserve_mib = -1;
     // The vision encoder for image input: the model's mmproj GGUF (clip, projector qwen3vl_merger, F16). Empty serves
     // text only.
     std::filesystem::path vision_path;

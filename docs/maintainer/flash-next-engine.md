@@ -108,6 +108,18 @@ sizes stay as chosen at load. A prompt that borrows VRAM (section 3.5) refills t
 when it ends, with the uncached experts its routing ranks highest (the routing of recent tokens,
 half-life 2,048 tokens, plus half the long-run counts).
 
+**VRAM budget** (`vram.{h,cpp}`; `engine.cpp` "VRAM budget"). The cache arena is a range of device
+addresses mapped in 32 MiB chunks with the driver's virtual memory API (`cuMemCreate`, `cuMemMap`), so its top can be
+unmapped and mapped again while every address stays the same (the decode graphs keep pointers into it). On Windows
+the engine reads the budget the OS gives the process (DXGI `QueryVideoMemoryInfo`, which counts every CUDA
+allocation). Measured on the 4090 that drives the desktop: a program that took 3 GB cut a 20 GB process's budget from
+22.1 to 18.3 GB at once, and that process's passes over its memory went from 60 ms to 1 to 2.7 s while it stayed over
+budget (the engine fell to 3 tok/s that way when a display woke up). `fit_vram` keeps `vram_reserve_mib` free within
+the budget: when it is short, the slots that reach above a new top lose their experts and the chunks above go back to
+the OS (4 GiB in 29 ms); prompts borrow below that top. After 10 s with room, chunks come back and their slots get the
+uncached experts that rank highest, as after a prompt. The engine's own late allocations (the KV staging pool, the
+vision encoder's) are absorbed the same way.
+
 **Decode-time adaptation** (`EngineOptions::decode_adapt`, on; `engine.cpp` "Decode-time
 adaptation"). The routing of the last steps predicts the next steps' far better than a prompt does:
 a conversation drifts. Recorded on the 32K-token code prompt below, the best static cache chosen from
